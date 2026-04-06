@@ -239,11 +239,39 @@ impl SandboxProfile {
 /// macOS sandbox-exec resolves symlinks before checking SBPL rules, so
 /// `/opt/homebrew/bin/zig` (a symlink to `/opt/homebrew/Cellar/zig/.../zig`)
 /// requires the Cellar path to be in the allow list too.
+///
+/// For Homebrew Cellar paths, we add the package root directory (e.g.,
+/// `/opt/homebrew/Cellar/zig/0.15.2/`) rather than just the binary, because
+/// tools like zig spawn sub-tools from their lib/ directory.
 #[allow(clippy::disallowed_methods)]
 fn resolve_symlinks(paths: &mut Vec<PathBuf>) {
     let additional: Vec<PathBuf> = paths
         .iter()
-        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .filter_map(|p| {
+            let resolved = std::fs::canonicalize(p).ok()?;
+            if resolved == *p {
+                return None;
+            }
+            // For Homebrew Cellar paths, allow the entire package directory.
+            // Structure: /opt/homebrew/Cellar/<pkg>/<version>/bin/<binary>
+            // We want:   /opt/homebrew/Cellar/<pkg>/<version>/
+            let resolved_str = resolved.to_string_lossy();
+            if let Some(cellar_idx) = resolved_str.find("/Cellar/") {
+                let after_cellar = &resolved_str[cellar_idx + 8..]; // skip "/Cellar/"
+                // Find pkg/version/ (two path components)
+                let parts: Vec<&str> = after_cellar.splitn(3, '/').collect();
+                if parts.len() >= 2 {
+                    let pkg_root = format!(
+                        "{}/Cellar/{}/{}",
+                        &resolved_str[..cellar_idx],
+                        parts[0],
+                        parts[1]
+                    );
+                    return Some(PathBuf::from(pkg_root));
+                }
+            }
+            Some(resolved)
+        })
         .filter(|resolved| !paths.contains(resolved))
         .collect();
     paths.extend(additional);
