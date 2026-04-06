@@ -115,12 +115,13 @@ impl SandboxProfile {
             .map(|p| expand_path(p, home, pwd))
             .collect();
 
-        // Build deny_exec: from common
-        let deny_exec: Vec<PathBuf> = common
+        // Build deny_exec: from common (also resolve symlinks for deny rules)
+        let mut deny_exec: Vec<PathBuf> = common
             .deny_exec
             .iter()
             .map(|p| expand_path(p, home, pwd))
             .collect();
+        resolve_symlinks(&mut deny_exec);
 
         // Build deny_read: from common
         let deny_read: Vec<PathBuf> = common
@@ -159,6 +160,11 @@ impl SandboxProfile {
         {
             allow_exec.push(PathBuf::from(java_home));
         }
+
+        // Resolve symlinks: SBPL checks the real path after kernel symlink
+        // resolution, so /opt/homebrew/bin/zig (symlink) won't match unless
+        // we also allow the resolved /opt/homebrew/Cellar/.../zig path.
+        resolve_symlinks(&mut allow_exec);
 
         SandboxProfile {
             name: profile_name,
@@ -226,6 +232,21 @@ impl SandboxProfile {
             }
         }
     }
+}
+
+/// For each path in the list, if it's a symlink, also add the resolved real path.
+///
+/// macOS sandbox-exec resolves symlinks before checking SBPL rules, so
+/// `/opt/homebrew/bin/zig` (a symlink to `/opt/homebrew/Cellar/zig/.../zig`)
+/// requires the Cellar path to be in the allow list too.
+#[allow(clippy::disallowed_methods)]
+fn resolve_symlinks(paths: &mut Vec<PathBuf>) {
+    let additional: Vec<PathBuf> = paths
+        .iter()
+        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .filter(|resolved| !paths.contains(resolved))
+        .collect();
+    paths.extend(additional);
 }
 
 /// Overrides from CLI flags that get merged into the resolved profile.
