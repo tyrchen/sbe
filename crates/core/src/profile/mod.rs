@@ -144,6 +144,16 @@ impl SandboxProfile {
             .map(|d| DomainPattern(d.clone()))
             .collect();
 
+        // Node-specific: monorepos hoist node_modules to workspace root.
+        // Allow exec/write from the git root's node_modules so hoisted binaries work.
+        if ecosystem == Ecosystem::Node
+            && let Some(git_root) = find_git_root(pwd)
+            && git_root != pwd
+        {
+            allow_exec.push(git_root.join("node_modules"));
+            allow_write.push(git_root.join("node_modules"));
+        }
+
         // Rust-specific: resolve cargo target dir for write + exec
         if ecosystem == Ecosystem::Rust {
             if let Some(target_dir) = resolve_cargo_target_dir(home, pwd) {
@@ -275,6 +285,17 @@ fn resolve_symlinks(paths: &mut Vec<PathBuf>) {
         .filter(|resolved| !paths.contains(resolved))
         .collect();
     paths.extend(additional);
+}
+
+/// Find the git root by walking up from `start`.
+fn find_git_root(start: &Path) -> Option<PathBuf> {
+    let mut dir = start;
+    loop {
+        if dir.join(".git").exists() {
+            return Some(dir.to_path_buf());
+        }
+        dir = dir.parent()?;
+    }
 }
 
 /// Overrides from CLI flags that get merged into the resolved profile.
