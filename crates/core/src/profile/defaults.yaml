@@ -32,9 +32,49 @@ common:
     - "/bin/bash"
     - "/bin/zsh"
     - "/usr/bin/env"
+    # Core utilities used by build scripts
+    - "/usr/bin/basename"
+    - "/usr/bin/dirname"
+    - "/usr/bin/cat"
+    - "/usr/bin/head"
+    - "/usr/bin/tail"
+    - "/usr/bin/cut"
+    - "/usr/bin/tr"
+    - "/usr/bin/sed"
+    - "/usr/bin/awk"
+    - "/usr/bin/grep"
+    - "/usr/bin/sort"
+    - "/usr/bin/uniq"
+    - "/usr/bin/wc"
+    - "/usr/bin/tee"
+    - "/usr/bin/xargs"
+    - "/usr/bin/find"
+    - "/usr/bin/touch"
+    - "/usr/bin/mktemp"
+    - "/usr/bin/install"
+    - "/usr/bin/test"
+    - "/usr/bin/expr"
+    - "/usr/bin/printf"
+    - "/bin/cp"
+    - "/bin/mv"
+    - "/bin/rm"
+    - "/bin/mkdir"
+    - "/bin/rmdir"
+    - "/bin/ln"
+    - "/bin/ls"
+    - "/bin/cat"
+    - "/bin/chmod"
+    - "/bin/date"
+    - "/bin/echo"
+    - "/bin/test"
+    - "/bin/expr"
+    - "/bin/dd"
     # Archive / compression
     - "/usr/bin/tar"
     - "/usr/bin/gzip"
+    - "/usr/bin/bzip2"
+    - "/usr/bin/unzip"
+    - "/usr/bin/zip"
     # Build toolchain
     - "/usr/bin/make"
     - "/usr/bin/cc"
@@ -59,6 +99,10 @@ common:
     # pkg-config — needed by many native deps
     - "/opt/homebrew/bin/pkg-config"
     - "/usr/local/bin/pkg-config"
+    # Temp directories — build tools (cargo-zigbuild, cc-rs) create and
+    # execute wrapper scripts here. Safe: scripts inherit the same sandbox.
+    - "/private/tmp"
+    - "/private/var/folders"
 
 profiles:
   node:
@@ -91,6 +135,10 @@ profiles:
       - "~/.cargo/git"
       - "~/.cargo/bin"
       - "~/.rustup"
+      # cargo-zigbuild writes linker wrapper scripts here
+      - "~/Library/Caches/cargo-zigbuild"
+      # zig compiler cache
+      - "~/.cache/zig"
     allowDomains:
       - "crates.io"
       - "static.crates.io"
@@ -104,6 +152,8 @@ profiles:
       - "~/.rustup/toolchains"
       - "/usr/bin/xcrun"
       - "/usr/bin/xcodebuild"
+      # cargo-zigbuild linker wrapper scripts
+      - "~/Library/Caches/cargo-zigbuild"
 
   python:
     allowWrite:
