@@ -123,8 +123,10 @@ profiles:
     allowExec:
       - "/usr/local/bin/node"
       - "/opt/homebrew/bin/node"
-      - "~/.nvm/versions"
+      - "~/.nvm"
       - "~/.volta"
+      - "~/.fnm"
+      - "~/.local/state/fnm_multishells"
       - "/usr/bin/xcodebuild"
       - "/usr/bin/xcrun"
 
