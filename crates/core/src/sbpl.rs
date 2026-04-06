@@ -134,9 +134,6 @@ fn section_misc(sb: &mut String) {
     writeln!(sb, "(allow ipc-posix-shm-read*)").ok();
     writeln!(sb, "(allow ipc-posix-shm-write-data)").ok();
     writeln!(sb, "(allow signal (target self))").ok();
-    writeln!(sb, "(allow process-info-pidinfo)").ok();
-    writeln!(sb, "(allow process-info-setcontrol)").ok();
-    writeln!(sb, "(allow process-info-dirtycontrol)").ok();
 }
 
 /// Write a path filter expression. Uses `subpath` for directories and `literal` for files.
