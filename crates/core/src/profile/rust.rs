@@ -24,9 +24,15 @@ pub fn rust_profile(home: &Path, pwd: &Path) -> SandboxProfile {
         home.join(".rustup"),
     ];
 
-    // Respect CARGO_TARGET_DIR if set, otherwise try to read from cargo config
+    // Respect CARGO_TARGET_DIR if set, otherwise try to read from cargo config.
+    // The target dir must be both writable (compilation output) and executable
+    // (build scripts, proc macros are compiled there and then executed by cargo).
     if let Some(target_dir) = resolve_cargo_target_dir(home, pwd) {
-        allow_write.push(target_dir);
+        allow_write.push(target_dir.clone());
+        allow_exec.push(target_dir);
+    } else {
+        // Default target dir — also needs exec for build scripts / proc macros
+        allow_exec.push(pwd.join("target"));
     }
 
     SandboxProfile {
