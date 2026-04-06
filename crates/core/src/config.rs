@@ -42,6 +42,14 @@ pub struct ProfileConfig {
     #[serde(default)]
     pub allow_exec: Vec<String>,
 
+    /// Domains that build scripts are allowed to fetch from.
+    ///
+    /// When non-empty, enables curl/wget execution and adds these domains
+    /// to the proxy allowlist. This is the intended way to allow build-time
+    /// downloads for specific crates (e.g., utoipa-swagger-ui, protobuf-src).
+    #[serde(default)]
+    pub allow_fetch: Vec<String>,
+
     /// Whether to allow all network access (disables proxy and SBPL network restrictions).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_all_network: Option<bool>,
@@ -116,6 +124,9 @@ impl ProfileConfig {
         }
         for p in &self.allow_exec {
             profile.allow_exec.push(expand_path(p, home, pwd));
+        }
+        for d in &self.allow_fetch {
+            profile.allow_fetch.push(DomainPattern(d.clone()));
         }
         if let Some(allow_all) = self.allow_all_network {
             profile.allow_all_network = allow_all;

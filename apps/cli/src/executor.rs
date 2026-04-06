@@ -49,6 +49,7 @@ async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
 
     let overrides = build_overrides(args, &home, &pwd);
     profile.merge_overrides(&overrides);
+    profile.finalize();
 
     // Start proxy if needed
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -234,6 +235,11 @@ fn build_overrides(args: &RunArgs, home: &Path, pwd: &Path) -> ProfileOverrides 
             .deny_exec
             .iter()
             .map(|p| expand_path(&p.to_string_lossy(), home, pwd))
+            .collect(),
+        allow_fetch: args
+            .allow_fetch
+            .iter()
+            .map(|d| DomainPattern(d.clone()))
             .collect(),
         allow_all_network: args.allow_all_network,
         no_proxy: args.no_proxy,

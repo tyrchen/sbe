@@ -86,6 +86,14 @@ pub struct SandboxProfile {
     #[serde(default)]
     pub allow_all_network: bool,
 
+    /// Domains that build scripts are allowed to fetch from.
+    ///
+    /// When non-empty, `curl` and `wget` are added to `allow_exec` and these
+    /// domains are merged into the proxy allowlist. This is the only way to
+    /// enable build-time downloads — curl/wget are blocked by default.
+    #[serde(default)]
+    pub allow_fetch: Vec<DomainPattern>,
+
     /// Additional environment variables to inject.
     #[serde(default)]
     pub env: HashMap<String, String>,
@@ -126,6 +134,10 @@ impl SandboxProfile {
                 .retain(|d| !overrides.deny_domains.iter().any(|denied| denied.0 == d.0));
         }
 
+        // Merge allow_fetch: adds domains to allowlist and enables curl/wget
+        self.allow_fetch
+            .extend(overrides.allow_fetch.iter().cloned());
+
         if overrides.allow_all_network {
             self.allow_all_network = true;
             self.enable_proxy = false;
@@ -136,6 +148,30 @@ impl SandboxProfile {
 
         for (k, v) in &overrides.env {
             self.env.insert(k.clone(), v.clone());
+        }
+    }
+
+    /// Finalize the profile: apply allow_fetch effects to allow_exec and allow_domains.
+    ///
+    /// Must be called after all merging is complete, before SBPL generation.
+    pub fn finalize(&mut self) {
+        if !self.allow_fetch.is_empty() {
+            // Enable curl and wget for build-time downloads
+            let curl = PathBuf::from("/usr/bin/curl");
+            let wget = PathBuf::from("/usr/bin/wget");
+            if !self.allow_exec.contains(&curl) {
+                self.allow_exec.push(curl);
+            }
+            if !self.allow_exec.contains(&wget) {
+                self.allow_exec.push(wget);
+            }
+
+            // Merge fetch domains into the proxy allowlist
+            for domain in &self.allow_fetch {
+                if !self.allow_domains.iter().any(|d| d.0 == domain.0) {
+                    self.allow_domains.push(domain.clone());
+                }
+            }
         }
     }
 }
@@ -149,6 +185,7 @@ pub struct ProfileOverrides {
     pub deny_domains: Vec<DomainPattern>,
     pub allow_exec: Vec<PathBuf>,
     pub deny_exec: Vec<PathBuf>,
+    pub allow_fetch: Vec<DomainPattern>,
     pub allow_all_network: bool,
     pub no_proxy: bool,
     pub env: HashMap<String, String>,
@@ -252,5 +289,60 @@ mod tests {
                 .iter()
                 .any(|d| d.0 == "registry.npmmirror.com")
         );
+    }
+
+    #[test]
+    fn test_should_finalize_allow_fetch() {
+        let home = PathBuf::from("/Users/test");
+        let pwd = PathBuf::from("/Users/test/project");
+        let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, &home, &pwd);
+
+        // By default, curl should not be in allow_exec
+        assert!(!profile.allow_exec.contains(&PathBuf::from("/usr/bin/curl")));
+
+        // Add allow_fetch domains
+        let overrides = ProfileOverrides {
+            allow_fetch: vec![DomainPattern::from("example.com")],
+            ..Default::default()
+        };
+        profile.merge_overrides(&overrides);
+        profile.finalize();
+
+        // After finalize, curl and wget should be added
+        assert!(profile.allow_exec.contains(&PathBuf::from("/usr/bin/curl")));
+        assert!(profile.allow_exec.contains(&PathBuf::from("/usr/bin/wget")));
+
+        // Domain should be in allow_domains
+        assert!(profile.allow_domains.iter().any(|d| d.0 == "example.com"));
+    }
+
+    #[test]
+    fn test_should_not_add_curl_without_allow_fetch() {
+        let home = PathBuf::from("/Users/test");
+        let pwd = PathBuf::from("/Users/test/project");
+        let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &pwd);
+
+        profile.finalize();
+
+        assert!(!profile.allow_exec.contains(&PathBuf::from("/usr/bin/curl")));
+    }
+
+    #[test]
+    fn test_should_not_duplicate_domains_on_finalize() {
+        let home = PathBuf::from("/Users/test");
+        let pwd = PathBuf::from("/Users/test/project");
+        let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, &home, &pwd);
+        let original_domain_count = profile.allow_domains.len();
+
+        // github.com is already in Rust defaults — adding via allow_fetch should not duplicate
+        let overrides = ProfileOverrides {
+            allow_fetch: vec![DomainPattern::from("github.com")],
+            ..Default::default()
+        };
+        profile.merge_overrides(&overrides);
+        profile.finalize();
+
+        assert_eq!(profile.allow_domains.len(), original_domain_count);
+        assert!(profile.allow_exec.contains(&PathBuf::from("/usr/bin/curl")));
     }
 }

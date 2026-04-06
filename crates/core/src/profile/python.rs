@@ -35,6 +35,7 @@ pub fn python_profile(home: &Path, pwd: &Path) -> SandboxProfile {
         allow_exec,
         enable_proxy: true,
         allow_all_network: false,
+        allow_fetch: vec![],
         env: Default::default(),
     }
 }

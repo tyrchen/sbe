@@ -56,6 +56,10 @@ pub struct RunArgs {
     #[arg(short = 'E', long = "deny-exec", action = clap::ArgAction::Append)]
     pub deny_exec: Vec<PathBuf>,
 
+    /// Allow build-time downloads from a domain (enables curl/wget, adds to proxy allowlist).
+    #[arg(short = 'f', long = "allow-fetch", action = clap::ArgAction::Append)]
+    pub allow_fetch: Vec<String>,
+
     /// Disable network sandboxing entirely.
     #[arg(long)]
     pub allow_all_network: bool,
@@ -119,6 +123,10 @@ pub struct InspectArgs {
     #[arg(short = 'E', long = "deny-exec", action = clap::ArgAction::Append)]
     pub deny_exec: Vec<PathBuf>,
 
+    /// Allow build-time downloads from a domain (enables curl/wget, adds to proxy allowlist).
+    #[arg(short = 'f', long = "allow-fetch", action = clap::ArgAction::Append)]
+    pub allow_fetch: Vec<String>,
+
     /// Disable network sandboxing entirely.
     #[arg(long)]
     pub allow_all_network: bool,
@@ -147,6 +155,7 @@ impl InspectArgs {
             deny_read: self.deny_read.clone(),
             allow_exec: self.allow_exec.clone(),
             deny_exec: self.deny_exec.clone(),
+            allow_fetch: self.allow_fetch.clone(),
             allow_all_network: self.allow_all_network,
             no_proxy: self.no_proxy,
             audit: false,
