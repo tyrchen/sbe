@@ -13,7 +13,6 @@ pub fn rust_profile(home: &Path, pwd: &Path) -> SandboxProfile {
         home.join(".rustup/toolchains"),
         PathBuf::from("/usr/bin/xcrun"),
         PathBuf::from("/usr/bin/xcodebuild"),
-        PathBuf::from("/usr/bin/install_name_tool"),
     ]);
 
     let mut allow_write = vec![
