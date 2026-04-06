@@ -202,6 +202,35 @@ mod tests {
     }
 
     #[test]
+    fn test_should_generate_no_proxy_mode() {
+        let home = PathBuf::from("/Users/test");
+        let pwd = PathBuf::from("/Users/test/project");
+        let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &pwd);
+        profile.enable_proxy = false;
+        let sbpl = generate(&profile, None);
+
+        // No proxy mode: should allow port 443 directly and localhost for local services
+        assert!(sbpl.contains("(remote tcp \"*:443\")"));
+        assert!(sbpl.contains("(remote ip \"localhost:*\")"));
+        // Should NOT have a specific proxy port
+        assert!(!sbpl.contains("(remote tcp \"localhost:"));
+    }
+
+    #[test]
+    fn test_should_deny_network_when_no_domains_and_no_allow_all() {
+        let home = PathBuf::from("/Users/test");
+        let pwd = PathBuf::from("/Users/test/project");
+        let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &pwd);
+        profile.allow_domains.clear();
+        profile.enable_proxy = false;
+        let sbpl = generate(&profile, None);
+
+        // Should still allow port 443 as fallback
+        assert!(sbpl.contains("(deny network*)"));
+        assert!(sbpl.contains("(remote tcp \"*:443\")"));
+    }
+
+    #[test]
     fn test_should_generate_for_all_ecosystems() {
         let home = PathBuf::from("/Users/test");
         let pwd = PathBuf::from("/Users/test/project");
