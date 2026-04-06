@@ -42,6 +42,14 @@ pub struct ProfileConfig {
     #[serde(default)]
     pub allow_exec: Vec<String>,
 
+    /// Whether to allow all network access (disables proxy and SBPL network restrictions).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_all_network: Option<bool>,
+
+    /// Whether to enable the domain-filtering proxy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_proxy: Option<bool>,
+
     #[serde(default)]
     pub env: HashMap<String, String>,
 }
@@ -108,6 +116,15 @@ impl ProfileConfig {
         }
         for p in &self.allow_exec {
             profile.allow_exec.push(expand_path(p, home, pwd));
+        }
+        if let Some(allow_all) = self.allow_all_network {
+            profile.allow_all_network = allow_all;
+            if allow_all {
+                profile.enable_proxy = false;
+            }
+        }
+        if let Some(enable_proxy) = self.enable_proxy {
+            profile.enable_proxy = enable_proxy;
         }
         for (k, v) in &self.env {
             profile.env.insert(k.clone(), v.clone());

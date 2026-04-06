@@ -29,6 +29,8 @@ pub fn node_profile(home: &Path, pwd: &Path) -> SandboxProfile {
             DomainPattern::from("registry.npmjs.org"),
             DomainPattern::from("registry.yarnpkg.com"),
             DomainPattern::from("registry.npmmirror.com"),
+            DomainPattern::from("github.com"),
+            DomainPattern::from("objects.githubusercontent.com"),
         ],
         deny_exec: common_deny_exec(),
         allow_exec,

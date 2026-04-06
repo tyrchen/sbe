@@ -166,6 +166,10 @@ pub fn common_deny_read(home: &Path) -> Vec<PathBuf> {
         home.join(".docker/config.json"),
         home.join(".netrc"),
         home.join("Library/Application Support/Google/Chrome"),
+        home.join("Library/Application Support/Firefox"),
+        home.join("Library/Application Support/Microsoft Edge"),
+        home.join("Library/Application Support/BraveSoftware/Brave-Browser"),
+        home.join("Library/Safari"),
     ]
 }
 
