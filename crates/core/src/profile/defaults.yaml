@@ -126,6 +126,7 @@ profiles:
       - "~/.nvm"
       - "~/.volta"
       - "~/.fnm"
+      - "~/.local/share/fnm"
       - "~/.local/state/fnm_multishells"
       - "/usr/bin/xcodebuild"
       - "/usr/bin/xcrun"
