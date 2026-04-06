@@ -196,6 +196,9 @@ pub fn common_allow_exec() -> Vec<PathBuf> {
         PathBuf::from("/usr/bin/gzip"),
         PathBuf::from("/usr/bin/make"),
         PathBuf::from("/usr/bin/cc"),
+        // Xcode / Command Line Tools (needed for linking, native compilation)
+        PathBuf::from("/Applications/Xcode.app"),
+        PathBuf::from("/Library/Developer/CommandLineTools"),
     ]
 }
 
