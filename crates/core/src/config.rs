@@ -145,9 +145,17 @@ impl ProfileConfig {
     }
 }
 
-/// Expand `~` to home and `./` to pwd in a path string.
+/// Expand path placeholders: `~` to home, `$PWD` to pwd, `$HOME` to home, `./` to pwd.
 pub fn expand_path(raw: &str, home: &Path, pwd: &Path) -> PathBuf {
-    if let Some(rest) = raw.strip_prefix("~/") {
+    if raw == "$PWD" {
+        pwd.to_path_buf()
+    } else if let Some(rest) = raw.strip_prefix("$PWD/") {
+        pwd.join(rest)
+    } else if raw == "$HOME" {
+        home.to_path_buf()
+    } else if let Some(rest) = raw.strip_prefix("$HOME/") {
+        home.join(rest)
+    } else if let Some(rest) = raw.strip_prefix("~/") {
         home.join(rest)
     } else if raw == "~" {
         home.to_path_buf()

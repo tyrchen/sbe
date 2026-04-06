@@ -1,9 +1,3 @@
-mod elixir;
-mod java;
-mod node;
-mod python;
-mod rust;
-
 use std::{
     collections::HashMap,
     fmt,
@@ -12,11 +6,10 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-pub use self::{
-    elixir::elixir_profile, java::java_profile, node::node_profile, python::python_profile,
-    rust::rust_profile,
-};
-use crate::detect::Ecosystem;
+use crate::{config::expand_path, detect::Ecosystem};
+
+/// Embedded default profiles YAML, compiled into the binary.
+const DEFAULTS_YAML: &str = include_str!("defaults.yaml");
 
 /// A pattern for matching domain names.
 ///
@@ -31,7 +24,6 @@ impl DomainPattern {
     pub fn matches(&self, host: &str) -> bool {
         let pattern = &self.0;
         if let Some(suffix) = pattern.strip_prefix("*.") {
-            // Wildcard: host must end with .suffix or be exactly suffix
             host == suffix || host.ends_with(&format!(".{suffix}"))
         } else {
             host == pattern
@@ -89,8 +81,7 @@ pub struct SandboxProfile {
     /// Domains that build scripts are allowed to fetch from.
     ///
     /// When non-empty, `curl` and `wget` are added to `allow_exec` and these
-    /// domains are merged into the proxy allowlist. This is the only way to
-    /// enable build-time downloads — curl/wget are blocked by default.
+    /// domains are merged into the proxy allowlist.
     #[serde(default)]
     pub allow_fetch: Vec<DomainPattern>,
 
@@ -104,21 +95,86 @@ fn default_true() -> bool {
 }
 
 impl SandboxProfile {
-    /// Get the default profile for a given ecosystem.
+    /// Build the default profile for an ecosystem from the embedded YAML defaults.
     pub fn for_ecosystem(ecosystem: Ecosystem, home: &Path, pwd: &Path) -> Self {
-        match ecosystem {
-            Ecosystem::Node => node_profile(home, pwd),
-            Ecosystem::Rust => rust_profile(home, pwd),
-            Ecosystem::Python => python_profile(home, pwd),
-            Ecosystem::Elixir => elixir_profile(home, pwd),
-            Ecosystem::Java => java_profile(home, pwd),
+        let defaults: DefaultsFile =
+            serde_yaml::from_str(DEFAULTS_YAML).expect("embedded defaults.yaml is invalid");
+
+        let common = &defaults.common;
+        let profile_name = ecosystem.to_string();
+        let eco_cfg = defaults
+            .profiles
+            .get(&profile_name)
+            .unwrap_or_else(|| panic!("missing profile '{profile_name}' in defaults.yaml"));
+
+        // Build allow_exec: common + ecosystem-specific
+        let mut allow_exec: Vec<PathBuf> = common
+            .allow_exec
+            .iter()
+            .chain(eco_cfg.allow_exec.iter())
+            .map(|p| expand_path(p, home, pwd))
+            .collect();
+
+        // Build deny_exec: from common
+        let deny_exec: Vec<PathBuf> = common
+            .deny_exec
+            .iter()
+            .map(|p| expand_path(p, home, pwd))
+            .collect();
+
+        // Build deny_read: from common
+        let deny_read: Vec<PathBuf> = common
+            .deny_read
+            .iter()
+            .map(|p| expand_path(p, home, pwd))
+            .collect();
+
+        // Build allow_write: from ecosystem
+        let mut allow_write: Vec<PathBuf> = eco_cfg
+            .allow_write
+            .iter()
+            .map(|p| expand_path(p, home, pwd))
+            .collect();
+
+        // Build allow_domains: from ecosystem
+        let allow_domains: Vec<DomainPattern> = eco_cfg
+            .allow_domains
+            .iter()
+            .map(|d| DomainPattern(d.clone()))
+            .collect();
+
+        // Rust-specific: resolve cargo target dir for write + exec
+        if ecosystem == Ecosystem::Rust {
+            if let Some(target_dir) = resolve_cargo_target_dir(home, pwd) {
+                allow_write.push(target_dir.clone());
+                allow_exec.push(target_dir);
+            } else {
+                allow_exec.push(pwd.join("target"));
+            }
+        }
+
+        // Java-specific: allow JAVA_HOME
+        if ecosystem == Ecosystem::Java
+            && let Ok(java_home) = std::env::var("JAVA_HOME")
+        {
+            allow_exec.push(PathBuf::from(java_home));
+        }
+
+        SandboxProfile {
+            name: profile_name,
+            allow_write,
+            deny_read,
+            allow_domains,
+            deny_exec,
+            allow_exec,
+            enable_proxy: true,
+            allow_all_network: false,
+            allow_fetch: vec![],
+            env: Default::default(),
         }
     }
 
     /// Merge CLI overrides into this profile.
-    ///
-    /// Additive fields (allow_write, deny_read, etc.) are appended.
-    /// Boolean flags and env vars are overwritten.
     pub fn merge_overrides(&mut self, overrides: &ProfileOverrides) {
         self.allow_write
             .extend(overrides.allow_write.iter().cloned());
@@ -128,13 +184,11 @@ impl SandboxProfile {
         self.deny_exec.extend(overrides.deny_exec.iter().cloned());
         self.allow_exec.extend(overrides.allow_exec.iter().cloned());
 
-        // Remove denied domains
         if !overrides.deny_domains.is_empty() {
             self.allow_domains
                 .retain(|d| !overrides.deny_domains.iter().any(|denied| denied.0 == d.0));
         }
 
-        // Merge allow_fetch: adds domains to allowlist and enables curl/wget
         self.allow_fetch
             .extend(overrides.allow_fetch.iter().cloned());
 
@@ -156,7 +210,6 @@ impl SandboxProfile {
     /// Must be called after all merging is complete, before SBPL generation.
     pub fn finalize(&mut self) {
         if !self.allow_fetch.is_empty() {
-            // Enable curl and wget for build-time downloads
             let curl = PathBuf::from("/usr/bin/curl");
             let wget = PathBuf::from("/usr/bin/wget");
             if !self.allow_exec.contains(&curl) {
@@ -166,7 +219,6 @@ impl SandboxProfile {
                 self.allow_exec.push(wget);
             }
 
-            // Merge fetch domains into the proxy allowlist
             for domain in &self.allow_fetch {
                 if !self.allow_domains.iter().any(|d| d.0 == domain.0) {
                     self.allow_domains.push(domain.clone());
@@ -191,60 +243,76 @@ pub struct ProfileOverrides {
     pub env: HashMap<String, String>,
 }
 
-/// Common sensitive paths that should be denied for reading across all ecosystems.
-pub fn common_deny_read(home: &Path) -> Vec<PathBuf> {
-    vec![
-        home.join(".ssh"),
-        home.join(".gnupg"),
-        home.join(".aws"),
-        home.join(".azure"),
-        home.join(".config/gcloud"),
-        home.join("Library/Keychains"),
-        home.join(".docker/config.json"),
-        home.join(".netrc"),
-        home.join("Library/Application Support/Google/Chrome"),
-        home.join("Library/Application Support/Firefox"),
-        home.join("Library/Application Support/Microsoft Edge"),
-        home.join("Library/Application Support/BraveSoftware/Brave-Browser"),
-        home.join("Library/Safari"),
-    ]
+// --- Embedded YAML deserialization types ---
+
+#[derive(Debug, Deserialize)]
+struct DefaultsFile {
+    common: CommonDefaults,
+    profiles: HashMap<String, EcosystemDefaults>,
 }
 
-/// Common binaries that should be denied execution across all ecosystems.
-pub fn common_deny_exec() -> Vec<PathBuf> {
-    vec![
-        PathBuf::from("/usr/bin/osascript"),
-        PathBuf::from("/usr/bin/security"),
-        PathBuf::from("/usr/sbin/screencapture"),
-        PathBuf::from("/usr/bin/open"),
-        PathBuf::from("/usr/bin/pbcopy"),
-        PathBuf::from("/usr/bin/pbpaste"),
-    ]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommonDefaults {
+    #[serde(default)]
+    deny_read: Vec<String>,
+    #[serde(default)]
+    deny_exec: Vec<String>,
+    #[serde(default)]
+    allow_exec: Vec<String>,
 }
 
-/// Common shell/utility binaries needed by most build tools.
-pub fn common_allow_exec() -> Vec<PathBuf> {
-    vec![
-        PathBuf::from("/bin/sh"),
-        PathBuf::from("/bin/bash"),
-        PathBuf::from("/bin/zsh"),
-        PathBuf::from("/usr/bin/env"),
-        PathBuf::from("/usr/bin/tar"),
-        PathBuf::from("/usr/bin/gzip"),
-        PathBuf::from("/usr/bin/make"),
-        PathBuf::from("/usr/bin/cc"),
-        PathBuf::from("/usr/bin/ar"),
-        PathBuf::from("/usr/bin/ranlib"),
-        PathBuf::from("/usr/bin/strip"),
-        PathBuf::from("/usr/bin/ld"),
-        PathBuf::from("/usr/bin/as"),
-        PathBuf::from("/usr/bin/nm"),
-        PathBuf::from("/usr/bin/libtool"),
-        PathBuf::from("/usr/bin/install_name_tool"),
-        // Xcode / Command Line Tools (needed for linking, native compilation)
-        PathBuf::from("/Applications/Xcode.app"),
-        PathBuf::from("/Library/Developer/CommandLineTools"),
-    ]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EcosystemDefaults {
+    #[serde(default)]
+    allow_write: Vec<String>,
+    #[serde(default)]
+    allow_domains: Vec<String>,
+    #[serde(default)]
+    allow_exec: Vec<String>,
+}
+
+// --- Rust-specific cargo target dir resolution ---
+
+/// Resolve the cargo target directory from environment or cargo config.
+fn resolve_cargo_target_dir(home: &Path, pwd: &Path) -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+    if let Ok(dir) = std::env::var("CARGO_BUILD_TARGET_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+    if let Some(dir) = read_target_dir_from_cargo_config(&pwd.join(".cargo/config.toml")) {
+        return Some(dir);
+    }
+    if let Some(dir) = read_target_dir_from_cargo_config(&home.join(".cargo/config.toml")) {
+        return Some(dir);
+    }
+    None
+}
+
+#[allow(clippy::disallowed_methods)]
+fn read_target_dir_from_cargo_config(path: &Path) -> Option<PathBuf> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut in_build_section = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_build_section = trimmed == "[build]";
+            continue;
+        }
+        if in_build_section && let Some(value) = trimmed.strip_prefix("target-dir") {
+            let value = value.trim().strip_prefix('=')?.trim();
+            let value = value
+                .strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+                .unwrap_or(value);
+            return Some(PathBuf::from(value));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -266,6 +334,75 @@ mod tests {
         assert!(p.matches("npmjs.org"));
         assert!(p.matches("deep.sub.npmjs.org"));
         assert!(!p.matches("evil.com"));
+    }
+
+    #[test]
+    fn test_should_load_all_ecosystems_from_yaml() {
+        let home = PathBuf::from("/Users/test");
+        let pwd = PathBuf::from("/Users/test/project");
+
+        for eco in Ecosystem::ALL {
+            let profile = SandboxProfile::for_ecosystem(eco, &home, &pwd);
+            assert_eq!(profile.name, eco.to_string());
+            assert!(!profile.allow_write.is_empty(), "no allow_write for {eco}");
+            assert!(!profile.deny_read.is_empty(), "no deny_read for {eco}");
+            assert!(
+                !profile.allow_domains.is_empty(),
+                "no allow_domains for {eco}"
+            );
+            assert!(!profile.deny_exec.is_empty(), "no deny_exec for {eco}");
+            assert!(!profile.allow_exec.is_empty(), "no allow_exec for {eco}");
+        }
+    }
+
+    #[test]
+    fn test_should_expand_paths_in_defaults() {
+        let home = PathBuf::from("/Users/test");
+        let pwd = PathBuf::from("/Users/test/project");
+        let profile = SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &pwd);
+
+        // ~ should be expanded
+        assert!(
+            profile
+                .deny_read
+                .contains(&PathBuf::from("/Users/test/.ssh"))
+        );
+        // $PWD should be expanded
+        assert!(
+            profile
+                .allow_write
+                .contains(&PathBuf::from("/Users/test/project"))
+        );
+        // Ecosystem-specific paths
+        assert!(
+            profile
+                .allow_write
+                .contains(&PathBuf::from("/Users/test/.npm"))
+        );
+    }
+
+    #[test]
+    fn test_should_include_common_exec_in_all_profiles() {
+        let home = PathBuf::from("/Users/test");
+        let pwd = PathBuf::from("/Users/test/project");
+
+        for eco in Ecosystem::ALL {
+            let profile = SandboxProfile::for_ecosystem(eco, &home, &pwd);
+            assert!(
+                profile.allow_exec.contains(&PathBuf::from("/bin/sh")),
+                "missing /bin/sh for {eco}"
+            );
+            assert!(
+                profile.allow_exec.contains(&PathBuf::from("/usr/bin/cc")),
+                "missing /usr/bin/cc for {eco}"
+            );
+            assert!(
+                profile
+                    .deny_exec
+                    .contains(&PathBuf::from("/usr/bin/osascript")),
+                "missing osascript deny for {eco}"
+            );
+        }
     }
 
     #[test]
@@ -297,10 +434,8 @@ mod tests {
         let pwd = PathBuf::from("/Users/test/project");
         let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, &home, &pwd);
 
-        // By default, curl should not be in allow_exec
         assert!(!profile.allow_exec.contains(&PathBuf::from("/usr/bin/curl")));
 
-        // Add allow_fetch domains
         let overrides = ProfileOverrides {
             allow_fetch: vec![DomainPattern::from("example.com")],
             ..Default::default()
@@ -308,11 +443,8 @@ mod tests {
         profile.merge_overrides(&overrides);
         profile.finalize();
 
-        // After finalize, curl and wget should be added
         assert!(profile.allow_exec.contains(&PathBuf::from("/usr/bin/curl")));
         assert!(profile.allow_exec.contains(&PathBuf::from("/usr/bin/wget")));
-
-        // Domain should be in allow_domains
         assert!(profile.allow_domains.iter().any(|d| d.0 == "example.com"));
     }
 
@@ -321,9 +453,7 @@ mod tests {
         let home = PathBuf::from("/Users/test");
         let pwd = PathBuf::from("/Users/test/project");
         let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &pwd);
-
         profile.finalize();
-
         assert!(!profile.allow_exec.contains(&PathBuf::from("/usr/bin/curl")));
     }
 
@@ -334,7 +464,6 @@ mod tests {
         let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, &home, &pwd);
         let original_domain_count = profile.allow_domains.len();
 
-        // github.com is already in Rust defaults — adding via allow_fetch should not duplicate
         let overrides = ProfileOverrides {
             allow_fetch: vec![DomainPattern::from("github.com")],
             ..Default::default()

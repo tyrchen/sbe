@@ -1,0 +1,176 @@
+# sbe built-in default profiles.
+# Embedded into the binary at compile time via include_str!.
+# Paths support ~ (home dir) and $PWD (working directory) placeholders.
+
+common:
+  denyRead:
+    - "~/.ssh"
+    - "~/.gnupg"
+    - "~/.aws"
+    - "~/.azure"
+    - "~/.config/gcloud"
+    - "~/Library/Keychains"
+    - "~/.docker/config.json"
+    - "~/.netrc"
+    - "~/Library/Application Support/Google/Chrome"
+    - "~/Library/Application Support/Firefox"
+    - "~/Library/Application Support/Microsoft Edge"
+    - "~/Library/Application Support/BraveSoftware/Brave-Browser"
+    - "~/Library/Safari"
+
+  denyExec:
+    - "/usr/bin/osascript"
+    - "/usr/bin/security"
+    - "/usr/sbin/screencapture"
+    - "/usr/bin/open"
+    - "/usr/bin/pbcopy"
+    - "/usr/bin/pbpaste"
+
+  allowExec:
+    # Shells
+    - "/bin/sh"
+    - "/bin/bash"
+    - "/bin/zsh"
+    - "/usr/bin/env"
+    # Archive / compression
+    - "/usr/bin/tar"
+    - "/usr/bin/gzip"
+    # Build toolchain
+    - "/usr/bin/make"
+    - "/usr/bin/cc"
+    - "/usr/bin/ar"
+    - "/usr/bin/ranlib"
+    - "/usr/bin/strip"
+    - "/usr/bin/ld"
+    - "/usr/bin/as"
+    - "/usr/bin/nm"
+    - "/usr/bin/libtool"
+    - "/usr/bin/install_name_tool"
+    # Zig — pure compiler/linker, no network access.
+    # Used for cross-compilation by cargo-lambda, cargo-zigbuild, maturin, etc.
+    - "/opt/homebrew/bin/zig"
+    - "/usr/local/bin/zig"
+    # Xcode / Command Line Tools (cc linker resolves to clang here)
+    - "/Applications/Xcode.app"
+    - "/Library/Developer/CommandLineTools"
+    # cmake — needed by aws-lc-sys, many native deps
+    - "/opt/homebrew/bin/cmake"
+    - "/usr/local/bin/cmake"
+    # pkg-config — needed by many native deps
+    - "/opt/homebrew/bin/pkg-config"
+    - "/usr/local/bin/pkg-config"
+
+profiles:
+  node:
+    allowWrite:
+      - "$PWD"
+      - "~/.npm"
+      - "~/.cache/yarn"
+      - "~/.local/share/pnpm"
+      - "~/.bun"
+      - "~/.cache/bun"
+    allowDomains:
+      - "registry.npmjs.org"
+      - "registry.yarnpkg.com"
+      - "registry.npmmirror.com"
+      - "github.com"
+      - "*.github.com"
+      - "objects.githubusercontent.com"
+    allowExec:
+      - "/usr/local/bin/node"
+      - "/opt/homebrew/bin/node"
+      - "~/.nvm/versions"
+      - "~/.volta"
+      - "/usr/bin/xcodebuild"
+      - "/usr/bin/xcrun"
+
+  rust:
+    allowWrite:
+      - "$PWD"
+      - "~/.cargo/registry"
+      - "~/.cargo/git"
+      - "~/.cargo/bin"
+      - "~/.rustup"
+    allowDomains:
+      - "crates.io"
+      - "static.crates.io"
+      - "index.crates.io"
+      - "static.rust-lang.org"
+      - "github.com"
+      - "*.github.com"
+      - "objects.githubusercontent.com"
+    allowExec:
+      - "~/.cargo/bin"
+      - "~/.rustup/toolchains"
+      - "/usr/bin/xcrun"
+      - "/usr/bin/xcodebuild"
+
+  python:
+    allowWrite:
+      - "$PWD"
+      - "~/.cache/pip"
+      - "~/.cache/uv"
+      - "~/.local/lib"
+      - "~/.local/bin"
+      - "$PWD/.venv"
+      - "$PWD/venv"
+    allowDomains:
+      - "pypi.org"
+      - "files.pythonhosted.org"
+      - "github.com"
+      - "*.github.com"
+      - "objects.githubusercontent.com"
+    allowExec:
+      - "/usr/bin/python3"
+      - "/usr/local/bin"
+      - "/opt/homebrew/bin"
+      - "~/.pyenv"
+      - "~/.local/bin"
+
+  elixir:
+    allowWrite:
+      - "$PWD"
+      - "~/.hex"
+      - "~/.mix"
+      - "~/.cache/rebar3"
+    allowDomains:
+      - "hex.pm"
+      - "repo.hex.pm"
+      - "builds.hex.pm"
+      - "github.com"
+      - "*.github.com"
+      - "objects.githubusercontent.com"
+    allowExec:
+      - "/usr/local/bin/elixir"
+      - "/usr/local/bin/mix"
+      - "/usr/local/bin/erl"
+      - "/opt/homebrew/bin/elixir"
+      - "/opt/homebrew/bin/mix"
+      - "/opt/homebrew/bin/erl"
+      - "~/.asdf"
+      - "~/.kiex"
+
+  java:
+    allowWrite:
+      - "$PWD"
+      - "~/.m2/repository"
+      - "~/.gradle/caches"
+      - "~/.gradle/wrapper"
+      - "$PWD/.gradle"
+      - "$PWD/build"
+      - "$PWD/target"
+    allowDomains:
+      - "repo1.maven.org"
+      - "repo.maven.apache.org"
+      - "plugins.gradle.org"
+      - "services.gradle.org"
+      - "downloads.gradle-dn.com"
+      - "jcenter.bintray.com"
+      - "github.com"
+      - "*.github.com"
+      - "objects.githubusercontent.com"
+    allowExec:
+      - "/usr/bin/java"
+      - "/usr/libexec/java_home"
+      - "/opt/homebrew/opt/openjdk"
+      - "~/.sdkman"
