@@ -83,13 +83,15 @@ impl SbeConfig {
     }
 
     /// Find the project config by walking up from `start` to the filesystem root,
-    /// stopping at a git repository boundary.
+    /// stopping at a git repository boundary. Checks both `.sbe.yaml` and `.sbe.yml`.
     pub fn find_project_config(start: &Path) -> Option<PathBuf> {
         let mut dir = start;
         loop {
-            let candidate = dir.join(".sbe.yaml");
-            if candidate.exists() {
-                return Some(candidate);
+            for name in [".sbe.yaml", ".sbe.yml"] {
+                let candidate = dir.join(name);
+                if candidate.exists() {
+                    return Some(candidate);
+                }
             }
             // Stop at git root
             if dir.join(".git").exists() {

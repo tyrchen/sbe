@@ -40,6 +40,7 @@ pub fn java_profile(home: &Path, pwd: &Path) -> SandboxProfile {
             DomainPattern::from("downloads.gradle-dn.com"),
             DomainPattern::from("jcenter.bintray.com"),
             DomainPattern::from("github.com"),
+            DomainPattern::from("*.github.com"),
             DomainPattern::from("objects.githubusercontent.com"),
         ],
         deny_exec: common_deny_exec(),

@@ -44,6 +44,7 @@ pub fn rust_profile(home: &Path, pwd: &Path) -> SandboxProfile {
             DomainPattern::from("index.crates.io"),
             DomainPattern::from("static.rust-lang.org"),
             DomainPattern::from("github.com"),
+            DomainPattern::from("*.github.com"),
             DomainPattern::from("objects.githubusercontent.com"),
         ],
         deny_exec: common_deny_exec(),

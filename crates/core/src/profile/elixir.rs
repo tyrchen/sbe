@@ -30,6 +30,7 @@ pub fn elixir_profile(home: &Path, pwd: &Path) -> SandboxProfile {
             DomainPattern::from("repo.hex.pm"),
             DomainPattern::from("builds.hex.pm"),
             DomainPattern::from("github.com"),
+            DomainPattern::from("*.github.com"),
             DomainPattern::from("objects.githubusercontent.com"),
         ],
         deny_exec: common_deny_exec(),

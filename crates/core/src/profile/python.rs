@@ -29,6 +29,7 @@ pub fn python_profile(home: &Path, pwd: &Path) -> SandboxProfile {
             DomainPattern::from("pypi.org"),
             DomainPattern::from("files.pythonhosted.org"),
             DomainPattern::from("github.com"),
+            DomainPattern::from("*.github.com"),
             DomainPattern::from("objects.githubusercontent.com"),
         ],
         deny_exec: common_deny_exec(),
