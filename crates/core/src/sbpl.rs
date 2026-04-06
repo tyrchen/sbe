@@ -85,6 +85,9 @@ fn section_file_write(sb: &mut String, profile: &SandboxProfile) {
         // Always allow temp directories for build tools
         writeln!(sb, "    (subpath \"/private/tmp\")").ok();
         writeln!(sb, "    (subpath \"/private/var/folders\")").ok();
+        // /dev/null and /dev/zero — used by Stdio::null() in build scripts
+        writeln!(sb, "    (literal \"/dev/null\")").ok();
+        writeln!(sb, "    (literal \"/dev/zero\")").ok();
         writeln!(sb, ")").ok();
     }
 
