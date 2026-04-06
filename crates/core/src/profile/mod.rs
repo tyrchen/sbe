@@ -241,6 +241,9 @@ pub fn common_allow_exec() -> Vec<PathBuf> {
         PathBuf::from("/usr/bin/nm"),
         PathBuf::from("/usr/bin/libtool"),
         PathBuf::from("/usr/bin/install_name_tool"),
+        // Homebrew / user-installed build tools (zig, cmake, pkg-config, etc.)
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/usr/local/bin"),
         // Xcode / Command Line Tools (needed for linking, native compilation)
         PathBuf::from("/Applications/Xcode.app"),
         PathBuf::from("/Library/Developer/CommandLineTools"),
