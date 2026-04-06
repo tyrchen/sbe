@@ -4,6 +4,17 @@ build:
 test:
 	@cargo nextest run --all-features
 
+fmt:
+	@cargo +nightly fmt
+
+lint:
+	@cargo clippy -- -D warnings
+
+check: fmt lint test
+
+install:
+	@cargo install --path apps/cli
+
 release:
 	@cargo release tag --execute
 	@git cliff -o CHANGELOG.md
@@ -14,4 +25,4 @@ release:
 update-submodule:
 	@git submodule update --init --recursive --remote
 
-.PHONY: build test release update-submodule
+.PHONY: build test fmt lint check install release update-submodule
