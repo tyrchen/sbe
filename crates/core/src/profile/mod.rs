@@ -144,14 +144,15 @@ impl SandboxProfile {
             .map(|d| DomainPattern(d.clone()))
             .collect();
 
-        // Node-specific: monorepos hoist node_modules to workspace root.
-        // Allow exec/write from the git root's node_modules so hoisted binaries work.
+        // Node-specific: monorepos hoist node_modules and package-lock.json
+        // to the workspace root. Allow exec + write for the entire git root
+        // so npm install can write lock files and hoisted binaries can run.
         if ecosystem == Ecosystem::Node
             && let Some(git_root) = find_git_root(pwd)
             && git_root != pwd
         {
             allow_exec.push(git_root.join("node_modules"));
-            allow_write.push(git_root.join("node_modules"));
+            allow_write.push(git_root.to_path_buf());
         }
 
         // Rust-specific: resolve cargo target dir for write + exec
