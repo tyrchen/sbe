@@ -1,0 +1,41 @@
+[workspace]
+members = ["crates/*", "apps/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+authors = ["Tyr Chen <tyr.chen@gmail.com>"]
+edition = "2024"
+license = "MIT"
+documentation = "https://docs.rs/"
+repository = "https://github.com/tyrchen/sbe"
+homepage = "https://github.com/tyrchen/sbe"
+readme = "README.md"
+
+[workspace.dependencies]
+anyhow = "1.0.98"
+clap = { version = "4.5", features = ["derive"] }
+dirs = "6.0"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.142"
+serde_yaml = "0.9.34"
+tempfile = "3.15"
+thiserror = "2.0.12"
+tokio = { version = "1.47.1", features = [
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "signal",
+    "process",
+    "fs",
+    "sync",
+    "time",
+] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["json", "env-filter"] }
+
+# workspace crates
+sbe-core = { path = "crates/core" }
+sbe-proxy = { path = "crates/proxy" }

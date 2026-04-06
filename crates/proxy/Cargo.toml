@@ -1,0 +1,17 @@
+[package]
+name = "sbe-proxy"
+description = "Domain-filtering HTTP CONNECT proxy for sbe sandbox"
+categories = ["development-tools"]
+keywords = ["proxy", "sandbox", "security"]
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+documentation.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

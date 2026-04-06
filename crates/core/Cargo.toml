@@ -1,0 +1,20 @@
+[package]
+name = "sbe-core"
+description = "Core library for sbe — macOS sandbox executor for supply chain defense"
+categories = ["development-tools"]
+keywords = ["sandbox", "security", "macos", "supply-chain"]
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+documentation.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+dirs.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

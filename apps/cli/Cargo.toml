@@ -1,0 +1,28 @@
+[package]
+name = "sbe"
+description = "Run commands in a macOS sandbox with supply chain attack protection"
+categories = ["development-tools", "command-line-utilities"]
+keywords = ["sandbox", "security", "macos", "supply-chain"]
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+documentation.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[[bin]]
+name = "sbe"
+path = "src/main.rs"
+
+[dependencies]
+sbe-core.workspace = true
+sbe-proxy.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+dirs.workspace = true
+serde_yaml.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
