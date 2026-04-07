@@ -187,7 +187,6 @@ mod tests {
         assert!(sbpl.contains("(subpath \"/Users/test/project\")"));
         // Files use literal
         assert!(sbpl.contains("(literal \"/usr/bin/osascript\")"));
-        assert!(sbpl.contains("(literal \"/Users/test/.npmrc\")"));
     }
 
     #[test]

@@ -22,7 +22,8 @@ common:
     - "~/.docker/config.json"
     - "~/.netrc"
     # Package manager tokens
-    - "~/.npmrc"
+    # NOTE: ~/.npmrc is NOT denied — yarn/npm need it for registry config.
+    # Token exfiltration is mitigated by proxy domain filtering.
     - "~/.cargo/credentials.toml"
     - "~/.cargo/credentials"
     - "~/.pypirc"
