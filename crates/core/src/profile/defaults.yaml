@@ -91,6 +91,11 @@ common:
     - "/bin/test"
     - "/bin/expr"
     - "/bin/dd"
+    # Git — used by husky, build scripts, mix deps.get, etc.
+    # Network access is still proxy-controlled; git over HTTPS goes through proxy.
+    - "/usr/bin/git"
+    - "/opt/homebrew/bin/git"
+    - "/usr/local/bin/git"
     # Archive / compression
     - "/usr/bin/tar"
     - "/usr/bin/gzip"
@@ -129,6 +134,8 @@ profiles:
       - "$PWD/"
       - "~/.npm/"
       - "~/.cache/yarn/"
+      - "~/Library/Caches/Yarn/"
+      - "~/.yarn/"
       - "~/.local/share/pnpm/"
       - "~/.bun/"
       - "~/.cache/bun/"
