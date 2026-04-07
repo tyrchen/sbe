@@ -98,11 +98,13 @@ async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
         }
     };
 
-    // Hint when sandboxed command fails — sandbox denials are silent and confusing
-    if code != 0 && !args.audit {
+    // Hint only for exit codes that suggest sandbox permission errors.
+    // 71 = sandbox-exec's EACCES, 126 = shell "command not executable".
+    // Don't spam for normal non-zero exits (e.g., test/lint failures).
+    if matches!(code, 71 | 126) && !args.audit {
         eprintln!(
-            "sbe: command exited with code {code}. If this looks like a permission error, re-run \
-             with --audit to see sandbox denials, or add allowExec/allowFetch to .sbe.yaml"
+            "sbe: command exited with code {code} (likely a sandbox denial). Re-run with --audit \
+             to see details, or add allowExec/allowFetch to .sbe.yaml"
         );
     }
 
