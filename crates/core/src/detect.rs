@@ -45,7 +45,7 @@ impl std::str::FromStr for Ecosystem {
             "rust" | "rs" => Ok(Self::Rust),
             "python" | "py" => Ok(Self::Python),
             "elixir" | "ex" => Ok(Self::Elixir),
-            "java" | "jvm" => Ok(Self::Java),
+            "java" | "jvm" | "scala" | "kotlin" | "kt" | "sbt" => Ok(Self::Java),
             _ => Err(format!("unknown ecosystem: {s}")),
         }
     }
@@ -70,8 +70,9 @@ fn detect_from_command(command: &str) -> Option<Ecosystem> {
         }
         // Elixir
         "mix" | "elixir" | "iex" => Some(Ecosystem::Elixir),
-        // Java
-        "java" | "javac" | "mvn" | "gradle" | "gradlew" => Some(Ecosystem::Java),
+        // Java / Scala / Kotlin
+        "java" | "javac" | "mvn" | "mvnw" | "gradle" | "gradlew" | "sbt" | "scala" | "scalac"
+        | "kotlinc" => Some(Ecosystem::Java),
         _ => None,
     }
 }
@@ -90,6 +91,7 @@ fn detect_from_files(pwd: &Path) -> Option<Ecosystem> {
         ("pom.xml", Ecosystem::Java),
         ("build.gradle", Ecosystem::Java),
         ("build.gradle.kts", Ecosystem::Java),
+        ("build.sbt", Ecosystem::Java),
     ];
 
     for (marker, ecosystem) in markers {
@@ -141,6 +143,10 @@ mod tests {
         assert_eq!(detect_from_command("gradle"), Some(Ecosystem::Java));
         assert_eq!(detect_from_command("gradlew"), Some(Ecosystem::Java));
         assert_eq!(detect_from_command("mvn"), Some(Ecosystem::Java));
+        assert_eq!(detect_from_command("mvnw"), Some(Ecosystem::Java));
+        assert_eq!(detect_from_command("sbt"), Some(Ecosystem::Java));
+        assert_eq!(detect_from_command("scala"), Some(Ecosystem::Java));
+        assert_eq!(detect_from_command("kotlinc"), Some(Ecosystem::Java));
     }
 
     #[test]
@@ -164,6 +170,9 @@ mod tests {
         assert_eq!("py".parse::<Ecosystem>(), Ok(Ecosystem::Python));
         assert_eq!("ex".parse::<Ecosystem>(), Ok(Ecosystem::Elixir));
         assert_eq!("jvm".parse::<Ecosystem>(), Ok(Ecosystem::Java));
+        assert_eq!("scala".parse::<Ecosystem>(), Ok(Ecosystem::Java));
+        assert_eq!("kotlin".parse::<Ecosystem>(), Ok(Ecosystem::Java));
+        assert_eq!("sbt".parse::<Ecosystem>(), Ok(Ecosystem::Java));
         assert!("unknown".parse::<Ecosystem>().is_err());
     }
 }

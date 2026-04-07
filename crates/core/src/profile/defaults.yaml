@@ -147,6 +147,8 @@ profiles:
       - "~/.fnm/"
       - "~/.local/share/fnm/"
       - "~/.local/state/fnm_multishells/"
+      # mise (polyglot version manager)
+      - "~/.local/share/mise/"
       - "/usr/bin/xcodebuild"
       - "/usr/bin/xcrun"
 
@@ -183,6 +185,16 @@ profiles:
       # NOTE: ~/.local/bin/ is NOT writable — prevents trojaning user binaries
       - "$PWD/.venv/"
       - "$PWD/venv/"
+      # uv Python version downloads and tool installs
+      - "~/.local/share/uv/"
+      # Poetry cache
+      - "~/Library/Caches/pypoetry/"
+      - "~/.cache/pypoetry/"
+      # PDM cache
+      - "~/.local/share/pdm/"
+      - "~/Library/Caches/pdm/"
+      # Rye
+      - "~/.rye/"
     allowDomains:
       - "pypi.org"
       - "files.pythonhosted.org"
@@ -197,10 +209,18 @@ profiles:
       - "/usr/local/bin/python3"
       - "/usr/local/bin/pip3"
       - "/usr/local/bin/uv"
+      # Version managers
       - "~/.pyenv/"
       - "~/.local/bin/"
+      # uv-managed Python installations
+      - "~/.local/share/uv/"
+      # Rye-managed Python
+      - "~/.rye/"
+      # Virtual env binaries within project
       - "$PWD/.venv/"
       - "$PWD/venv/"
+      # mise (polyglot version manager)
+      - "~/.local/share/mise/"
 
   elixir:
     allowWrite:
@@ -212,6 +232,7 @@ profiles:
       - "hex.pm"
       - "repo.hex.pm"
       - "builds.hex.pm"
+      - "cdn.hex.pm"
       - "github.com"
       - "codeload.github.com"
       - "objects.githubusercontent.com"
@@ -222,8 +243,12 @@ profiles:
       - "/opt/homebrew/bin/elixir"
       - "/opt/homebrew/bin/mix"
       - "/opt/homebrew/bin/erl"
+      # rebar3 downloads and runs plugins
+      - "~/.cache/rebar3/"
+      # Version managers
       - "~/.asdf/"
       - "~/.kiex/"
+      - "~/.local/share/mise/"
 
   java:
     allowWrite:
@@ -234,6 +259,12 @@ profiles:
       - "$PWD/.gradle/"
       - "$PWD/build/"
       - "$PWD/target/"
+      # Scala / sbt
+      - "~/.sbt/"
+      - "~/.ivy2/"
+      # Coursier (Scala dependency manager)
+      - "~/.cache/coursier/"
+      - "~/Library/Caches/Coursier/"
     allowDomains:
       - "repo1.maven.org"
       - "repo.maven.apache.org"
@@ -244,8 +275,24 @@ profiles:
       - "github.com"
       - "codeload.github.com"
       - "objects.githubusercontent.com"
+      # Scala
+      - "repo.scala-sbt.org"
+      - "scala-ci.typesafe.com"
     allowExec:
       - "/usr/bin/java"
       - "/usr/libexec/java_home"
       - "/opt/homebrew/opt/openjdk/"
       - "~/.sdkman/"
+      # Gradle wrapper runs from here
+      - "~/.gradle/wrapper/"
+      # Coursier downloads launchers here
+      - "~/.cache/coursier/"
+      - "~/Library/Caches/Coursier/"
+      # Scala / sbt tools
+      - "/opt/homebrew/bin/sbt"
+      - "/opt/homebrew/bin/scala"
+      - "/opt/homebrew/bin/scalac"
+      - "/usr/local/bin/sbt"
+      - "/usr/local/bin/scala"
+      - "/usr/local/bin/scalac"
+      - "~/.local/share/mise/"
