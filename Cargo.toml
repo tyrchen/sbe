@@ -37,5 +37,5 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["json", "env-filter"] }
 
 # workspace crates
-sbe-core = { path = "crates/core" }
-sbe-proxy = { path = "crates/proxy" }
+sbe-core = { path = "crates/core", version = "0.1.0" }
+sbe-proxy = { path = "crates/proxy", version = "0.1.0" }

@@ -10,6 +10,7 @@ license.workspace = true
 documentation.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme.workspace = true
 
 [[bin]]
 name = "sbe"
