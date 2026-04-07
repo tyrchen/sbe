@@ -285,11 +285,11 @@ pub fn print_profiles() {
         println!("=== {} ===", profile.name);
         println!("  Write paths:");
         for p in &profile.allow_write {
-            println!("    - {}", p.display());
+            println!("    - {p}");
         }
         println!("  Denied read paths:");
         for p in &profile.deny_read {
-            println!("    - {}", p.display());
+            println!("    - {p}");
         }
         println!("  Allowed domains:");
         for d in &profile.allow_domains {
@@ -297,11 +297,11 @@ pub fn print_profiles() {
         }
         println!("  Denied executables:");
         for p in &profile.deny_exec {
-            println!("    - {}", p.display());
+            println!("    - {p}");
         }
         println!("  Allowed executables:");
         for p in &profile.allow_exec {
-            println!("    - {}", p.display());
+            println!("    - {p}");
         }
         println!();
     }

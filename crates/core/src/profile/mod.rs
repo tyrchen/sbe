@@ -6,7 +6,10 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{config::expand_path, detect::Ecosystem};
+use crate::{
+    config::{SandboxPath, expand_path},
+    detect::Ecosystem,
+};
 
 /// Embedded default profiles YAML, compiled into the binary.
 const DEFAULTS_YAML: &str = include_str!("defaults.yaml");
@@ -52,11 +55,11 @@ pub struct SandboxProfile {
 
     /// Paths allowed for writing (expanded, absolute).
     #[serde(default)]
-    pub allow_write: Vec<PathBuf>,
+    pub allow_write: Vec<SandboxPath>,
 
     /// Paths denied for reading (expanded, absolute).
     #[serde(default)]
-    pub deny_read: Vec<PathBuf>,
+    pub deny_read: Vec<SandboxPath>,
 
     /// Domains allowed for outbound HTTPS.
     #[serde(default)]
@@ -64,11 +67,11 @@ pub struct SandboxProfile {
 
     /// Binary paths denied for execution.
     #[serde(default)]
-    pub deny_exec: Vec<PathBuf>,
+    pub deny_exec: Vec<SandboxPath>,
 
     /// Binary paths explicitly allowed for execution.
     #[serde(default)]
-    pub allow_exec: Vec<PathBuf>,
+    pub allow_exec: Vec<SandboxPath>,
 
     /// Whether to enable the domain-filtering proxy.
     #[serde(default = "default_true")]
@@ -108,7 +111,7 @@ impl SandboxProfile {
             .unwrap_or_else(|| panic!("missing profile '{profile_name}' in defaults.yaml"));
 
         // Build allow_exec: common + ecosystem-specific
-        let mut allow_exec: Vec<PathBuf> = common
+        let mut allow_exec: Vec<SandboxPath> = common
             .allow_exec
             .iter()
             .chain(eco_cfg.allow_exec.iter())
@@ -116,7 +119,7 @@ impl SandboxProfile {
             .collect();
 
         // Build deny_exec: from common (also resolve symlinks for deny rules)
-        let mut deny_exec: Vec<PathBuf> = common
+        let mut deny_exec: Vec<SandboxPath> = common
             .deny_exec
             .iter()
             .map(|p| expand_path(p, home, pwd))
@@ -124,14 +127,14 @@ impl SandboxProfile {
         resolve_symlinks(&mut deny_exec);
 
         // Build deny_read: from common
-        let deny_read: Vec<PathBuf> = common
+        let deny_read: Vec<SandboxPath> = common
             .deny_read
             .iter()
             .map(|p| expand_path(p, home, pwd))
             .collect();
 
         // Build allow_write: from ecosystem
-        let mut allow_write: Vec<PathBuf> = eco_cfg
+        let mut allow_write: Vec<SandboxPath> = eco_cfg
             .allow_write
             .iter()
             .map(|p| expand_path(p, home, pwd))
@@ -152,23 +155,23 @@ impl SandboxProfile {
             && let Some(git_root) = find_git_root(pwd)
             && git_root != pwd
         {
-            allow_exec.push(git_root.join("node_modules"));
-            allow_write.push(git_root.join("node_modules"));
-            allow_write.push(git_root.join("package-lock.json"));
-            allow_write.push(git_root.join("yarn.lock"));
-            allow_write.push(git_root.join("pnpm-lock.yaml"));
-            allow_write.push(git_root.join(".yarn"));
-            allow_write.push(git_root.join(".pnp.cjs"));
-            allow_write.push(git_root.join(".pnp.loader.mjs"));
+            allow_exec.push(SandboxPath::dir(git_root.join("node_modules")));
+            allow_write.push(SandboxPath::dir(git_root.join("node_modules")));
+            allow_write.push(SandboxPath::file(git_root.join("package-lock.json")));
+            allow_write.push(SandboxPath::file(git_root.join("yarn.lock")));
+            allow_write.push(SandboxPath::file(git_root.join("pnpm-lock.yaml")));
+            allow_write.push(SandboxPath::dir(git_root.join(".yarn")));
+            allow_write.push(SandboxPath::file(git_root.join(".pnp.cjs")));
+            allow_write.push(SandboxPath::file(git_root.join(".pnp.loader.mjs")));
         }
 
         // Rust-specific: resolve cargo target dir for write + exec
         if ecosystem == Ecosystem::Rust {
             if let Some(target_dir) = resolve_cargo_target_dir(home, pwd) {
-                allow_write.push(target_dir.clone());
-                allow_exec.push(target_dir);
+                allow_write.push(SandboxPath::dir(target_dir.clone()));
+                allow_exec.push(SandboxPath::dir(target_dir));
             } else {
-                allow_exec.push(pwd.join("target"));
+                allow_exec.push(SandboxPath::dir(pwd.join("target")));
             }
         }
 
@@ -176,7 +179,7 @@ impl SandboxProfile {
         if ecosystem == Ecosystem::Java
             && let Ok(java_home) = std::env::var("JAVA_HOME")
         {
-            allow_exec.push(PathBuf::from(java_home));
+            allow_exec.push(SandboxPath::dir(PathBuf::from(java_home)));
         }
 
         // Resolve symlinks: SBPL checks the real path after kernel symlink
@@ -234,12 +237,12 @@ impl SandboxProfile {
     /// Must be called after all merging is complete, before SBPL generation.
     pub fn finalize(&mut self) {
         if !self.allow_fetch.is_empty() {
-            let curl = PathBuf::from("/usr/bin/curl");
-            let wget = PathBuf::from("/usr/bin/wget");
-            if !self.allow_exec.contains(&curl) {
+            let curl = SandboxPath::file(PathBuf::from("/usr/bin/curl"));
+            let wget = SandboxPath::file(PathBuf::from("/usr/bin/wget"));
+            if !self.allow_exec.iter().any(|p| p.path == curl.path) {
                 self.allow_exec.push(curl);
             }
-            if !self.allow_exec.contains(&wget) {
+            if !self.allow_exec.iter().any(|p| p.path == wget.path) {
                 self.allow_exec.push(wget);
             }
 
@@ -262,12 +265,12 @@ impl SandboxProfile {
 /// `/opt/homebrew/Cellar/zig/0.15.2/`) rather than just the binary, because
 /// tools like zig spawn sub-tools from their lib/ directory.
 #[allow(clippy::disallowed_methods)]
-fn resolve_symlinks(paths: &mut Vec<PathBuf>) {
-    let additional: Vec<PathBuf> = paths
+fn resolve_symlinks(paths: &mut Vec<SandboxPath>) {
+    let additional: Vec<SandboxPath> = paths
         .iter()
-        .filter_map(|p| {
-            let resolved = std::fs::canonicalize(p).ok()?;
-            if resolved == *p {
+        .filter_map(|sp| {
+            let resolved = std::fs::canonicalize(&sp.path).ok()?;
+            if resolved == sp.path {
                 return None;
             }
             // For Homebrew Cellar paths, allow the entire package directory.
@@ -275,8 +278,7 @@ fn resolve_symlinks(paths: &mut Vec<PathBuf>) {
             // We want:   /opt/homebrew/Cellar/<pkg>/<version>/
             let resolved_str = resolved.to_string_lossy();
             if let Some(cellar_idx) = resolved_str.find("/Cellar/") {
-                let after_cellar = &resolved_str[cellar_idx + 8..]; // skip "/Cellar/"
-                // Find pkg/version/ (two path components)
+                let after_cellar = &resolved_str[cellar_idx + 8..];
                 let parts: Vec<&str> = after_cellar.splitn(3, '/').collect();
                 if parts.len() >= 2 {
                     let pkg_root = format!(
@@ -285,12 +287,16 @@ fn resolve_symlinks(paths: &mut Vec<PathBuf>) {
                         parts[0],
                         parts[1]
                     );
-                    return Some(PathBuf::from(pkg_root));
+                    return Some(SandboxPath::dir(PathBuf::from(pkg_root)));
                 }
             }
-            Some(resolved)
+            // Preserve the original is_dir flag for non-Cellar symlinks
+            Some(SandboxPath {
+                path: resolved,
+                is_dir: sp.is_dir,
+            })
         })
-        .filter(|resolved| !paths.contains(resolved))
+        .filter(|resolved| !paths.iter().any(|p| p.path == resolved.path))
         .collect();
     paths.extend(additional);
 }
@@ -309,12 +315,12 @@ fn find_git_root(start: &Path) -> Option<PathBuf> {
 /// Overrides from CLI flags that get merged into the resolved profile.
 #[derive(Debug, Default, Clone)]
 pub struct ProfileOverrides {
-    pub allow_write: Vec<PathBuf>,
-    pub deny_read: Vec<PathBuf>,
+    pub allow_write: Vec<SandboxPath>,
+    pub deny_read: Vec<SandboxPath>,
     pub allow_domains: Vec<DomainPattern>,
     pub deny_domains: Vec<DomainPattern>,
-    pub allow_exec: Vec<PathBuf>,
-    pub deny_exec: Vec<PathBuf>,
+    pub allow_exec: Vec<SandboxPath>,
+    pub deny_exec: Vec<SandboxPath>,
     pub allow_fetch: Vec<DomainPattern>,
     pub allow_all_network: bool,
     pub no_proxy: bool,
@@ -433,30 +439,20 @@ mod tests {
         }
     }
 
+    /// Helper: check if a path list contains a given path (ignoring is_dir).
+    fn has(paths: &[SandboxPath], path: &str) -> bool {
+        paths.iter().any(|sp| sp.has_path(Path::new(path)))
+    }
+
     #[test]
     fn test_should_expand_paths_in_defaults() {
         let home = PathBuf::from("/Users/test");
         let pwd = PathBuf::from("/Users/test/project");
         let profile = SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &pwd);
 
-        // ~ should be expanded
-        assert!(
-            profile
-                .deny_read
-                .contains(&PathBuf::from("/Users/test/.ssh"))
-        );
-        // $PWD should be expanded
-        assert!(
-            profile
-                .allow_write
-                .contains(&PathBuf::from("/Users/test/project"))
-        );
-        // Ecosystem-specific paths
-        assert!(
-            profile
-                .allow_write
-                .contains(&PathBuf::from("/Users/test/.npm"))
-        );
+        assert!(has(&profile.deny_read, "/Users/test/.ssh"));
+        assert!(has(&profile.allow_write, "/Users/test/project"));
+        assert!(has(&profile.allow_write, "/Users/test/.npm"));
     }
 
     #[test]
@@ -467,17 +463,15 @@ mod tests {
         for eco in Ecosystem::ALL {
             let profile = SandboxProfile::for_ecosystem(eco, &home, &pwd);
             assert!(
-                profile.allow_exec.contains(&PathBuf::from("/bin/sh")),
+                has(&profile.allow_exec, "/bin/sh"),
                 "missing /bin/sh for {eco}"
             );
             assert!(
-                profile.allow_exec.contains(&PathBuf::from("/usr/bin/cc")),
+                has(&profile.allow_exec, "/usr/bin/cc"),
                 "missing /usr/bin/cc for {eco}"
             );
             assert!(
-                profile
-                    .deny_exec
-                    .contains(&PathBuf::from("/usr/bin/osascript")),
+                has(&profile.deny_exec, "/usr/bin/osascript"),
                 "missing osascript deny for {eco}"
             );
         }
@@ -491,7 +485,7 @@ mod tests {
         let original_write_count = profile.allow_write.len();
 
         let overrides = ProfileOverrides {
-            allow_write: vec![PathBuf::from("/extra/path")],
+            allow_write: vec![SandboxPath::dir(PathBuf::from("/extra/path"))],
             deny_domains: vec![DomainPattern::from("registry.npmmirror.com")],
             ..Default::default()
         };
@@ -512,7 +506,7 @@ mod tests {
         let pwd = PathBuf::from("/Users/test/project");
         let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, &home, &pwd);
 
-        assert!(!profile.allow_exec.contains(&PathBuf::from("/usr/bin/curl")));
+        assert!(!has(&profile.allow_exec, "/usr/bin/curl"));
 
         let overrides = ProfileOverrides {
             allow_fetch: vec![DomainPattern::from("example.com")],
@@ -521,8 +515,8 @@ mod tests {
         profile.merge_overrides(&overrides);
         profile.finalize();
 
-        assert!(profile.allow_exec.contains(&PathBuf::from("/usr/bin/curl")));
-        assert!(profile.allow_exec.contains(&PathBuf::from("/usr/bin/wget")));
+        assert!(has(&profile.allow_exec, "/usr/bin/curl"));
+        assert!(has(&profile.allow_exec, "/usr/bin/wget"));
         assert!(profile.allow_domains.iter().any(|d| d.0 == "example.com"));
     }
 
@@ -532,7 +526,7 @@ mod tests {
         let pwd = PathBuf::from("/Users/test/project");
         let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &pwd);
         profile.finalize();
-        assert!(!profile.allow_exec.contains(&PathBuf::from("/usr/bin/curl")));
+        assert!(!has(&profile.allow_exec, "/usr/bin/curl"));
     }
 
     #[test]
@@ -550,6 +544,6 @@ mod tests {
         profile.finalize();
 
         assert_eq!(profile.allow_domains.len(), original_domain_count);
-        assert!(profile.allow_exec.contains(&PathBuf::from("/usr/bin/curl")));
+        assert!(has(&profile.allow_exec, "/usr/bin/curl"));
     }
 }

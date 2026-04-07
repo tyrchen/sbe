@@ -1,39 +1,43 @@
 # sbe built-in default profiles.
 # Embedded into the binary at compile time via include_str!.
-# Paths support ~ (home dir) and $PWD (working directory) placeholders.
+#
+# Path conventions:
+#   ~ expands to home dir, $PWD to working directory
+#   Trailing / means directory → SBPL subpath (recursive match)
+#   No trailing / means file   → SBPL literal (exact match)
 
 common:
   denyRead:
     # SSH / GPG
-    - "~/.ssh"
-    - "~/.gnupg"
+    - "~/.ssh/"
+    - "~/.gnupg/"
     # Cloud credentials
-    - "~/.aws"
-    - "~/.azure"
-    - "~/.config/gcloud"
+    - "~/.aws/"
+    - "~/.azure/"
+    - "~/.config/gcloud/"
     - "~/.kube/config"
     # macOS Keychain
-    - "~/Library/Keychains"
+    - "~/Library/Keychains/"
     # Container / registry auth
     - "~/.docker/config.json"
     - "~/.netrc"
-    # Package manager tokens (prevent exfiltration of publish credentials)
+    # Package manager tokens
     - "~/.npmrc"
     - "~/.cargo/credentials.toml"
     - "~/.cargo/credentials"
     - "~/.pypirc"
     - "~/.hex/hex_api_key"
-    - "~/.config/gh"
+    - "~/.config/gh/"
     # Environment secrets
     - "$PWD/.env"
     - "$PWD/.env.local"
     - "$PWD/.env.production"
-    # Browser profiles (cookies, saved passwords)
-    - "~/Library/Application Support/Google/Chrome"
-    - "~/Library/Application Support/Firefox"
-    - "~/Library/Application Support/Microsoft Edge"
-    - "~/Library/Application Support/BraveSoftware/Brave-Browser"
-    - "~/Library/Safari"
+    # Browser profiles
+    - "~/Library/Application Support/Google/Chrome/"
+    - "~/Library/Application Support/Firefox/"
+    - "~/Library/Application Support/Microsoft Edge/"
+    - "~/Library/Application Support/BraveSoftware/Brave-Browser/"
+    - "~/Library/Safari/"
 
   denyExec:
     - "/usr/bin/osascript"
@@ -49,7 +53,7 @@ common:
     - "/bin/bash"
     - "/bin/zsh"
     - "/usr/bin/env"
-    # Core utilities used by build scripts
+    # Core utilities
     - "/usr/bin/basename"
     - "/usr/bin/dirname"
     - "/usr/bin/cat"
@@ -103,32 +107,30 @@ common:
     - "/usr/bin/nm"
     - "/usr/bin/libtool"
     - "/usr/bin/install_name_tool"
-    # Zig — pure compiler/linker, no network access.
+    # Zig — pure compiler/linker, no network access
     - "/opt/homebrew/bin/zig"
     - "/usr/local/bin/zig"
-    # Xcode / Command Line Tools (cc linker resolves to clang here)
-    - "/Applications/Xcode.app"
-    - "/Library/Developer/CommandLineTools"
-    # cmake — needed by aws-lc-sys, many native deps
+    # Xcode / Command Line Tools (directories — contain toolchains)
+    - "/Applications/Xcode.app/"
+    - "/Library/Developer/CommandLineTools/"
+    # cmake / pkg-config
     - "/opt/homebrew/bin/cmake"
     - "/usr/local/bin/cmake"
-    # pkg-config — needed by many native deps
     - "/opt/homebrew/bin/pkg-config"
     - "/usr/local/bin/pkg-config"
-    # Temp directories — build tools (cargo-zigbuild, cc-rs) create and
-    # execute wrapper scripts here. Safe: scripts inherit the same sandbox.
-    - "/private/tmp"
-    - "/private/var/folders"
+    # Temp directories — build tools create wrapper scripts here
+    - "/private/tmp/"
+    - "/private/var/folders/"
 
 profiles:
   node:
     allowWrite:
-      - "$PWD"
-      - "~/.npm"
-      - "~/.cache/yarn"
-      - "~/.local/share/pnpm"
-      - "~/.bun"
-      - "~/.cache/bun"
+      - "$PWD/"
+      - "~/.npm/"
+      - "~/.cache/yarn/"
+      - "~/.local/share/pnpm/"
+      - "~/.bun/"
+      - "~/.cache/bun/"
     allowDomains:
       - "registry.npmjs.org"
       - "registry.yarnpkg.com"
@@ -137,29 +139,26 @@ profiles:
       - "codeload.github.com"
       - "objects.githubusercontent.com"
     allowExec:
-      - "$PWD/node_modules"
+      - "$PWD/node_modules/"
       - "/usr/local/bin/node"
       - "/opt/homebrew/bin/node"
-      - "~/.nvm"
-      - "~/.volta"
-      - "~/.fnm"
-      - "~/.local/share/fnm"
-      - "~/.local/state/fnm_multishells"
+      - "~/.nvm/"
+      - "~/.volta/"
+      - "~/.fnm/"
+      - "~/.local/share/fnm/"
+      - "~/.local/state/fnm_multishells/"
       - "/usr/bin/xcodebuild"
       - "/usr/bin/xcrun"
 
   rust:
     allowWrite:
-      - "$PWD"
-      - "~/.cargo/registry"
-      - "~/.cargo/git"
-      # NOTE: ~/.cargo/bin is NOT writable — prevents trojaning cargo binaries.
-      # Use `cargo install` outside the sandbox for that.
-      - "~/.rustup"
-      # cargo-zigbuild writes linker wrapper scripts here
-      - "~/Library/Caches/cargo-zigbuild"
-      # zig compiler cache
-      - "~/.cache/zig"
+      - "$PWD/"
+      - "~/.cargo/registry/"
+      - "~/.cargo/git/"
+      # NOTE: ~/.cargo/bin/ is NOT writable — prevents trojaning cargo binaries
+      - "~/.rustup/"
+      - "~/Library/Caches/cargo-zigbuild/"
+      - "~/.cache/zig/"
     allowDomains:
       - "crates.io"
       - "static.crates.io"
@@ -169,23 +168,21 @@ profiles:
       - "codeload.github.com"
       - "objects.githubusercontent.com"
     allowExec:
-      - "~/.cargo/bin"
-      - "~/.rustup/toolchains"
+      - "~/.cargo/bin/"
+      - "~/.rustup/toolchains/"
       - "/usr/bin/xcrun"
       - "/usr/bin/xcodebuild"
-      # cargo-zigbuild linker wrapper scripts
-      - "~/Library/Caches/cargo-zigbuild"
+      - "~/Library/Caches/cargo-zigbuild/"
 
   python:
     allowWrite:
-      - "$PWD"
-      - "~/.cache/pip"
-      - "~/.cache/uv"
-      - "~/.local/lib"
-      # NOTE: ~/.local/bin is NOT writable — prevents trojaning user binaries.
-      # Use `pip install` outside the sandbox for global tool installs.
-      - "$PWD/.venv"
-      - "$PWD/venv"
+      - "$PWD/"
+      - "~/.cache/pip/"
+      - "~/.cache/uv/"
+      - "~/.local/lib/"
+      # NOTE: ~/.local/bin/ is NOT writable — prevents trojaning user binaries
+      - "$PWD/.venv/"
+      - "$PWD/venv/"
     allowDomains:
       - "pypi.org"
       - "files.pythonhosted.org"
@@ -193,28 +190,24 @@ profiles:
       - "codeload.github.com"
       - "objects.githubusercontent.com"
     allowExec:
-      # System python
       - "/usr/bin/python3"
-      # Homebrew python — specific binaries, NOT the entire /opt/homebrew/bin
       - "/opt/homebrew/bin/python3"
       - "/opt/homebrew/bin/pip3"
       - "/opt/homebrew/bin/uv"
       - "/usr/local/bin/python3"
       - "/usr/local/bin/pip3"
       - "/usr/local/bin/uv"
-      # Version managers
-      - "~/.pyenv"
-      - "~/.local/bin"
-      # Virtual env binaries within project
-      - "$PWD/.venv"
-      - "$PWD/venv"
+      - "~/.pyenv/"
+      - "~/.local/bin/"
+      - "$PWD/.venv/"
+      - "$PWD/venv/"
 
   elixir:
     allowWrite:
-      - "$PWD"
-      - "~/.hex"
-      - "~/.mix"
-      - "~/.cache/rebar3"
+      - "$PWD/"
+      - "~/.hex/"
+      - "~/.mix/"
+      - "~/.cache/rebar3/"
     allowDomains:
       - "hex.pm"
       - "repo.hex.pm"
@@ -229,18 +222,18 @@ profiles:
       - "/opt/homebrew/bin/elixir"
       - "/opt/homebrew/bin/mix"
       - "/opt/homebrew/bin/erl"
-      - "~/.asdf"
-      - "~/.kiex"
+      - "~/.asdf/"
+      - "~/.kiex/"
 
   java:
     allowWrite:
-      - "$PWD"
-      - "~/.m2/repository"
-      - "~/.gradle/caches"
-      - "~/.gradle/wrapper"
-      - "$PWD/.gradle"
-      - "$PWD/build"
-      - "$PWD/target"
+      - "$PWD/"
+      - "~/.m2/repository/"
+      - "~/.gradle/caches/"
+      - "~/.gradle/wrapper/"
+      - "$PWD/.gradle/"
+      - "$PWD/build/"
+      - "$PWD/target/"
     allowDomains:
       - "repo1.maven.org"
       - "repo.maven.apache.org"
@@ -254,5 +247,5 @@ profiles:
     allowExec:
       - "/usr/bin/java"
       - "/usr/libexec/java_home"
-      - "/opt/homebrew/opt/openjdk"
-      - "~/.sdkman"
+      - "/opt/homebrew/opt/openjdk/"
+      - "~/.sdkman/"

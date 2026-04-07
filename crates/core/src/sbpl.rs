@@ -1,6 +1,6 @@
-use std::{fmt::Write, path::Path};
+use std::fmt::Write;
 
-use crate::profile::SandboxProfile;
+use crate::{config::SandboxPath, profile::SandboxProfile};
 
 /// Generate a Seatbelt Profile Language (SBPL) policy string from a `SandboxProfile`.
 ///
@@ -19,17 +19,10 @@ pub fn generate(profile: &SandboxProfile, proxy_port: Option<u16>) -> String {
     writeln!(sb, "(deny default)").ok();
     writeln!(sb).ok();
 
-    // Process control
     section_process(&mut sb, profile);
-
-    // File system
     section_file_read(&mut sb, profile);
     section_file_write(&mut sb, profile);
-
-    // Network
     section_network(&mut sb, profile, proxy_port);
-
-    // Miscellaneous required permissions
     section_misc(&mut sb);
 
     sb
@@ -40,17 +33,16 @@ fn section_process(sb: &mut String, profile: &SandboxProfile) {
     writeln!(sb, "(allow process-fork)").ok();
     writeln!(sb, "(allow process-exec").ok();
 
-    for path in &profile.allow_exec {
-        write_path_filter(sb, path, "    ");
+    for sp in &profile.allow_exec {
+        write_sandbox_path(sb, sp, "    ");
     }
 
     writeln!(sb, ")").ok();
 
-    // Deny risky binaries (deny rules override allow in SBPL when placed after)
     if !profile.deny_exec.is_empty() {
         writeln!(sb, "(deny process-exec").ok();
-        for path in &profile.deny_exec {
-            write_path_filter(sb, path, "    ");
+        for sp in &profile.deny_exec {
+            write_sandbox_path(sb, sp, "    ");
         }
         writeln!(sb, ")").ok();
     }
@@ -64,8 +56,8 @@ fn section_file_read(sb: &mut String, profile: &SandboxProfile) {
 
     if !profile.deny_read.is_empty() {
         writeln!(sb, "(deny file-read*").ok();
-        for path in &profile.deny_read {
-            write_path_filter(sb, path, "    ");
+        for sp in &profile.deny_read {
+            write_sandbox_path(sb, sp, "    ");
         }
         writeln!(sb, ")").ok();
     }
@@ -79,8 +71,8 @@ fn section_file_write(sb: &mut String, profile: &SandboxProfile) {
 
     if !profile.allow_write.is_empty() {
         writeln!(sb, "(allow file-write*").ok();
-        for path in &profile.allow_write {
-            write_path_filter(sb, path, "    ");
+        for sp in &profile.allow_write {
+            write_sandbox_path(sb, sp, "    ");
         }
         // Always allow temp directories for build tools
         writeln!(sb, "    (subpath \"/private/tmp\")").ok();
@@ -100,7 +92,6 @@ fn section_network(sb: &mut String, profile: &SandboxProfile, proxy_port: Option
     if profile.allow_all_network {
         writeln!(sb, "(allow network*)").ok();
     } else if let Some(port) = proxy_port {
-        // Proxy mode: only allow connections to the local proxy + DNS
         writeln!(sb, "(deny network*)").ok();
         writeln!(sb, "(allow network-outbound").ok();
         writeln!(sb, "    (remote tcp \"localhost:{port}\")").ok();
@@ -109,7 +100,6 @@ fn section_network(sb: &mut String, profile: &SandboxProfile, proxy_port: Option
         writeln!(sb, ")").ok();
         writeln!(sb, "(allow network-inbound (local ip \"localhost:*\"))").ok();
     } else if !profile.allow_domains.is_empty() && profile.enable_proxy {
-        // Proxy mode requested but no port yet — allow localhost broadly
         writeln!(sb, "(deny network*)").ok();
         writeln!(sb, "(allow network-outbound").ok();
         writeln!(sb, "    (remote ip \"localhost:*\")").ok();
@@ -117,7 +107,6 @@ fn section_network(sb: &mut String, profile: &SandboxProfile, proxy_port: Option
         writeln!(sb, ")").ok();
         writeln!(sb, "(allow network-inbound (local ip \"localhost:*\"))").ok();
     } else {
-        // No proxy mode: allow HTTPS only (port 443)
         writeln!(sb, "(deny network*)").ok();
         writeln!(sb, "(allow network-outbound").ok();
         writeln!(sb, "    (remote tcp \"*:443\")").ok();
@@ -133,8 +122,6 @@ fn section_network(sb: &mut String, profile: &SandboxProfile, proxy_port: Option
 fn section_misc(sb: &mut String) {
     writeln!(sb, ";; Miscellaneous required permissions").ok();
     writeln!(sb, "(allow sysctl-read)").ok();
-    // Mach IPC: only allow services required for build tools, DNS, and system libs.
-    // Unrestricted mach-lookup would expose Keychain, clipboard, and other services.
     writeln!(sb, "(allow mach-lookup").ok();
     writeln!(sb, "    (global-name \"com.apple.system.logger\")").ok();
     writeln!(
@@ -165,70 +152,13 @@ fn section_misc(sb: &mut String) {
     writeln!(sb, "(allow signal (target self))").ok();
 }
 
-/// Write a path filter expression.
+/// Write an SBPL path filter from a `SandboxPath`.
 ///
-/// Uses `subpath` for directories (matches the dir and everything under it)
-/// and `literal` for individual files (exact match only). This distinction
-/// matters for security: `(subpath "/usr/bin/curl")` would match any path
-/// starting with that prefix, while `(literal "/usr/bin/curl")` is exact.
-fn write_path_filter(sb: &mut String, path: &Path, indent: &str) {
-    if is_directory_path(path) {
-        writeln!(sb, "{indent}(subpath \"{path}\")", path = path.display()).ok();
-    } else {
-        writeln!(sb, "{indent}(literal \"{path}\")", path = path.display()).ok();
-    }
-}
-
-/// Determine whether a path should be treated as a directory (subpath) or file (literal).
-///
-/// Checks the filesystem first. For paths that don't exist yet, uses heuristics:
-/// - Paths in known binary dirs → file (literal)
-/// - Paths with file extensions (`.json`, `.toml`, `.yaml`) → file (literal)
-/// - Dotfiles without subdirectory structure (`.env`, `.npmrc`) → file (literal)
-/// - Everything else → directory (subpath)
-fn is_directory_path(path: &Path) -> bool {
-    if path.exists() {
-        return path.is_dir();
-    }
-
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-
-    // Paths in known binary directories are files
-    if let Some(parent) = path.parent().and_then(|p| p.to_str()) {
-        let binary_dirs = [
-            "/bin",
-            "/usr/bin",
-            "/usr/sbin",
-            "/usr/libexec",
-            "/opt/homebrew/bin",
-            "/usr/local/bin",
-        ];
-        if binary_dirs.contains(&parent) {
-            return false;
-        }
-    }
-
-    // Paths with file extensions are files
-    if path.extension().is_some() {
-        return false;
-    }
-
-    // Dotfiles without extensions that look like config files (not directories)
-    // e.g., .env, .npmrc, .netrc, .pypirc — these are files, not directories
-    let config_dotfiles = [
-        ".env",
-        ".env.local",
-        ".env.production",
-        ".npmrc",
-        ".netrc",
-        ".pypirc",
-        ".yarnrc",
-    ];
-    if config_dotfiles.contains(&name) {
-        return false;
-    }
-
-    true
+/// `is_dir == true` → `(subpath ...)` (matches directory and all contents)
+/// `is_dir == false` → `(literal ...)` (exact file match only)
+fn write_sandbox_path(sb: &mut String, sp: &SandboxPath, indent: &str) {
+    let kind = if sp.is_dir { "subpath" } else { "literal" };
+    writeln!(sb, "{indent}({kind} \"{}\")", sp.path.display()).ok();
 }
 
 #[cfg(test)]
@@ -251,9 +181,13 @@ mod tests {
         assert!(sbpl.contains("(allow file-read*)"));
         assert!(sbpl.contains("(deny file-write*)"));
         assert!(sbpl.contains("(deny file-read*"));
-        assert!(sbpl.contains("/Users/test/.ssh"));
-        assert!(sbpl.contains("/Users/test/project"));
-        assert!(sbpl.contains("osascript"));
+        // Directories use subpath
+        assert!(sbpl.contains("(subpath \"/Users/test/.ssh\")"));
+        // Project dir uses subpath
+        assert!(sbpl.contains("(subpath \"/Users/test/project\")"));
+        // Files use literal
+        assert!(sbpl.contains("(literal \"/usr/bin/osascript\")"));
+        assert!(sbpl.contains("(literal \"/Users/test/.npmrc\")"));
     }
 
     #[test]
@@ -298,10 +232,8 @@ mod tests {
         profile.enable_proxy = false;
         let sbpl = generate(&profile, None);
 
-        // No proxy mode: should allow port 443 directly and localhost for local services
         assert!(sbpl.contains("(remote tcp \"*:443\")"));
         assert!(sbpl.contains("(remote ip \"localhost:*\")"));
-        // Should NOT have a specific proxy port
         assert!(!sbpl.contains("(remote tcp \"localhost:"));
     }
 
@@ -314,7 +246,6 @@ mod tests {
         profile.enable_proxy = false;
         let sbpl = generate(&profile, None);
 
-        // Should still allow port 443 as fallback
         assert!(sbpl.contains("(deny network*)"));
         assert!(sbpl.contains("(remote tcp \"*:443\")"));
     }
@@ -333,5 +264,33 @@ mod tests {
                 "missing deny default for {eco}"
             );
         }
+    }
+
+    #[test]
+    fn test_should_use_literal_for_files_and_subpath_for_dirs() {
+        let home = PathBuf::from("/Users/test");
+        let pwd = PathBuf::from("/Users/test/project");
+        let profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, &home, &pwd);
+        let sbpl = generate(&profile, None);
+
+        // Individual binaries should be literal
+        assert!(sbpl.contains("(literal \"/bin/sh\")"));
+        assert!(sbpl.contains("(literal \"/usr/bin/cc\")"));
+        // Directories should be subpath
+        assert!(sbpl.contains("(subpath \"/Users/test/.cargo/bin\")"));
+        assert!(sbpl.contains("(subpath \"/Users/test/.rustup/toolchains\")"));
+    }
+
+    #[test]
+    fn test_should_scope_mach_lookup() {
+        let home = PathBuf::from("/Users/test");
+        let pwd = PathBuf::from("/Users/test/project");
+        let profile = SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &pwd);
+        let sbpl = generate(&profile, None);
+
+        // Should have scoped mach-lookup, not blanket allow
+        assert!(sbpl.contains("(allow mach-lookup"));
+        assert!(sbpl.contains("global-name"));
+        assert!(!sbpl.contains("(allow mach-lookup)"));
     }
 }

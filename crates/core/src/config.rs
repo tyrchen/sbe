@@ -145,9 +145,54 @@ impl ProfileConfig {
     }
 }
 
-/// Expand path placeholders: `~` to home, `$PWD` to pwd, `$HOME` to home, `./` to pwd.
-pub fn expand_path(raw: &str, home: &Path, pwd: &Path) -> PathBuf {
-    if raw == "$PWD" {
+/// A path with an explicit directory/file flag for SBPL generation.
+///
+/// Convention: in YAML configs, paths ending with `/` are directories
+/// (generate SBPL `subpath`), paths without trailing `/` are files
+/// (generate SBPL `literal`). This eliminates heuristics and filesystem
+/// checks — the YAML author declares intent explicitly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxPath {
+    pub path: PathBuf,
+    pub is_dir: bool,
+}
+
+impl SandboxPath {
+    pub fn dir(path: PathBuf) -> Self {
+        Self { path, is_dir: true }
+    }
+
+    pub fn file(path: PathBuf) -> Self {
+        Self {
+            path,
+            is_dir: false,
+        }
+    }
+}
+
+impl SandboxPath {
+    /// Check if this sandbox path matches a given filesystem path (ignoring is_dir).
+    pub fn has_path(&self, path: &Path) -> bool {
+        self.path == path
+    }
+}
+
+impl std::fmt::Display for SandboxPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.path.display().fmt(f)
+    }
+}
+
+/// Expand path placeholders and detect directory vs file from trailing `/`.
+///
+/// - `~/.ssh/` → directory (subpath)
+/// - `~/.npmrc` → file (literal)
+/// - `$PWD/` → directory
+pub fn expand_path(raw: &str, home: &Path, pwd: &Path) -> SandboxPath {
+    let is_dir = raw.ends_with('/');
+    let raw = raw.strip_suffix('/').unwrap_or(raw);
+
+    let path = if raw == "$PWD" {
         pwd.to_path_buf()
     } else if let Some(rest) = raw.strip_prefix("$PWD/") {
         pwd.join(rest)
@@ -166,9 +211,10 @@ pub fn expand_path(raw: &str, home: &Path, pwd: &Path) -> PathBuf {
     } else if raw.starts_with('/') {
         PathBuf::from(raw)
     } else {
-        // Relative path — resolve against pwd
         pwd.join(raw)
-    }
+    };
+
+    SandboxPath { path, is_dir }
 }
 
 /// Load and merge configuration from all sources.
@@ -236,30 +282,42 @@ mod tests {
     fn test_should_expand_home_path() {
         let home = PathBuf::from("/Users/test");
         let pwd = PathBuf::from("/Users/test/project");
-        assert_eq!(
-            expand_path("~/.ssh", &home, &pwd),
-            PathBuf::from("/Users/test/.ssh")
-        );
+        let sp = expand_path("~/.ssh/", &home, &pwd);
+        assert_eq!(sp.path, PathBuf::from("/Users/test/.ssh"));
+        assert!(sp.is_dir);
     }
 
     #[test]
     fn test_should_expand_relative_path() {
         let home = PathBuf::from("/Users/test");
         let pwd = PathBuf::from("/Users/test/project");
-        assert_eq!(
-            expand_path("./node_modules", &home, &pwd),
-            PathBuf::from("/Users/test/project/node_modules")
-        );
+        let sp = expand_path("./node_modules/", &home, &pwd);
+        assert_eq!(sp.path, PathBuf::from("/Users/test/project/node_modules"));
+        assert!(sp.is_dir);
     }
 
     #[test]
-    fn test_should_keep_absolute_path() {
+    fn test_should_keep_absolute_path_as_file() {
         let home = PathBuf::from("/Users/test");
         let pwd = PathBuf::from("/Users/test/project");
-        assert_eq!(
-            expand_path("/usr/bin/osascript", &home, &pwd),
-            PathBuf::from("/usr/bin/osascript")
-        );
+        let sp = expand_path("/usr/bin/osascript", &home, &pwd);
+        assert_eq!(sp.path, PathBuf::from("/usr/bin/osascript"));
+        assert!(!sp.is_dir);
+    }
+
+    #[test]
+    fn test_should_detect_dir_from_trailing_slash() {
+        let home = PathBuf::from("/Users/test");
+        let pwd = PathBuf::from("/Users/test/project");
+
+        let dir = expand_path("~/.cargo/bin/", &home, &pwd);
+        assert!(dir.is_dir);
+
+        let file = expand_path("~/.cargo/credentials.toml", &home, &pwd);
+        assert!(!file.is_dir);
+
+        let pwd_dir = expand_path("$PWD/", &home, &pwd);
+        assert!(pwd_dir.is_dir);
     }
 
     #[test]
