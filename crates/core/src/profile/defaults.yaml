@@ -121,6 +121,7 @@ profiles:
       - "*.github.com"
       - "objects.githubusercontent.com"
     allowExec:
+      - "$PWD/node_modules"
       - "/usr/local/bin/node"
       - "/opt/homebrew/bin/node"
       - "~/.nvm"
