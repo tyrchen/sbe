@@ -4,14 +4,31 @@
 
 common:
   denyRead:
+    # SSH / GPG
     - "~/.ssh"
     - "~/.gnupg"
+    # Cloud credentials
     - "~/.aws"
     - "~/.azure"
     - "~/.config/gcloud"
+    - "~/.kube/config"
+    # macOS Keychain
     - "~/Library/Keychains"
+    # Container / registry auth
     - "~/.docker/config.json"
     - "~/.netrc"
+    # Package manager tokens (prevent exfiltration of publish credentials)
+    - "~/.npmrc"
+    - "~/.cargo/credentials.toml"
+    - "~/.cargo/credentials"
+    - "~/.pypirc"
+    - "~/.hex/hex_api_key"
+    - "~/.config/gh"
+    # Environment secrets
+    - "$PWD/.env"
+    - "$PWD/.env.local"
+    - "$PWD/.env.production"
+    # Browser profiles (cookies, saved passwords)
     - "~/Library/Application Support/Google/Chrome"
     - "~/Library/Application Support/Firefox"
     - "~/Library/Application Support/Microsoft Edge"
@@ -87,7 +104,6 @@ common:
     - "/usr/bin/libtool"
     - "/usr/bin/install_name_tool"
     # Zig — pure compiler/linker, no network access.
-    # Used for cross-compilation by cargo-lambda, cargo-zigbuild, maturin, etc.
     - "/opt/homebrew/bin/zig"
     - "/usr/local/bin/zig"
     # Xcode / Command Line Tools (cc linker resolves to clang here)
@@ -118,7 +134,7 @@ profiles:
       - "registry.yarnpkg.com"
       - "registry.npmmirror.com"
       - "github.com"
-      - "*.github.com"
+      - "codeload.github.com"
       - "objects.githubusercontent.com"
     allowExec:
       - "$PWD/node_modules"
@@ -137,7 +153,8 @@ profiles:
       - "$PWD"
       - "~/.cargo/registry"
       - "~/.cargo/git"
-      - "~/.cargo/bin"
+      # NOTE: ~/.cargo/bin is NOT writable — prevents trojaning cargo binaries.
+      # Use `cargo install` outside the sandbox for that.
       - "~/.rustup"
       # cargo-zigbuild writes linker wrapper scripts here
       - "~/Library/Caches/cargo-zigbuild"
@@ -149,7 +166,7 @@ profiles:
       - "index.crates.io"
       - "static.rust-lang.org"
       - "github.com"
-      - "*.github.com"
+      - "codeload.github.com"
       - "objects.githubusercontent.com"
     allowExec:
       - "~/.cargo/bin"
@@ -165,21 +182,32 @@ profiles:
       - "~/.cache/pip"
       - "~/.cache/uv"
       - "~/.local/lib"
-      - "~/.local/bin"
+      # NOTE: ~/.local/bin is NOT writable — prevents trojaning user binaries.
+      # Use `pip install` outside the sandbox for global tool installs.
       - "$PWD/.venv"
       - "$PWD/venv"
     allowDomains:
       - "pypi.org"
       - "files.pythonhosted.org"
       - "github.com"
-      - "*.github.com"
+      - "codeload.github.com"
       - "objects.githubusercontent.com"
     allowExec:
+      # System python
       - "/usr/bin/python3"
-      - "/usr/local/bin"
-      - "/opt/homebrew/bin"
+      # Homebrew python — specific binaries, NOT the entire /opt/homebrew/bin
+      - "/opt/homebrew/bin/python3"
+      - "/opt/homebrew/bin/pip3"
+      - "/opt/homebrew/bin/uv"
+      - "/usr/local/bin/python3"
+      - "/usr/local/bin/pip3"
+      - "/usr/local/bin/uv"
+      # Version managers
       - "~/.pyenv"
       - "~/.local/bin"
+      # Virtual env binaries within project
+      - "$PWD/.venv"
+      - "$PWD/venv"
 
   elixir:
     allowWrite:
@@ -192,7 +220,7 @@ profiles:
       - "repo.hex.pm"
       - "builds.hex.pm"
       - "github.com"
-      - "*.github.com"
+      - "codeload.github.com"
       - "objects.githubusercontent.com"
     allowExec:
       - "/usr/local/bin/elixir"
@@ -221,7 +249,7 @@ profiles:
       - "downloads.gradle-dn.com"
       - "jcenter.bintray.com"
       - "github.com"
-      - "*.github.com"
+      - "codeload.github.com"
       - "objects.githubusercontent.com"
     allowExec:
       - "/usr/bin/java"

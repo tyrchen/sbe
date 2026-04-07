@@ -50,7 +50,7 @@ fn section_process(sb: &mut String, profile: &SandboxProfile) {
     if !profile.deny_exec.is_empty() {
         writeln!(sb, "(deny process-exec").ok();
         for path in &profile.deny_exec {
-            writeln!(sb, "    (literal \"{}\")", path.display()).ok();
+            write_path_filter(sb, path, "    ");
         }
         writeln!(sb, ")").ok();
     }
@@ -133,16 +133,102 @@ fn section_network(sb: &mut String, profile: &SandboxProfile, proxy_port: Option
 fn section_misc(sb: &mut String) {
     writeln!(sb, ";; Miscellaneous required permissions").ok();
     writeln!(sb, "(allow sysctl-read)").ok();
-    writeln!(sb, "(allow mach-lookup)").ok();
+    // Mach IPC: only allow services required for build tools, DNS, and system libs.
+    // Unrestricted mach-lookup would expose Keychain, clipboard, and other services.
+    writeln!(sb, "(allow mach-lookup").ok();
+    writeln!(sb, "    (global-name \"com.apple.system.logger\")").ok();
+    writeln!(
+        sb,
+        "    (global-name \"com.apple.system.notification_center\")"
+    )
+    .ok();
+    writeln!(
+        sb,
+        "    (global-name \"com.apple.CoreServices.coreservicesd\")"
+    )
+    .ok();
+    writeln!(sb, "    (global-name \"com.apple.SecurityServer\")").ok();
+    writeln!(
+        sb,
+        "    (global-name \"com.apple.distributed_notifications@Mu\")"
+    )
+    .ok();
+    writeln!(
+        sb,
+        "    (global-name-regex #\"^com\\.apple\\.cfprefsd\\.\")"
+    )
+    .ok();
+    writeln!(sb, "    (global-name-regex #\"^com\\.apple\\.lsd\\.\")").ok();
+    writeln!(sb, ")").ok();
     writeln!(sb, "(allow ipc-posix-shm-read*)").ok();
     writeln!(sb, "(allow ipc-posix-shm-write-data)").ok();
     writeln!(sb, "(allow signal (target self))").ok();
 }
 
-/// Write a path filter expression. Uses `subpath` for directories and `literal` for files.
+/// Write a path filter expression.
+///
+/// Uses `subpath` for directories (matches the dir and everything under it)
+/// and `literal` for individual files (exact match only). This distinction
+/// matters for security: `(subpath "/usr/bin/curl")` would match any path
+/// starting with that prefix, while `(literal "/usr/bin/curl")` is exact.
 fn write_path_filter(sb: &mut String, path: &Path, indent: &str) {
-    // Use subpath for directories (the common case for sandbox paths)
-    writeln!(sb, "{indent}(subpath \"{path}\")", path = path.display()).ok();
+    if is_directory_path(path) {
+        writeln!(sb, "{indent}(subpath \"{path}\")", path = path.display()).ok();
+    } else {
+        writeln!(sb, "{indent}(literal \"{path}\")", path = path.display()).ok();
+    }
+}
+
+/// Determine whether a path should be treated as a directory (subpath) or file (literal).
+///
+/// Checks the filesystem first. For paths that don't exist yet, uses heuristics:
+/// - Paths in known binary dirs → file (literal)
+/// - Paths with file extensions (`.json`, `.toml`, `.yaml`) → file (literal)
+/// - Dotfiles without subdirectory structure (`.env`, `.npmrc`) → file (literal)
+/// - Everything else → directory (subpath)
+fn is_directory_path(path: &Path) -> bool {
+    if path.exists() {
+        return path.is_dir();
+    }
+
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+    // Paths in known binary directories are files
+    if let Some(parent) = path.parent().and_then(|p| p.to_str()) {
+        let binary_dirs = [
+            "/bin",
+            "/usr/bin",
+            "/usr/sbin",
+            "/usr/libexec",
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+        ];
+        if binary_dirs.contains(&parent) {
+            return false;
+        }
+    }
+
+    // Paths with file extensions are files
+    if path.extension().is_some() {
+        return false;
+    }
+
+    // Dotfiles without extensions that look like config files (not directories)
+    // e.g., .env, .npmrc, .netrc, .pypirc — these are files, not directories
+    let config_dotfiles = [
+        ".env",
+        ".env.local",
+        ".env.production",
+        ".npmrc",
+        ".netrc",
+        ".pypirc",
+        ".yarnrc",
+    ];
+    if config_dotfiles.contains(&name) {
+        return false;
+    }
+
+    true
 }
 
 #[cfg(test)]
