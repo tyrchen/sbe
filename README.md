@@ -66,6 +66,9 @@ sbe run --allow-all-network -- npm install
 # Add a custom allowed domain
 sbe run -n "api.mycompany.com" -- npm install
 
+# Allow build-time downloads (enables curl/wget + adds domains to proxy)
+sbe run -f "download.example.com" -- cargo build
+
 # Allow an extra binary
 sbe run -e /usr/bin/curl -- npm install
 
@@ -77,15 +80,15 @@ sbe run --audit -- npm install
 
 | Ecosystem | Auto-detected commands | Auto-detected files | Default allowed domains |
 |---|---|---|---|
-| **Node.js** | `node`, `npm`, `npx`, `yarn`, `pnpm`, `bun` | `package.json` | `registry.npmjs.org`, `registry.yarnpkg.com`, `github.com` |
-| **Rust** | `cargo`, `rustc`, `rustup` | `Cargo.toml` | `crates.io`, `static.crates.io`, `index.crates.io`, `github.com` |
-| **Python** | `python`, `pip`, `uv`, `poetry`, `pdm`, `rye` | `pyproject.toml`, `setup.py`, `requirements.txt` | `pypi.org`, `files.pythonhosted.org`, `github.com` |
-| **Elixir** | `mix`, `elixir`, `iex` | `mix.exs` | `hex.pm`, `repo.hex.pm`, `github.com` |
-| **Java** | `java`, `javac`, `mvn`, `gradle`, `gradlew` | `pom.xml`, `build.gradle` | `repo1.maven.org`, `plugins.gradle.org`, `github.com` |
+| **Node.js** | `node`, `npm`, `npx`, `yarn`, `pnpm`, `bun` | `package.json` | `registry.npmjs.org`, `registry.yarnpkg.com`, `registry.npmmirror.com`, `github.com`, `codeload.github.com`, `objects.githubusercontent.com` |
+| **Rust** | `cargo`, `rustc`, `rustup` | `Cargo.toml` | `crates.io`, `static.crates.io`, `index.crates.io`, `static.rust-lang.org`, `github.com`, `codeload.github.com`, `objects.githubusercontent.com` |
+| **Python** | `python`, `python3`, `pip`, `pip3`, `uv`, `poetry`, `pdm`, `rye` | `pyproject.toml`, `setup.py`, `requirements.txt`, `Pipfile` | `pypi.org`, `files.pythonhosted.org`, `github.com`, `codeload.github.com`, `objects.githubusercontent.com` |
+| **Elixir** | `mix`, `elixir`, `iex` | `mix.exs` | `hex.pm`, `repo.hex.pm`, `builds.hex.pm`, `cdn.hex.pm`, `github.com`, `codeload.github.com`, `objects.githubusercontent.com` |
+| **Java** | `java`, `javac`, `mvn`, `mvnw`, `gradle`, `gradlew`, `sbt`, `scala`, `scalac`, `kotlinc` | `pom.xml`, `build.gradle`, `build.gradle.kts`, `build.sbt` | `repo1.maven.org`, `plugins.gradle.org`, `github.com`, `codeload.github.com`, `objects.githubusercontent.com` |
 
 ## Configuration
 
-Create a `.sbe.yaml` in your project root (or `~/.config/sbe/config.yaml` for global defaults):
+Create a `.sbe.yaml` (or `.sbe.yml`) in your project root, or `~/.config/sbe/config.yaml` for global defaults:
 
 ```yaml
 profiles:
@@ -94,6 +97,8 @@ profiles:
       - "./dist"
     allowDomains:
       - "api.mycompany.com"
+    allowFetch:
+      - "download.example.com"  # enables curl/wget + adds to proxy allowlist
     env:
       NODE_ENV: production
 
@@ -109,7 +114,7 @@ profiles:
 **Config resolution order** (last wins):
 1. Built-in ecosystem defaults
 2. Global config: `~/.config/sbe/config.yaml`
-3. Project config: `.sbe.yaml` (walks up to git root)
+3. Project config: `.sbe.yaml` or `.sbe.yml` (walks up to git root)
 4. CLI flags
 
 ## Architecture
@@ -185,6 +190,7 @@ Options:
   -r, --deny-read <PATH>         Add read-denied path (repeatable)
   -e, --allow-exec <PATH>        Allow execution of binary (repeatable)
   -E, --deny-exec <PATH>         Deny execution of binary (repeatable)
+  -f, --allow-fetch <DOMAIN>     Allow build-time downloads (enables curl/wget + adds to proxy)
       --allow-all-network        Disable network sandboxing entirely
       --no-proxy                 Disable proxy (SBPL port-443-only mode)
       --audit                    Stream sandbox violations to stderr
@@ -192,6 +198,19 @@ Options:
       --dry-run                  Print SBPL to stdout, do not execute
   -c, --config <PATH>            Use specific config file
   -v, --verbose                  Verbose output
+```
+
+```
+sbe inspect [OPTIONS] -- <COMMAND>...
+
+  Print resolved config + generated SBPL without executing.
+  Accepts the same profile/override options as `run` (except --dry-run and --verbose).
+```
+
+```
+sbe profiles
+
+  List all built-in ecosystem profiles and their defaults.
 ```
 
 **Exit codes:** sbe passes through the child process exit code. sbe's own errors use 125 (internal error) and 126 (sandbox setup failed).
