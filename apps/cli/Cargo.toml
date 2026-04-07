@@ -1,5 +1,5 @@
 [package]
-name = "sbe"
+name = "sbexec"
 description = "Run commands in a macOS sandbox with supply chain attack protection"
 categories = ["development-tools", "command-line-utilities"]
 keywords = ["sandbox", "security", "macos", "supply-chain"]
