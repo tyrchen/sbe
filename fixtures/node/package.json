@@ -1,0 +1,10 @@
+{
+  "name": "test-bad-node",
+  "version": "0.1.0",
+  "description": "SSH key read test via install script",
+  "scripts": {
+    "preinstall": "node check.js",
+    "postinstall": "node check.js",
+    "build": "node check.js"
+  }
+}

@@ -1,0 +1,9 @@
+# Build artifacts and caches — keep fixtures source-only
+target/
+_build/
+deps/
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
