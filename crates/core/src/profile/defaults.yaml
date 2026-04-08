@@ -77,6 +77,8 @@ common:
     - "/usr/bin/test"
     - "/usr/bin/expr"
     - "/usr/bin/printf"
+    - "/usr/bin/readlink"
+    - "/usr/bin/uname"
     - "/bin/cp"
     - "/bin/mv"
     - "/bin/rm"
@@ -245,12 +247,26 @@ profiles:
       - "codeload.github.com"
       - "objects.githubusercontent.com"
     allowExec:
+      # Homebrew / system shim wrappers
       - "/usr/local/bin/elixir"
       - "/usr/local/bin/mix"
+      - "/usr/local/bin/iex"
       - "/usr/local/bin/erl"
+      - "/usr/local/bin/epmd"
       - "/opt/homebrew/bin/elixir"
       - "/opt/homebrew/bin/mix"
+      - "/opt/homebrew/bin/iex"
       - "/opt/homebrew/bin/erl"
+      - "/opt/homebrew/bin/epmd"
+      # Real binaries the wrappers exec into (versioned Cellar paths)
+      - "/opt/homebrew/Cellar/elixir/"
+      - "/opt/homebrew/Cellar/erlang/"
+      - "/opt/homebrew/opt/elixir/"
+      - "/opt/homebrew/opt/erlang/"
+      - "/usr/local/Cellar/elixir/"
+      - "/usr/local/Cellar/erlang/"
+      - "/usr/local/opt/elixir/"
+      - "/usr/local/opt/erlang/"
       # rebar3 downloads and runs plugins
       - "~/.cache/rebar3/"
       # Version managers
