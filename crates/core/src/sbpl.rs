@@ -1,6 +1,9 @@
 use std::fmt::Write;
 
-use crate::{config::SandboxPath, profile::SandboxProfile};
+use crate::{
+    config::{PathKind, SandboxPath},
+    profile::SandboxProfile,
+};
 
 /// Generate a Seatbelt Profile Language (SBPL) policy string from a `SandboxProfile`.
 ///
@@ -154,11 +157,21 @@ fn section_misc(sb: &mut String) {
 
 /// Write an SBPL path filter from a `SandboxPath`.
 ///
-/// `is_dir == true` → `(subpath ...)` (matches directory and all contents)
-/// `is_dir == false` → `(literal ...)` (exact file match only)
+/// - `Subpath` → `(subpath "/path")` (matches directory and all contents)
+/// - `Literal` → `(literal "/path")` (exact file match only)
+/// - `Regex`   → `(regex #"pattern")` (regex match against absolute path)
 fn write_sandbox_path(sb: &mut String, sp: &SandboxPath, indent: &str) {
-    let kind = if sp.is_dir { "subpath" } else { "literal" };
-    writeln!(sb, "{indent}({kind} \"{}\")", sp.path.display()).ok();
+    match sp.kind {
+        PathKind::Subpath => {
+            writeln!(sb, "{indent}(subpath \"{}\")", sp.path.display()).ok();
+        }
+        PathKind::Literal => {
+            writeln!(sb, "{indent}(literal \"{}\")", sp.path.display()).ok();
+        }
+        PathKind::Regex => {
+            writeln!(sb, "{indent}(regex #\"{}\")", sp.path.display()).ok();
+        }
+    }
 }
 
 #[cfg(test)]

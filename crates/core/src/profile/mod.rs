@@ -165,11 +165,18 @@ impl SandboxProfile {
             allow_write.push(SandboxPath::file(git_root.join(".pnp.loader.mjs")));
         }
 
-        // Rust-specific: resolve cargo target dir for write + exec
+        // Rust-specific: resolve cargo target dir for write + exec.
+        // Cargo also creates atomic-rename temp dirs as siblings of target
+        // (e.g., ~/.targetXXXXXX), so we need a regex allow for those.
         if ecosystem == Ecosystem::Rust {
             if let Some(target_dir) = resolve_cargo_target_dir(home, pwd) {
                 allow_write.push(SandboxPath::dir(target_dir.clone()));
-                allow_exec.push(SandboxPath::dir(target_dir));
+                allow_exec.push(SandboxPath::dir(target_dir.clone()));
+                // Allow sibling temp dirs created by cargo for atomic rename
+                if let Some(target_str) = target_dir.to_str() {
+                    let pattern = format!("^{}[A-Za-z0-9]*$", regex_escape(target_str));
+                    allow_write.push(SandboxPath::regex(PathBuf::from(pattern)));
+                }
             } else {
                 allow_exec.push(SandboxPath::dir(pwd.join("target")));
             }
@@ -290,15 +297,30 @@ fn resolve_symlinks(paths: &mut Vec<SandboxPath>) {
                     return Some(SandboxPath::dir(PathBuf::from(pkg_root)));
                 }
             }
-            // Preserve the original is_dir flag for non-Cellar symlinks
+            // Preserve the original kind for non-Cellar symlinks
             Some(SandboxPath {
                 path: resolved,
-                is_dir: sp.is_dir,
+                kind: sp.kind,
             })
         })
         .filter(|resolved| !paths.iter().any(|p| p.path == resolved.path))
         .collect();
     paths.extend(additional);
+}
+
+/// Escape regex metacharacters in a literal string.
+fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(
+            c,
+            '.' | '\\' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Find the git root by walking up from `start`.

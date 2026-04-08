@@ -145,33 +145,55 @@ impl ProfileConfig {
     }
 }
 
-/// A path with an explicit directory/file flag for SBPL generation.
+/// How a `SandboxPath` should be matched in SBPL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PathKind {
+    /// Match the directory and everything under it (SBPL `subpath`).
+    Subpath,
+    /// Exact file match (SBPL `literal`).
+    Literal,
+    /// Regex match against the absolute path (SBPL `regex`).
+    /// Used for prefix patterns like `<target>XXXXXX` temp dirs.
+    Regex,
+}
+
+/// A path with an explicit kind for SBPL generation.
 ///
 /// Convention: in YAML configs, paths ending with `/` are directories
 /// (generate SBPL `subpath`), paths without trailing `/` are files
-/// (generate SBPL `literal`). This eliminates heuristics and filesystem
-/// checks — the YAML author declares intent explicitly.
+/// (generate SBPL `literal`). Regex paths are only constructed
+/// programmatically (not from YAML).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxPath {
     pub path: PathBuf,
-    pub is_dir: bool,
+    pub kind: PathKind,
 }
 
 impl SandboxPath {
     pub fn dir(path: PathBuf) -> Self {
-        Self { path, is_dir: true }
+        Self {
+            path,
+            kind: PathKind::Subpath,
+        }
     }
 
     pub fn file(path: PathBuf) -> Self {
         Self {
             path,
-            is_dir: false,
+            kind: PathKind::Literal,
         }
     }
-}
 
-impl SandboxPath {
-    /// Check if this sandbox path matches a given filesystem path (ignoring is_dir).
+    /// Create a regex match. The path must be a valid regex pattern.
+    pub fn regex(pattern: PathBuf) -> Self {
+        Self {
+            path: pattern,
+            kind: PathKind::Regex,
+        }
+    }
+
+    /// Check if this sandbox path matches a given filesystem path.
     pub fn has_path(&self, path: &Path) -> bool {
         self.path == path
     }
@@ -189,7 +211,11 @@ impl std::fmt::Display for SandboxPath {
 /// - `~/.npmrc` → file (literal)
 /// - `$PWD/` → directory
 pub fn expand_path(raw: &str, home: &Path, pwd: &Path) -> SandboxPath {
-    let is_dir = raw.ends_with('/');
+    let kind = if raw.ends_with('/') {
+        PathKind::Subpath
+    } else {
+        PathKind::Literal
+    };
     let raw = raw.strip_suffix('/').unwrap_or(raw);
 
     let path = if raw == "$PWD" {
@@ -214,7 +240,7 @@ pub fn expand_path(raw: &str, home: &Path, pwd: &Path) -> SandboxPath {
         pwd.join(raw)
     };
 
-    SandboxPath { path, is_dir }
+    SandboxPath { path, kind }
 }
 
 /// Load and merge configuration from all sources.
@@ -284,7 +310,7 @@ mod tests {
         let pwd = PathBuf::from("/Users/test/project");
         let sp = expand_path("~/.ssh/", &home, &pwd);
         assert_eq!(sp.path, PathBuf::from("/Users/test/.ssh"));
-        assert!(sp.is_dir);
+        assert_eq!(sp.kind, PathKind::Subpath);
     }
 
     #[test]
@@ -293,7 +319,7 @@ mod tests {
         let pwd = PathBuf::from("/Users/test/project");
         let sp = expand_path("./node_modules/", &home, &pwd);
         assert_eq!(sp.path, PathBuf::from("/Users/test/project/node_modules"));
-        assert!(sp.is_dir);
+        assert_eq!(sp.kind, PathKind::Subpath);
     }
 
     #[test]
@@ -302,7 +328,7 @@ mod tests {
         let pwd = PathBuf::from("/Users/test/project");
         let sp = expand_path("/usr/bin/osascript", &home, &pwd);
         assert_eq!(sp.path, PathBuf::from("/usr/bin/osascript"));
-        assert!(!sp.is_dir);
+        assert_eq!(sp.kind, PathKind::Literal);
     }
 
     #[test]
@@ -311,13 +337,13 @@ mod tests {
         let pwd = PathBuf::from("/Users/test/project");
 
         let dir = expand_path("~/.cargo/bin/", &home, &pwd);
-        assert!(dir.is_dir);
+        assert_eq!(dir.kind, PathKind::Subpath);
 
         let file = expand_path("~/.cargo/credentials.toml", &home, &pwd);
-        assert!(!file.is_dir);
+        assert_eq!(file.kind, PathKind::Literal);
 
         let pwd_dir = expand_path("$PWD/", &home, &pwd);
-        assert!(pwd_dir.is_dir);
+        assert_eq!(pwd_dir.kind, PathKind::Subpath);
     }
 
     #[test]
