@@ -164,6 +164,46 @@ This combination defeats CDN-backed registries: SBPL and Landlock can't filter
 by hostname, but the proxy does — and the kernel forces every TCP egress
 through it.
 
+## What sbe Does *Not* Protect Against
+
+The README's "What It Blocks" table summarises the wins. These are the
+**known gaps** — places where the marketing implies coverage that the
+implementation can't actually deliver. Don't trust sbe to be the last
+line of defense against any of these.
+
+- **`/proc` cross-process snooping (Linux)**. The baseline read anchors
+  include `/proc/`, so a sandboxed build script can list every process
+  the invoking user owns and read its `/proc/<pid>/environ`,
+  `cmdline`, `cwd`, `fd/*`. If your shell exported
+  `AWS_SECRET_ACCESS_KEY`, an attacker-controlled `npm install` sees it.
+  Mitigation: set `kernel.yama.ptrace_scope=2` and avoid putting
+  secrets in env vars of unrelated processes; macOS isn't affected.
+- **DNS-over-UDP is unfiltered (Linux)**. Landlock has no UDP filter at
+  any ABI. With `/etc/resolv.conf` readable, an attacker can encode
+  exfil data in DNS subdomains and the kernel resolver will deliver
+  them. The HTTP CONNECT proxy filters HTTP/HTTPS by hostname but never
+  sees DNS itself.
+- **TLS to port 443 on any host when proxy is disabled**. JVM tools
+  (Maven, sbt's coursier, Gradle's resolver) don't honor `HTTP_PROXY`
+  env, so the java profile ships with `enableProxy: false` and Landlock
+  allows TCP egress on port 443 to anywhere. A compromised Maven plugin
+  can establish a TLS C2 channel to any host. Kernel still blocks every
+  non-443 outbound; filesystem and exec restrictions still apply.
+- **Gradle on Linux disables the kernel net filter entirely**. Gradle's
+  CLI ↔ daemon IPC uses a random localhost TCP port that Landlock v4
+  can't express. Users opting into Gradle via `allowAllNetwork: true`
+  lose all kernel TCP filtering for that profile.
+- **`/dev/tcp`, `/dev/udp` (bash built-ins)**. `bash` is in the default
+  `allowExec`, and bash's `< /dev/tcp/host/port` opens a socket
+  in-process. Same kernel syscalls (`socket`+`connect`); the proxy
+  doesn't see this traffic. On port-443, fully unfiltered (see above).
+- **Audit logging is best-effort on Linux**. The auditor reads
+  `/dev/kmsg`, which requires `CAP_SYSLOG` on most hardened hosts
+  (`kernel.dmesg_restrict=1` is the Ubuntu default). When it can't read
+  kmsg, sbe falls back to "violations surface as `EACCES` exit codes"
+  — silent for any attack that doesn't trip a kernel deny event (DNS
+  exfil, /proc snooping, TLS:443 C2).
+
 ## Linux Backend Caveats
 
 These differences from the macOS path are surface-level — the same `sbe run`

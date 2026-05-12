@@ -54,12 +54,18 @@ pub const READ_ALLOWLIST_ANCHORS: &[&str] = &[
     // systemd-resolved stub on Ubuntu/Debian/Fedora: /etc/resolv.conf is a
     // symlink to /run/systemd/resolve/stub-resolv.conf. Landlock follows
     // symlinks to the canonical path, so the resolver can't read the
-    // nameserver list without this entry — every tool that does direct
-    // DNS (Maven/Gradle/sbt, anything not using HTTP_PROXY) gets
-    // EAI_AGAIN otherwise. The narrower socket dir is preferred over
-    // exposing all of /run/ (which would expose every running service's
-    // pid files and the system DBus socket).
-    "/run/systemd/resolve",
+    // nameserver list without granting read on the symlink target.
+    //
+    // We name the SPECIFIC files used by the libc resolver rather than the
+    // whole directory. The directory also contains
+    // `/run/systemd/resolve/io.systemd.Resolve` — a varlink Unix-domain
+    // socket. Landlock pre-ABI v6 does NOT gate UDS connect by path-based
+    // access, so granting read on the directory enables a build script to
+    // connect to the varlink endpoint and ask systemd-resolved to perform
+    // arbitrary DNS lookups, bypassing the HTTP CONNECT proxy's domain
+    // allowlist. Narrow to the two read-only stub files.
+    "/run/systemd/resolve/stub-resolv.conf",
+    "/run/systemd/resolve/resolv.conf",
 ];
 
 /// Baseline writable paths injected into every Linux ruleset.
@@ -75,22 +81,45 @@ const BASELINE_WRITE_PATHS: &[&str] = &["/tmp", "/var/tmp", "/dev/null", "/dev/z
 /// `allow_exec` subpath. The lint refuses to build the ruleset if a
 /// user-supplied profile would re-enable any of these via a directory rule.
 const PRIVILEGE_ESCALATION_BINARIES: &[&str] = &[
+    // Direct UID change
     "/usr/bin/sudo",
     "/bin/sudo",
     "/usr/bin/su",
     "/bin/su",
-    "/usr/bin/pkexec",
+    "/usr/bin/runuser",
+    "/usr/sbin/runuser",
+    "/usr/bin/gosu",
+    "/usr/local/bin/gosu",
     "/usr/bin/doas",
+    "/usr/local/bin/doas",
+    "/usr/bin/pkexec",
+    // Account / shell modification
     "/usr/bin/chsh",
     "/usr/bin/chfn",
     "/usr/bin/newgrp",
     "/usr/bin/sg",
     "/usr/bin/passwd",
     "/usr/bin/gpasswd",
+    // Capability / namespace manipulation (NNP defangs setuid but some
+    // of these are file-cap-based and can still raise privs).
+    "/usr/bin/capsh",
+    "/usr/sbin/capsh",
+    "/usr/bin/setpriv",
+    "/usr/bin/nsenter",
+    "/usr/bin/unshare",
+    "/usr/sbin/unshare",
+    // systemd / DBus-mediated escalation
+    "/usr/bin/systemd-run",
+    "/usr/bin/machinectl",
+    "/usr/bin/pkttyagent",
+    "/usr/bin/dbus-launch",
+    // Filesystem mount manipulation
     "/usr/bin/mount",
     "/usr/bin/umount",
     "/bin/mount",
     "/bin/umount",
+    "/usr/bin/fusermount",
+    "/usr/bin/fusermount3",
 ];
 
 /// FS read access flags applied to the curated read allowlist.
@@ -146,9 +175,27 @@ pub fn compile(
     probe: &ProbeResult,
     options: BackendOptions,
 ) -> Result<CompiledLandlock, CoreError> {
+    if options.allow_degraded {
+        // §13 D1: --allow-degraded is a single flag that bypasses
+        // *three* unrelated checks (priv-esc subpath lint, denyRead
+        // forbidden-list seal, ABI-v4 net-filter gate). Surface every
+        // bypass explicitly so users can't accidentally lose unrelated
+        // defenses while reaching for the flag to fix a kernel-version
+        // problem.
+        tracing::warn!(
+            "--allow-degraded ACTIVE: the following Linux sandbox checks are DISABLED for this \
+             run: (1) privilege-escalation subpath lint (allowExec subpaths can include \
+             sudo/su/pkexec/etc.); (2) denyRead forbidden-list seal \
+             (allowRead/allowWrite/allowExec may overlap denyRead paths); (3) \
+             refuse-on-missing-Landlock-ABI-v4 (kernel may run without per-port TCP filter). \
+             Re-run without --allow-degraded for full enforcement."
+        );
+    }
+
     // 1. Lints.
     lint_allow_exec_for_priv_escalation(profile, options)?;
     let forbidden_reads = build_forbidden_reads(profile)?;
+    lint_forbidden_reads_against_grants(profile, &forbidden_reads, options)?;
 
     // 2. Resolve read-allowlist (curated anchors + extra paths from profile).
     let read_paths = build_read_paths(profile, &forbidden_reads, options)?;
@@ -211,6 +258,21 @@ fn add_path_rules(
     access: BitFlags<AccessFs>,
 ) -> Result<RulesetCreated, CoreError> {
     for path in paths {
+        // Refuse symlinks. A pre-existing symlink along this path lets an
+        // attacker redirect the Landlock grant onto a target of their
+        // choosing — e.g. an earlier build leaves ~/.npm → ~/.ssh, and the
+        // next sbe invocation hands write access on ~/.ssh to the
+        // sandboxed process. Landlock's PathFd::new uses File::open which
+        // follows symlinks; we screen with symlink_metadata first.
+        if is_symlink(path) {
+            return Err(CoreError::ProfileLint(format!(
+                "Landlock allowlist entry '{}' is a symlink. Refusing to open it — a symlink lets \
+                 an attacker redirect the grant onto a target of their choosing. Replace the \
+                 entry with the canonical target path or remove the symlink before re-running sbe.",
+                path.display(),
+            )));
+        }
+
         // Skip paths that don't exist on the host: Landlock requires open()
         // on the path, and OpenAt failures here would otherwise abort the
         // whole sandbox. We log via tracing for diagnostics.
@@ -226,31 +288,55 @@ fn add_path_rules(
     Ok(created)
 }
 
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
+fn is_symlink(p: &Path) -> bool {
+    std::fs::symlink_metadata(p)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
 /// Create any missing directories from `allow_write` so Landlock can open
 /// an FD on each one. We mode-0700 directories under $HOME to protect
 /// secrets; paths outside $HOME (e.g. `/tmp`, `/var/tmp`) are left alone.
+///
+/// Crucial: we use [`std::fs::symlink_metadata`] (does NOT follow
+/// symlinks) rather than `Path::exists` (DOES follow) so a pre-existing
+/// symlink like `~/.npm → ~/.ssh` doesn't make us conclude "already
+/// there" and silently grant Landlock write on the link target later.
+/// If the entry itself is a symlink, we leave it alone — `add_path_rules`
+/// will refuse to open it and the build aborts.
 #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 fn ensure_writable_dirs(paths: &[PathBuf]) {
     use std::os::unix::fs::PermissionsExt;
     let home = std::env::var_os("HOME").map(PathBuf::from);
     for p in paths {
-        if p.exists() {
-            continue;
+        // If a real dir already exists at this path, nothing to do.
+        // If a symlink exists, do NOT mkdir into it — add_path_rules will
+        // reject it.
+        match std::fs::symlink_metadata(p) {
+            Ok(m) if m.file_type().is_symlink() => {
+                tracing::warn!(
+                    path = %p.display(),
+                    "allow_write entry is a symlink; refusing to materialize. add_path_rules \
+                     will reject this entry."
+                );
+                continue;
+            }
+            Ok(_) => continue, // real file or dir already exists
+            Err(_) => { /* doesn't exist — fall through to mkdir */ }
         }
-        if let Some(parent) = p.parent()
-            && !parent.exists()
-        {
-            // Best-effort recursive create — silently skip on error so we
-            // don't break unrelated paths.
-            let _ = std::fs::create_dir_all(parent);
-        }
-        // If the entry itself looks like a directory (trailing slash or
-        // matches a known cache prefix), create it too.
+
+        // Best-effort recursive create. If any ancestor is a symlink the
+        // create can land on an attacker-chosen target — we accept that
+        // for the mkdir step but add_path_rules's PathFd::new will still
+        // follow the symlink at open time, so the rule itself is what we
+        // gate via is_symlink() at the entry level.
         let _ = std::fs::create_dir_all(p);
         if let Some(h) = home.as_ref()
             && p.starts_with(h)
-            && p.is_dir()
-            && let Ok(meta) = p.metadata()
+            && let Ok(meta) = std::fs::symlink_metadata(p)
+            && !meta.file_type().is_symlink()
+            && meta.file_type().is_dir()
         {
             let mut perms = meta.permissions();
             perms.set_mode(0o700);
@@ -267,40 +353,63 @@ fn build_forbidden_reads(profile: &SandboxProfile) -> Result<BTreeSet<PathBuf>, 
     Ok(set)
 }
 
-fn build_read_paths(
+/// Reject any `allow_write` / `allow_exec` entry that overlaps a `denyRead`
+/// path. Landlock grants on write_access ([`AccessFs::from_all`]) and
+/// exec_access ([`AccessFs::Execute`] | [`AccessFs::from_read`]) **both
+/// imply read**, so without this lint a user who writes
+///   profiles.node.allowWrite: ["~/"]
+/// would silently broaden read access onto every denyRead path under
+/// `~/`. The `denyRead` field was billed as a sealed forbidden-list in
+/// §8 of the spec — that promise is only valid if we lint all grant
+/// fields, not just `allow_read`.
+fn lint_forbidden_reads_against_grants(
     profile: &SandboxProfile,
     forbidden: &BTreeSet<PathBuf>,
     options: BackendOptions,
-) -> Result<Vec<PathBuf>, CoreError> {
-    let mut out: Vec<PathBuf> = READ_ALLOWLIST_ANCHORS.iter().map(PathBuf::from).collect();
-
-    // Sealed forbidden-list lint: check user-supplied allow_read overlap
-    // against denyRead. We do NOT lint against the baseline anchors —
-    // those are documented in the README as readable, and the seal's
-    // purpose per §8 is to prevent a user's *broadening* of the allowlist
-    // from accidentally exposing a path they marked secret.
-    if !options.allow_degraded {
-        for sp in &profile.allow_read {
+) -> Result<(), CoreError> {
+    if options.allow_degraded {
+        return Ok(());
+    }
+    // For each grant field that implies read, check no entry covers a
+    // forbidden path. `path_is_under` is "f is under anchor", i.e. anchor
+    // would expose f.
+    for (field, paths) in [
+        ("allowWrite", &profile.allow_write),
+        ("allowExec", &profile.allow_exec),
+        ("allowRead", &profile.allow_read),
+    ] {
+        for sp in paths {
             for f in forbidden {
                 if path_is_under(f, &sp.path) {
                     return Err(CoreError::ProfileLint(format!(
-                        "denyRead path '{}' is under user-supplied allowRead entry '{}'; the \
-                         Landlock backend cannot subtract reads from a granted subtree. Either \
-                         remove the denyRead entry, narrow the allowRead entry, or pass \
+                        "denyRead path '{}' is under {} entry '{}'. Landlock grants on allowWrite \
+                         and allowExec also imply read, so this would silently expose the denied \
+                         path. Either narrow the {} entry, remove the denyRead entry, or pass \
                          --allow-degraded if you understand the threat model.",
                         f.display(),
+                        field,
                         sp.path.display(),
+                        field,
                     )));
                 }
             }
         }
     }
+    Ok(())
+}
 
-    // Merge user extensions after the lint succeeds.
+fn build_read_paths(
+    profile: &SandboxProfile,
+    _forbidden: &BTreeSet<PathBuf>,
+    _options: BackendOptions,
+) -> Result<Vec<PathBuf>, CoreError> {
+    // Lint already ran in `lint_forbidden_reads_against_grants` (covers
+    // allow_read alongside allow_write and allow_exec). Here we just
+    // assemble the baseline anchors + per-profile read extensions.
+    let mut out: Vec<PathBuf> = READ_ALLOWLIST_ANCHORS.iter().map(PathBuf::from).collect();
     for sp in &profile.allow_read {
         out.push(sp.path.clone());
     }
-
     out.sort();
     out.dedup();
     Ok(out)
@@ -418,7 +527,8 @@ mod tests {
         // §8: the seal is a "promise to never *silently broaden* a path that
         // overlaps denyRead". Baseline anchors (/etc, /tmp, /lib, …) are
         // documented in the README as readable, so they don't count as a
-        // user-broadening event. Only user-supplied allowRead is linted.
+        // user-broadening event — the lint only inspects per-profile
+        // allow_read / allow_write / allow_exec entries.
         let mut profile = SandboxProfile::for_ecosystem(
             Ecosystem::Rust,
             &PathBuf::from("/home/test"),
@@ -430,8 +540,11 @@ mod tests {
             kind: PathKind::Subpath,
         });
         let forbidden = build_forbidden_reads(&profile).unwrap();
+        let lint =
+            lint_forbidden_reads_against_grants(&profile, &forbidden, BackendOptions::default());
+        assert!(lint.is_ok(), "baseline anchor overlap must not lint");
         let res = build_read_paths(&profile, &forbidden, BackendOptions::default());
-        assert!(res.is_ok(), "baseline anchor overlap must not lint");
+        assert!(res.is_ok());
     }
 
     #[test]
@@ -452,8 +565,64 @@ mod tests {
             kind: PathKind::Subpath,
         });
         let forbidden = build_forbidden_reads(&profile).unwrap();
-        let err = build_read_paths(&profile, &forbidden, BackendOptions::default()).unwrap_err();
+        let err =
+            lint_forbidden_reads_against_grants(&profile, &forbidden, BackendOptions::default())
+                .unwrap_err();
         assert!(format!("{err}").contains("denyRead"));
+        assert!(format!("{err}").contains("allowRead"));
+    }
+
+    /// C2: a user who broadens read-access via allowWrite (not allowRead)
+    /// must still trip the denyRead seal. The Landlock write_access bitmask
+    /// includes read_file/read_dir, so without this check the
+    /// "sealed forbidden-list" promise is bypassable trivially.
+    #[test]
+    fn test_should_reject_forbidden_read_overlap_with_allow_write() {
+        let mut profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Rust,
+            &PathBuf::from("/home/test"),
+            &PathBuf::from("/home/test/pwd"),
+        );
+        profile.deny_read.clear();
+        profile.deny_read.push(SandboxPath {
+            path: PathBuf::from("/home/test/.ssh"),
+            kind: PathKind::Subpath,
+        });
+        profile.allow_write.push(SandboxPath {
+            path: PathBuf::from("/home/test"),
+            kind: PathKind::Subpath,
+        });
+        let forbidden = build_forbidden_reads(&profile).unwrap();
+        let err =
+            lint_forbidden_reads_against_grants(&profile, &forbidden, BackendOptions::default())
+                .unwrap_err();
+        assert!(format!("{err}").contains("denyRead"));
+        assert!(format!("{err}").contains("allowWrite"));
+    }
+
+    /// Same path-class attack but via allowExec. Landlock exec_access
+    /// includes from_read so a directory under allowExec is read-visible.
+    #[test]
+    fn test_should_reject_forbidden_read_overlap_with_allow_exec() {
+        let mut profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Rust,
+            &PathBuf::from("/home/test"),
+            &PathBuf::from("/home/test/pwd"),
+        );
+        profile.deny_read.clear();
+        profile.deny_read.push(SandboxPath {
+            path: PathBuf::from("/home/test/.aws/credentials"),
+            kind: PathKind::Literal,
+        });
+        profile.allow_exec.push(SandboxPath {
+            path: PathBuf::from("/home/test/.aws"),
+            kind: PathKind::Subpath,
+        });
+        let forbidden = build_forbidden_reads(&profile).unwrap();
+        let err =
+            lint_forbidden_reads_against_grants(&profile, &forbidden, BackendOptions::default())
+                .unwrap_err();
+        assert!(format!("{err}").contains("allowExec"));
     }
 
     #[test]
@@ -465,11 +634,15 @@ mod tests {
         );
         profile.deny_read.clear();
         profile.deny_read.push(SandboxPath {
-            path: PathBuf::from("/etc/ssh"),
+            path: PathBuf::from("/home/test/.ssh"),
+            kind: PathKind::Subpath,
+        });
+        profile.allow_write.push(SandboxPath {
+            path: PathBuf::from("/home/test"),
             kind: PathKind::Subpath,
         });
         let forbidden = build_forbidden_reads(&profile).unwrap();
-        let res = build_read_paths(
+        let res = lint_forbidden_reads_against_grants(
             &profile,
             &forbidden,
             BackendOptions {
