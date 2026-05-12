@@ -51,6 +51,33 @@ jobs:
         uses: tyrchen/sbe@sbexec-v0.3.0
         with:
           version: latest
+      - name: Diagnostic — cargo location + sbe inspect
+        run: |
+          set +e
+          echo "=== uname / runner ==="
+          uname -a
+          echo "RUNNER_OS=$RUNNER_OS  RUNNER_ARCH=$RUNNER_ARCH  HOME=$HOME"
+          echo
+          echo "=== which cargo ==="
+          which cargo
+          readlink -f "$(which cargo)" 2>/dev/null || true
+          ls -la "$(which cargo)"
+          echo
+          echo "=== \$HOME/.cargo/bin/ ==="
+          ls -la "$HOME/.cargo/bin/" || true
+          echo
+          echo "=== \$HOME/.rustup/toolchains/ ==="
+          ls -la "$HOME/.rustup/toolchains/" || true
+          echo
+          echo "=== sbe --version ==="
+          sbe --version
+          echo
+          echo "=== sbe inspect -- cargo check --all ==="
+          sbe inspect -- cargo check --all
+          echo
+          echo "=== sbe run --dry-run -- cargo check --all ==="
+          sbe run --dry-run -- cargo check --all
+          true
       - name: Check code format
         run: cargo fmt --all -- --check
       - name: Check the package for errors
