@@ -198,6 +198,18 @@ jobs:
         with:
           node-version: '20'
 
+      # Persist npm's user-level cache so the lodash+chalk fetch is
+      # warm on subsequent runs. The cache lives at ~/.npm; the node
+      # profile's allowWrite already includes it, so sbe can write to
+      # it inside the sandbox.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+          key: sbe-node-${{ runner.os }}-${{ hashFiles('fixtures/node/package.json', '.github/workflows/test-cli.yml') }}
+          restore-keys: |
+            sbe-node-${{ runner.os }}-
+
       - name: real-dep happy path — npm install lodash + chalk
         run: |
           set -euo pipefail
@@ -239,6 +251,18 @@ jobs:
         uses: astral-sh/setup-uv@v3
         with:
           version: latest
+
+      # Persist uv's user-level cache (~/.cache/uv) and pip's so the
+      # requests+httpx wheels are warm next time. The python profile's
+      # allowWrite already covers both.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/uv
+            ~/.cache/pip
+          key: sbe-uv-${{ runner.os }}-${{ hashFiles('fixtures/python/pyproject.toml', '.github/workflows/test-cli.yml') }}
+          restore-keys: |
+            sbe-uv-${{ runner.os }}-
 
       - name: real-dep happy path — uv pip install requests (HTTP via proxy)
         env:
@@ -282,6 +306,20 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y elixir erlang
           echo "mix at $(command -v mix)"
+
+      # Persist hex/mix/rebar3 caches. The mix.exs files don't pin versions
+      # tightly enough for hashFiles to be a useful invalidation signal —
+      # any change to the workflow drops the cache. The elixir profile's
+      # allowWrite already covers all three paths.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.hex
+            ~/.mix
+            ~/.cache/rebar3
+          key: sbe-mix-${{ runner.os }}-${{ hashFiles('fixtures/elixir/mix.exs', '.github/workflows/test-cli.yml') }}
+          restore-keys: |
+            sbe-mix-${{ runner.os }}-
 
       - name: Bootstrap hex (outside sbe — one-time host setup)
         run: |
