@@ -3,6 +3,31 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [sbexec-v0.2.1](https://github.com/compare/sbexec-v0.2.0..sbexec-v0.2.1) - 2026-05-12
+
+### Bug Fixes
+
+- **(profile)** allow Homebrew elixir/erlang Cellar paths and shim helpers - ([80de8a9](https://github.com/commit/80de8a9be6eec64bc8292f5b2f09d9d105f68c37)) - Tyr Chen
+
+### Features
+
+- support SBPL regex paths for cargo target sibling temp dirs - ([f9087ce](https://github.com/commit/f9087cef48d15d78f4ad25a5c05eb135017a6a71)) - Tyr Chen
+
+### Miscellaneous Chores
+
+- update fixtures - ([fc57e04](https://github.com/commit/fc57e0406b70b3c4074a4bc0cc63a85d50d19822)) - Tyr Chen
+- update arch doc - ([896628b](https://github.com/commit/896628bda9153dc09f162581d1752b2fb0177c2c)) - Tyr Chen
+- update gh action to support release - ([ac60a82](https://github.com/commit/ac60a82bd76f381bff7be12effb5ce257a407bd9)) - Tyr Chen
+
+### Other
+
+- Update CHANGELOG.md - ([60f3565](https://github.com/commit/60f35651d2d7f7acbeadbeebefa108a6ae3b1fb9)) - Tyr Chen
+
+### Tests
+
+- add language fixtures for sandbox profile testing - ([4a7bc53](https://github.com/commit/4a7bc53d39baff18b21fc94212d6cab085b9db6d)) - Tyr Chen
+
+---
 ## [sbexec-v0.2.0] - 2026-04-07
 
 ### Bug Fixes
