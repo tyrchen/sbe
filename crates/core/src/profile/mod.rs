@@ -123,6 +123,19 @@ pub struct SandboxProfile {
     /// of the cross-platform backend design.
     #[serde(default)]
     pub allow_degraded: bool,
+
+    /// Per-field boundary marker: indices `< first_user_*` were populated
+    /// from the curated per-OS defaults; indices `>=` came from user
+    /// `.sbe.yaml` or CLI overrides. The Linux backend's `denyRead`
+    /// forbidden-list seal lint only inspects user additions so that
+    /// intentional default overlaps (e.g. `$PWD/` covers `$PWD/.env`)
+    /// don't trip on every project.
+    #[serde(skip)]
+    pub first_user_allow_write: usize,
+    #[serde(skip)]
+    pub first_user_allow_exec: usize,
+    #[serde(skip)]
+    pub first_user_allow_read: usize,
 }
 
 fn default_true() -> bool {
@@ -240,6 +253,13 @@ impl SandboxProfile {
             .map(|p| expand_path(p, home, pwd))
             .collect();
 
+        // After this point everything appended to allow_* is treated as
+        // user-supplied. Snapshot the lengths now so the seal lint can
+        // identify user additions later.
+        let first_user_allow_write = allow_write.len();
+        let first_user_allow_exec = allow_exec.len();
+        let first_user_allow_read = allow_read.len();
+
         SandboxProfile {
             name: profile_name,
             allow_write,
@@ -253,6 +273,9 @@ impl SandboxProfile {
             allow_fetch: vec![],
             env: Default::default(),
             allow_degraded: false,
+            first_user_allow_write,
+            first_user_allow_exec,
+            first_user_allow_read,
         }
     }
 

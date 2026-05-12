@@ -353,15 +353,21 @@ fn build_forbidden_reads(profile: &SandboxProfile) -> Result<BTreeSet<PathBuf>, 
     Ok(set)
 }
 
-/// Reject any `allow_write` / `allow_exec` entry that overlaps a `denyRead`
-/// path. Landlock grants on write_access ([`AccessFs::from_all`]) and
-/// exec_access ([`AccessFs::Execute`] | [`AccessFs::from_read`]) **both
-/// imply read**, so without this lint a user who writes
+/// Reject any **user-supplied** `allow_write` / `allow_exec` / `allow_read`
+/// entry that overlaps a `denyRead` path. Landlock grants on write_access
+/// ([`AccessFs::from_all`]) and exec_access
+/// ([`AccessFs::Execute`] | [`AccessFs::from_read`]) **both imply read**,
+/// so without this lint a user who writes
 ///   profiles.node.allowWrite: ["~/"]
-/// would silently broaden read access onto every denyRead path under
-/// `~/`. The `denyRead` field was billed as a sealed forbidden-list in
-/// §8 of the spec — that promise is only valid if we lint all grant
-/// fields, not just `allow_read`.
+/// would silently broaden read access onto every denyRead path under `~/`.
+///
+/// The lint only inspects entries appended *after* the curated defaults
+/// (indices `>= first_user_*`). Built-in defaults intentionally overlap
+/// denyRead in places where Landlock cannot enforce the denial (e.g.
+/// `$PWD/` grants write+read, but `$PWD/.env` is in denyRead so SBPL on
+/// macOS can subtract it). Linting the defaults would block every
+/// project; the documented gap is in README's
+/// "What sbe Does *Not* Protect Against".
 fn lint_forbidden_reads_against_grants(
     profile: &SandboxProfile,
     forbidden: &BTreeSet<PathBuf>,
@@ -370,22 +376,29 @@ fn lint_forbidden_reads_against_grants(
     if options.allow_degraded {
         return Ok(());
     }
-    // For each grant field that implies read, check no entry covers a
-    // forbidden path. `path_is_under` is "f is under anchor", i.e. anchor
-    // would expose f.
-    for (field, paths) in [
-        ("allowWrite", &profile.allow_write),
-        ("allowExec", &profile.allow_exec),
-        ("allowRead", &profile.allow_read),
-    ] {
+    let user_slices: [(&str, &[SandboxPath]); 3] = [
+        (
+            "allowWrite",
+            &profile.allow_write[profile.first_user_allow_write..],
+        ),
+        (
+            "allowExec",
+            &profile.allow_exec[profile.first_user_allow_exec..],
+        ),
+        (
+            "allowRead",
+            &profile.allow_read[profile.first_user_allow_read..],
+        ),
+    ];
+    for (field, paths) in user_slices {
         for sp in paths {
             for f in forbidden {
                 if path_is_under(f, &sp.path) {
                     return Err(CoreError::ProfileLint(format!(
-                        "denyRead path '{}' is under {} entry '{}'. Landlock grants on allowWrite \
-                         and allowExec also imply read, so this would silently expose the denied \
-                         path. Either narrow the {} entry, remove the denyRead entry, or pass \
-                         --allow-degraded if you understand the threat model.",
+                        "denyRead path '{}' is under user-supplied {} entry '{}'. Landlock grants \
+                         on allowWrite and allowExec also imply read, so this would silently \
+                         expose the denied path. Either narrow the {} entry, remove the denyRead \
+                         entry, or pass --allow-degraded if you understand the threat model.",
                         f.display(),
                         field,
                         sp.path.display(),

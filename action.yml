@@ -1,5 +1,5 @@
 name: 'Setup sbe'
-description: 'Install the sbe CLI (macOS sandbox-exec wrapper) and add it to PATH on Linux CI runners'
+description: 'Install the sbe CLI (sandbox-exec on macOS, Landlock + seccomp on Linux) and add it to PATH'
 author: 'Tyr Chen'
 branding:
   icon: 'shield'
@@ -7,7 +7,7 @@ branding:
 
 inputs:
   version:
-    description: 'sbe version to install (e.g. "0.2.0", "sbexec-v0.2.0", or "latest")'
+    description: 'sbe version to install (e.g. "0.2.2", "sbexec-v0.2.2", or "latest")'
     required: false
     default: 'latest'
   github-token:
@@ -17,7 +17,7 @@ inputs:
 
 outputs:
   version:
-    description: 'The resolved release tag that was installed (e.g. "sbexec-v0.2.0")'
+    description: 'The resolved release tag that was installed (e.g. "sbexec-v0.2.2")'
     value: ${{ steps.resolve.outputs.tag }}
   bin-path:
     description: 'Absolute path to the installed sbe binary'
@@ -26,15 +26,7 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Verify runner OS
-      shell: bash
-      run: |
-        if [[ "$RUNNER_OS" != "Linux" ]]; then
-          echo "::error::setup-sbe currently only supports Linux runners (got: $RUNNER_OS)"
-          exit 1
-        fi
-
-    - name: Resolve version and target
+    - name: Resolve target triple
       id: resolve
       shell: bash
       env:
@@ -43,11 +35,31 @@ runs:
       run: |
         set -euo pipefail
 
-        arch="$(uname -m)"
-        case "$arch" in
-          x86_64)         target="x86_64-unknown-linux-musl" ;;
-          aarch64|arm64)  target="aarch64-unknown-linux-musl" ;;
-          *) echo "::error::Unsupported architecture: $arch"; exit 1 ;;
+        # Map (RUNNER_OS, RUNNER_ARCH) → release target triple. The four
+        # release artifacts are:
+        #   sbe-<tag>-x86_64-unknown-linux-musl.tar.gz
+        #   sbe-<tag>-aarch64-unknown-linux-musl.tar.gz
+        #   sbe-<tag>-x86_64-apple-darwin.tar.gz
+        #   sbe-<tag>-aarch64-apple-darwin.tar.gz
+        case "$RUNNER_OS" in
+          Linux)
+            case "$RUNNER_ARCH" in
+              X64)   target="x86_64-unknown-linux-musl"  ;;
+              ARM64) target="aarch64-unknown-linux-musl" ;;
+              *) echo "::error::Unsupported Linux arch: $RUNNER_ARCH"; exit 1 ;;
+            esac
+            ;;
+          macOS)
+            case "$RUNNER_ARCH" in
+              X64)   target="x86_64-apple-darwin"  ;;
+              ARM64) target="aarch64-apple-darwin" ;;
+              *) echo "::error::Unsupported macOS arch: $RUNNER_ARCH"; exit 1 ;;
+            esac
+            ;;
+          *)
+            echo "::error::setup-sbe supports Linux and macOS runners (got: $RUNNER_OS)"
+            exit 1
+            ;;
         esac
 
         if [[ "$INPUT_VERSION" == "latest" ]]; then
@@ -68,7 +80,7 @@ runs:
 
         echo "tag=$tag" >> "$GITHUB_OUTPUT"
         echo "target=$target" >> "$GITHUB_OUTPUT"
-        echo "Resolved: $tag for $target"
+        echo "Resolved: $tag for $target ($RUNNER_OS / $RUNNER_ARCH)"
 
     - name: Download and install sbe
       id: install

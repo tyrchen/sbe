@@ -34,13 +34,23 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     needs: create-release
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
+        include:
+          # Linux: static musl binaries, run on Ubuntu.
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+          # macOS: dynamic-linked darwin binaries. macos-13 is the last
+          # remaining Intel-x86_64 runner image; macos-latest is Apple
+          # Silicon (aarch64-apple-darwin native).
+          - target: x86_64-apple-darwin
+            runner: macos-13
+          - target: aarch64-apple-darwin
+            runner: macos-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust

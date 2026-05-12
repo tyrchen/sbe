@@ -59,19 +59,29 @@ Supported targets:
 
 ### CI (GitHub Actions)
 
-The bundled composite action installs a prebuilt static binary and adds it to
-`PATH`:
+The bundled composite action installs a prebuilt sbe binary for the runner's
+OS and architecture, then adds it to `PATH`. It works on both Linux and macOS
+GitHub-hosted runners:
 
 ```yaml
 jobs:
-  build:
+  build-linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: tyrchen/sbe@sbexec-v0.2.0   # or @master with `version: latest`
+      - uses: tyrchen/sbe@sbexec-v0.2.2   # or @master with `version: latest`
         with:
           version: latest
       - run: sbe --version
+      - run: sbe run -- cargo build
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: tyrchen/sbe@sbexec-v0.2.2
+        with:
+          version: latest
       - run: sbe run -- cargo build
 ```
 
@@ -82,11 +92,22 @@ Inputs:
 | `version` | `latest` | Release to install. Accepts `latest`, a semver (`0.2.2`), or a full tag (`sbexec-v0.2.2`). |
 | `github-token` | `${{ github.token }}` | Token used for releases API + asset download. |
 
-Outputs: `version` (resolved tag) and `bin-path` (absolute path to the installed binary).
+Outputs: `version` (resolved tag) and `bin-path` (absolute path to the
+installed binary).
 
-Linux runners get full enforcement on `ubuntu-latest` / `ubuntu-24.04` (kernel
-6.x with Landlock ABI v4). On macOS runners the binary uses `sandbox-exec` as
-before.
+Supported runner / architecture matrix (auto-detected via `$RUNNER_OS` and
+`$RUNNER_ARCH`):
+
+| Runner | Arch | Release artifact |
+|---|---|---|
+| `ubuntu-*`  | x86_64 | `x86_64-unknown-linux-musl` |
+| `ubuntu-*`  | arm64  | `aarch64-unknown-linux-musl` |
+| `macos-*`   | x86_64 | `x86_64-apple-darwin` |
+| `macos-*`   | arm64  | `aarch64-apple-darwin` |
+
+Linux runners on `ubuntu-latest` / `ubuntu-24.04` (kernel 6.x) get full
+enforcement via Landlock ABI v4 + seccomp-bpf. macOS runners use
+`sandbox-exec` / SBPL.
 
 ## Quick Start
 
