@@ -12,7 +12,18 @@ use crate::{
 };
 
 /// Embedded default profiles YAML, compiled into the binary.
-const DEFAULTS_YAML: &str = include_str!("defaults.yaml");
+///
+/// Selection is `cfg(target_os = ...)` so each binary ships exactly the
+/// defaults that match its sandbox backend. Both files deserialize through
+/// the same [`DefaultsFile`] schema (verified in tests).
+#[cfg(target_os = "macos")]
+const DEFAULTS_YAML: &str = include_str!("defaults-macos.yaml");
+
+#[cfg(target_os = "linux")]
+const DEFAULTS_YAML: &str = include_str!("defaults-linux.yaml");
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+const DEFAULTS_YAML: &str = include_str!("defaults-macos.yaml");
 
 /// A pattern for matching domain names.
 ///
@@ -58,8 +69,23 @@ pub struct SandboxProfile {
     pub allow_write: Vec<SandboxPath>,
 
     /// Paths denied for reading (expanded, absolute).
+    ///
+    /// On macOS this is a subtractive `(deny file-read* …)` rule. On Linux
+    /// Landlock cannot subtract from an allowed subtree, so the backend
+    /// instead treats this list as a *sealed forbidden-list*: paths here are
+    /// guaranteed never to be silently added to [`Self::allow_read`], and
+    /// any user config that would overlap is rejected.
     #[serde(default)]
     pub deny_read: Vec<SandboxPath>,
+
+    /// Read-allowlist extensions on Linux (no-op on macOS).
+    ///
+    /// macOS uses an "allow all reads then subtract" model, so this field
+    /// goes unused there. On Linux the backend merges these into the
+    /// curated read-anchors and runs the [`Self::deny_read`] forbidden-list
+    /// lint against the merged set.
+    #[serde(default)]
+    pub allow_read: Vec<SandboxPath>,
 
     /// Domains allowed for outbound HTTPS.
     #[serde(default)]
@@ -91,6 +117,25 @@ pub struct SandboxProfile {
     /// Additional environment variables to inject.
     #[serde(default)]
     pub env: HashMap<String, String>,
+
+    /// Proceed under a less-capable kernel even when a requested feature
+    /// (currently: Landlock ABI v4 net filter) is unavailable. See §13 D1
+    /// of the cross-platform backend design.
+    #[serde(default)]
+    pub allow_degraded: bool,
+
+    /// Per-field boundary marker: indices `< first_user_*` were populated
+    /// from the curated per-OS defaults; indices `>=` came from user
+    /// `.sbe.yaml` or CLI overrides. The Linux backend's `denyRead`
+    /// forbidden-list seal lint only inspects user additions so that
+    /// intentional default overlaps (e.g. `$PWD/` covers `$PWD/.env`)
+    /// don't trip on every project.
+    #[serde(skip)]
+    pub first_user_allow_write: usize,
+    #[serde(skip)]
+    pub first_user_allow_exec: usize,
+    #[serde(skip)]
+    pub first_user_allow_read: usize,
 }
 
 fn default_true() -> bool {
@@ -118,12 +163,15 @@ impl SandboxProfile {
             .map(|p| expand_path(p, home, pwd))
             .collect();
 
-        // Build deny_exec: from common (also resolve symlinks for deny rules)
+        // Build deny_exec: from common (also resolve symlinks for deny rules
+        // on macOS — on Linux denyExec is a no-op so symlinks don't matter).
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut deny_exec: Vec<SandboxPath> = common
             .deny_exec
             .iter()
             .map(|p| expand_path(p, home, pwd))
             .collect();
+        #[cfg(target_os = "macos")]
         resolve_symlinks(&mut deny_exec);
 
         // Build deny_read: from common
@@ -189,22 +237,45 @@ impl SandboxProfile {
             allow_exec.push(SandboxPath::dir(PathBuf::from(java_home)));
         }
 
-        // Resolve symlinks: SBPL checks the real path after kernel symlink
-        // resolution, so /opt/homebrew/bin/zig (symlink) won't match unless
-        // we also allow the resolved /opt/homebrew/Cellar/.../zig path.
+        // Resolve symlinks: SBPL on macOS checks the real path after kernel
+        // symlink resolution, so /opt/homebrew/bin/zig (a symlink to
+        // /opt/homebrew/Cellar/.../zig) won't match unless we also allow the
+        // resolved Cellar path. Landlock on Linux dereferences via the
+        // preopened FD; symlink resolution there is a non-issue.
+        #[cfg(target_os = "macos")]
         resolve_symlinks(&mut allow_exec);
+
+        // Linux read-allowlist additions from defaults (macOS ignores).
+        let allow_read: Vec<SandboxPath> = common
+            .allow_read
+            .iter()
+            .chain(eco_cfg.allow_read.iter())
+            .map(|p| expand_path(p, home, pwd))
+            .collect();
+
+        // After this point everything appended to allow_* is treated as
+        // user-supplied. Snapshot the lengths now so the seal lint can
+        // identify user additions later.
+        let first_user_allow_write = allow_write.len();
+        let first_user_allow_exec = allow_exec.len();
+        let first_user_allow_read = allow_read.len();
 
         SandboxProfile {
             name: profile_name,
             allow_write,
             deny_read,
+            allow_read,
             allow_domains,
             deny_exec,
             allow_exec,
-            enable_proxy: true,
+            enable_proxy: eco_cfg.enable_proxy.unwrap_or(true),
             allow_all_network: false,
             allow_fetch: vec![],
             env: Default::default(),
+            allow_degraded: false,
+            first_user_allow_write,
+            first_user_allow_exec,
+            first_user_allow_read,
         }
     }
 
@@ -213,6 +284,7 @@ impl SandboxProfile {
         self.allow_write
             .extend(overrides.allow_write.iter().cloned());
         self.deny_read.extend(overrides.deny_read.iter().cloned());
+        self.allow_read.extend(overrides.allow_read.iter().cloned());
         self.allow_domains
             .extend(overrides.allow_domains.iter().cloned());
         self.deny_exec.extend(overrides.deny_exec.iter().cloned());
@@ -232,6 +304,9 @@ impl SandboxProfile {
         }
         if overrides.no_proxy {
             self.enable_proxy = false;
+        }
+        if overrides.allow_degraded {
+            self.allow_degraded = true;
         }
 
         for (k, v) in &overrides.env {
@@ -271,6 +346,7 @@ impl SandboxProfile {
 /// For Homebrew Cellar paths, we add the package root directory (e.g.,
 /// `/opt/homebrew/Cellar/zig/0.15.2/`) rather than just the binary, because
 /// tools like zig spawn sub-tools from their lib/ directory.
+#[cfg(target_os = "macos")]
 #[allow(clippy::disallowed_methods)]
 fn resolve_symlinks(paths: &mut Vec<SandboxPath>) {
     let additional: Vec<SandboxPath> = paths
@@ -339,6 +415,7 @@ fn find_git_root(start: &Path) -> Option<PathBuf> {
 pub struct ProfileOverrides {
     pub allow_write: Vec<SandboxPath>,
     pub deny_read: Vec<SandboxPath>,
+    pub allow_read: Vec<SandboxPath>,
     pub allow_domains: Vec<DomainPattern>,
     pub deny_domains: Vec<DomainPattern>,
     pub allow_exec: Vec<SandboxPath>,
@@ -346,6 +423,7 @@ pub struct ProfileOverrides {
     pub allow_fetch: Vec<DomainPattern>,
     pub allow_all_network: bool,
     pub no_proxy: bool,
+    pub allow_degraded: bool,
     pub env: HashMap<String, String>,
 }
 
@@ -363,6 +441,8 @@ struct CommonDefaults {
     #[serde(default)]
     deny_read: Vec<String>,
     #[serde(default)]
+    allow_read: Vec<String>,
+    #[serde(default)]
     deny_exec: Vec<String>,
     #[serde(default)]
     allow_exec: Vec<String>,
@@ -374,9 +454,20 @@ struct EcosystemDefaults {
     #[serde(default)]
     allow_write: Vec<String>,
     #[serde(default)]
+    allow_read: Vec<String>,
+    #[serde(default)]
     allow_domains: Vec<String>,
     #[serde(default)]
     allow_exec: Vec<String>,
+    /// Whether to start the domain-filtering proxy. Some ecosystems whose
+    /// HTTP stack does not respect `HTTP_PROXY` env (notably JVM tools like
+    /// Maven and Gradle) cannot benefit from the proxy and need the kernel
+    /// to open port 443 directly. Set this to `false` in those profiles —
+    /// kernel TCP filter still enforces "egress on port 443 only", but
+    /// domain filtering is delegated to the proxy when set to true.
+    /// Defaults to `true`.
+    #[serde(default)]
+    enable_proxy: Option<bool>,
 }
 
 // --- Rust-specific cargo target dir resolution ---
@@ -456,8 +547,24 @@ mod tests {
                 !profile.allow_domains.is_empty(),
                 "no allow_domains for {eco}"
             );
-            assert!(!profile.deny_exec.is_empty(), "no deny_exec for {eco}");
             assert!(!profile.allow_exec.is_empty(), "no allow_exec for {eco}");
+            // denyExec is macOS-only — Linux Landlock is allowlist-only.
+            #[cfg(target_os = "macos")]
+            assert!(!profile.deny_exec.is_empty(), "no deny_exec for {eco}");
+        }
+    }
+
+    /// Both YAML defaults files must deserialize through [`DefaultsFile`]
+    /// (regression guard for the macOS/Linux schema split).
+    #[test]
+    fn test_should_parse_both_defaults_files() {
+        let macos: DefaultsFile =
+            serde_yaml::from_str(include_str!("defaults-macos.yaml")).expect("macOS defaults");
+        let linux: DefaultsFile =
+            serde_yaml::from_str(include_str!("defaults-linux.yaml")).expect("Linux defaults");
+        for name in ["node", "rust", "python", "elixir", "java"] {
+            assert!(macos.profiles.contains_key(name), "macos missing {name}");
+            assert!(linux.profiles.contains_key(name), "linux missing {name}");
         }
     }
 
@@ -492,6 +599,8 @@ mod tests {
                 has(&profile.allow_exec, "/usr/bin/cc"),
                 "missing /usr/bin/cc for {eco}"
             );
+            // osascript deny only exists in the macOS defaults.
+            #[cfg(target_os = "macos")]
             assert!(
                 has(&profile.deny_exec, "/usr/bin/osascript"),
                 "missing osascript deny for {eco}"

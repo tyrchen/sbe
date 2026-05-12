@@ -1,0 +1,538 @@
+name: test-cli
+
+# Full-fledged sbe end-to-end test suite. Three layers:
+#
+#  1. install + smoke (Linux + macOS): cargo install + sbe --version /
+#     profiles / inspect / --dry-run / minimal `run` / --allow-all-network /
+#     --allow-degraded.
+#
+#  2. ecosystem (Linux): for each language ecosystem, run a representative
+#     real-world build under `sbe run` against (a) a fresh "happy path"
+#     project that depends on a real upstream package, and (b) the hostile
+#     fixture in /fixtures/<eco>/ that exercises every attack in
+#     fixtures/ATTACKS.md. The fixture output must contain zero `PWNED:`
+#     lines and at least one `SAFE:` line for every attack ID.
+#
+#  3. network-filter (Linux): explicit proxy-allowlist tests — `curl` to
+#     an allowed domain (registry) succeeds; `curl` to an evil domain
+#     gets a non-2xx response. Verifies the two-layer defense.
+#
+# Java/Scala uses the gradle fixture (Kotlin DSL) and the sbt fixture
+# (Scala) since the team builds Scala backends. Maven coverage is implicit
+# via the same java profile and the gradle fixture's mavenCentral repo.
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  # Used by every "verify-fixture-output" step.
+  ATTACK_IDS: "ssh-read aws-read gcloud-read gh-token-read env-read bashrc-write authorized-keys-write sudo-exec pkexec-exec curl-evil"
+
+jobs:
+  install:
+    name: install + smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo install --path apps/cli
+        run: cargo install --path apps/cli --locked --force
+
+      - name: sbe --version
+        run: sbe --version
+
+      - name: sbe profiles (lists all 5 ecosystems)
+        run: |
+          set -euo pipefail
+          out=$(sbe profiles)
+          echo "$out"
+          for eco in node rust python elixir java; do
+            echo "$out" | grep -E "^=== ${eco} ===" >/dev/null || {
+              echo "missing profile section: $eco"; exit 1; }
+          done
+
+      - name: sbe inspect renders deterministic policy (rust)
+        run: |
+          set -euo pipefail
+          out=$(sbe inspect -- cargo build 2>/dev/null)
+          test -n "$out"
+          echo "$out" | head -40
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            echo "$out" | grep -E "^backend: landlock\+seccomp" >/dev/null
+            echo "$out" | grep -E "^landlockAbi: v[0-9]+" >/dev/null
+            echo "$out" | grep -E "^seccomp:" >/dev/null
+          else
+            echo "$out" | grep -E "^\(version 1\)" >/dev/null
+            echo "$out" | grep -E "^\(deny default\)" >/dev/null
+          fi
+
+      - name: sbe inspect for every ecosystem (smoke)
+        run: |
+          set -euo pipefail
+          for eco in node rust python elixir java; do
+            echo "=== $eco ==="
+            sbe inspect --profile "$eco" -- /bin/echo hi >/dev/null 2>&1 \
+              || { echo "inspect $eco failed"; exit 1; }
+          done
+
+      - name: sbe run --dry-run prints policy without spawning the child
+        run: |
+          set -euo pipefail
+          sbe run --dry-run -- echo hello >/tmp/sbe-dry.out 2>&1 || true
+          test -s /tmp/sbe-dry.out
+          head -20 /tmp/sbe-dry.out
+
+      - name: sbe run -- /bin/echo hello (real sandbox)
+        run: |
+          set -euo pipefail
+          out=$(sbe run --profile rust -- /bin/echo "hello from sbe")
+          echo "got: $out"
+          test "$out" = "hello from sbe"
+
+      - name: sbe run --allow-all-network -- /bin/echo (bypass proxy)
+        run: |
+          set -euo pipefail
+          sbe run --allow-all-network -- /bin/echo "bypass-ok"
+
+      - name: sbe run --allow-degraded smoke (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sbe run --allow-degraded --profile python -- /bin/echo "degraded-ok"
+
+      - name: sbe run twice in a row (warm-cache behaviour)
+        run: |
+          set -euo pipefail
+          sbe run --profile node -- /bin/echo run-1
+          sbe run --profile node -- /bin/echo run-2
+
+  # Shared verifier shell. Saved here so all ecosystem jobs use the same logic.
+  # Asserts: zero "PWNED:" lines AND a "SAFE:" line for every attack ID.
+  # Wrapped in a Bash function via $GITHUB_ENV could work, but a composite
+  # action would be cleaner. For now we inline a heredoc in each step.
+
+  ecosystem-rust:
+    name: ecosystem / cargo
+    needs: install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo install sbe
+        run: cargo install --path apps/cli --locked --force
+
+      - name: real-dep happy path — cargo build of a fresh crate with serde
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/sbe-rust" && cd "$HOME/sbe-rust"
+          rm -rf real && cargo init --name real --bin real
+          cd real
+          cat > Cargo.toml <<'TOML'
+          [package]
+          name = "real"
+          version = "0.1.0"
+          edition = "2024"
+          [dependencies]
+          serde = { version = "1", features = ["derive"] }
+          serde_json = "1"
+          TOML
+          cat > src/main.rs <<'RS'
+          use serde::{Deserialize, Serialize};
+          #[derive(Serialize, Deserialize, Debug)]
+          struct P { name: String, age: u32 }
+          fn main() {
+              let p = P { name: "sbe".to_owned(), age: 1 };
+              let s = serde_json::to_string(&p).unwrap();
+              println!("{s}");
+          }
+          RS
+          sbe run -- cargo build --release 2>&1 | tee out.log
+          grep -q "Compiling serde" out.log
+          ./target/release/real | grep -q '"name":"sbe"'
+
+      - name: hostile fixture — every attack must be SAFE (10/10)
+        run: |
+          set -euo pipefail
+          cd fixtures/rust
+          rm -rf target
+          sbe run -- cargo build 2>&1 | tee out.log
+          ${GITHUB_WORKSPACE}/.github/workflows/verify-attacks.sh out.log
+
+  ecosystem-node:
+    name: ecosystem / npm
+    needs: install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo install sbe
+        run: cargo install --path apps/cli --locked --force
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Persist npm's user-level cache so the lodash+chalk fetch is
+      # warm on subsequent runs. The cache lives at ~/.npm; the node
+      # profile's allowWrite already includes it, so sbe can write to
+      # it inside the sandbox.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+          key: sbe-node-${{ runner.os }}-${{ hashFiles('fixtures/node/package.json', '.github/workflows/test-cli.yml') }}
+          restore-keys: |
+            sbe-node-${{ runner.os }}-
+
+      - name: real-dep happy path — npm install lodash + chalk
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/sbe-node" && cd "$HOME/sbe-node"
+          rm -rf real && mkdir real && cd real
+          cat > package.json <<'JSON'
+          {
+            "name": "real",
+            "version": "0.0.1",
+            "dependencies": { "lodash": "4.17.21", "chalk": "4.1.2" }
+          }
+          JSON
+          sbe run -- npm install --no-audit --no-fund 2>&1 | tee out.log
+          test -d node_modules/lodash
+          test -d node_modules/chalk
+
+      - name: hostile fixture — every attack must be SAFE (10/10)
+        run: |
+          set -euo pipefail
+          cd fixtures/node
+          rm -rf node_modules
+          sbe run -- npm install --no-audit --no-fund 2>&1 | tee out.log || true
+          ${GITHUB_WORKSPACE}/.github/workflows/verify-attacks.sh out.log
+
+  ecosystem-python:
+    name: ecosystem / uv
+    needs: install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo install sbe
+        run: cargo install --path apps/cli --locked --force
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: latest
+
+      # Persist uv's user-level cache (~/.cache/uv) and pip's so the
+      # requests+httpx wheels are warm next time. The python profile's
+      # allowWrite already covers both.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/uv
+            ~/.cache/pip
+          key: sbe-uv-${{ runner.os }}-${{ hashFiles('fixtures/python/pyproject.toml', '.github/workflows/test-cli.yml') }}
+          restore-keys: |
+            sbe-uv-${{ runner.os }}-
+
+      - name: real-dep happy path — uv pip install requests (HTTP via proxy)
+        env:
+          UV_CACHE_DIR: ${{ github.workspace }}/../.uv-cache
+        run: |
+          set -euo pipefail
+          export UV_CACHE_DIR="$HOME/.cache/uv"
+          mkdir -p "$HOME/sbe-uv" "$UV_CACHE_DIR"
+          cd "$HOME/sbe-uv"
+          rm -rf real && mkdir real && cd real
+          uv venv .venv
+          sbe run -- uv pip install --python .venv --no-progress requests httpx
+          test -d .venv/lib
+
+      - name: hostile fixture — every attack must be SAFE (10/10)
+        run: |
+          set -euo pipefail
+          export UV_CACHE_DIR="$HOME/.cache/uv"
+          mkdir -p "$UV_CACHE_DIR"
+          cd fixtures/python
+          rm -rf dist
+          sbe run -- uv build --no-progress 2>&1 | tee out.log || true
+          ${GITHUB_WORKSPACE}/.github/workflows/verify-attacks.sh out.log
+
+  ecosystem-elixir:
+    name: ecosystem / mix
+    needs: install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo install sbe
+        run: cargo install --path apps/cli --locked --force
+      - name: Install Erlang/Elixir
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y elixir erlang
+          echo "mix at $(command -v mix)"
+
+      # Persist hex/mix/rebar3 caches. The mix.exs files don't pin versions
+      # tightly enough for hashFiles to be a useful invalidation signal —
+      # any change to the workflow drops the cache. The elixir profile's
+      # allowWrite already covers all three paths.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.hex
+            ~/.mix
+            ~/.cache/rebar3
+          key: sbe-mix-${{ runner.os }}-${{ hashFiles('fixtures/elixir/mix.exs', '.github/workflows/test-cli.yml') }}
+          restore-keys: |
+            sbe-mix-${{ runner.os }}-
+
+      - name: Bootstrap hex (outside sbe — one-time host setup)
+        run: |
+          set -euo pipefail
+          mix local.hex --force --if-missing
+          mix local.rebar --force --if-missing
+
+      - name: real-dep happy path — mix compile a fresh project with jason
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/sbe-mix" && cd "$HOME/sbe-mix"
+          rm -rf real && mkdir real && cd real
+          cat > mix.exs <<'EX'
+          defmodule Real.MixProject do
+            use Mix.Project
+            def project, do: [app: :real, version: "0.1.0", elixir: "~> 1.14", deps: deps()]
+            def application, do: [extra_applications: [:logger]]
+            defp deps, do: [{:jason, "~> 1.4"}]
+          end
+          EX
+          mkdir -p lib
+          cat > lib/real.ex <<'EX'
+          defmodule Real do
+            def hello, do: Jason.encode!(%{name: "sbe", age: 1})
+          end
+          EX
+          sbe run -- mix deps.get 2>&1 | tee deps.log
+          grep -qi "jason" deps.log
+          sbe run -- mix compile 2>&1 | tee compile.log
+          grep -qE "(Compiled|Generated real)" compile.log
+
+      - name: hostile fixture — every attack must be SAFE (10/10)
+        run: |
+          set -euo pipefail
+          cd fixtures/elixir
+          rm -rf _build deps
+          sbe run -- mix compile 2>&1 | tee out.log || true
+          ${GITHUB_WORKSPACE}/.github/workflows/verify-attacks.sh out.log
+
+  # Java/Scala coverage uses sbt and Maven — both single-JVM tools.
+  #
+  # Gradle is INTENTIONALLY NOT in this job. Gradle's CLI talks to a daemon
+  # process over a kernel-chosen random localhost TCP port, and Landlock
+  # ABI v4 can only filter TCP by port number, not by destination IP. There
+  # is no way to express "allow any port on 127.0.0.1" the way macOS SBPL's
+  # `(remote ip "localhost:*")` does. Users who insist on Gradle on Linux
+  # must opt into `allowAllNetwork: true` in their .sbe.yaml for the java
+  # profile — fully aware that this disables both kernel TCP filtering AND
+  # the proxy. README documents this trade-off.
+  #
+  # sbt 1.x defaults to Unix-domain-socket IPC (since 1.1) so it isn't
+  # subject to NET_CONNECT_TCP at all. Maven runs in a single JVM with no
+  # IPC. Both work cleanly under the default java profile.
+  ecosystem-java:
+    name: ecosystem / java (sbt + mvn)
+    needs: install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo install sbe
+        run: cargo install --path apps/cli --locked --force
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      - uses: sbt/setup-sbt@v1
+
+      # Cache the JVM-tool dependency caches between runs. Without this the
+      # cold-cache fetch of cats-effect + munit-cats-effect + sbt + scala
+      # compiler is the dominant CI cost (~3 min). Key is hashed over the
+      # build descriptors so any dep bump invalidates cleanly.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.ivy2/cache
+            ~/.sbt
+            ~/.cache/coursier
+            ~/.m2/repository
+          key: sbe-jvm-${{ runner.os }}-${{ hashFiles('fixtures/scala/build.sbt', 'fixtures/scala/project/build.properties') }}
+          restore-keys: |
+            sbe-jvm-${{ runner.os }}-
+
+      - name: Install Maven (apt — system paths so the default profile applies)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y maven
+          echo "mvn at $(command -v mvn)"
+
+      - name: real-dep happy path — mvn compile a fresh Java project with Guava
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/sbe-mvn" && cd "$HOME/sbe-mvn"
+          rm -rf real && mkdir -p real/src/main/java/com/sbetest && cd real
+          cat > pom.xml <<'POM'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>com.sbetest</groupId>
+            <artifactId>real</artifactId>
+            <version>0.1.0</version>
+            <properties>
+              <maven.compiler.source>17</maven.compiler.source>
+              <maven.compiler.target>17</maven.compiler.target>
+            </properties>
+            <dependencies>
+              <dependency>
+                <groupId>com.google.guava</groupId>
+                <artifactId>guava</artifactId>
+                <version>33.0.0-jre</version>
+              </dependency>
+            </dependencies>
+          </project>
+          POM
+          cat > src/main/java/com/sbetest/App.java <<'JAVA'
+          package com.sbetest;
+          import com.google.common.base.Strings;
+          public final class App {
+              public static void main(String[] a) {
+                  System.out.println(Strings.repeat("hi ", 3));
+              }
+          }
+          JAVA
+          sbe run -- mvn -q -B compile 2>&1 | tee out.log
+          test -f target/classes/com/sbetest/App.class
+
+      - name: real-dep happy path — sbt compile a fresh Scala project with cats
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/sbe-scala" && cd "$HOME/sbe-scala"
+          rm -rf real && mkdir -p real/src/main/scala/com/sbetest real/project
+          cd real
+          cat > project/build.properties <<'P'
+          sbt.version=1.10.0
+          P
+          cat > build.sbt <<'SBT'
+          ThisBuild / scalaVersion := "2.13.14"
+          ThisBuild / organization := "com.sbetest"
+          ThisBuild / version      := "0.1.0"
+          lazy val root = (project in file(".")).settings(
+              name := "real",
+              libraryDependencies += "org.typelevel" %% "cats-core" % "2.10.0"
+          )
+          SBT
+          cat > src/main/scala/com/sbetest/App.scala <<'SCALA'
+          package com.sbetest
+          import cats.implicits._
+          object App {
+              def main(args: Array[String]): Unit = println((1, 2).bimap(_ + 1, _ * 2))
+          }
+          SCALA
+          sbe run -- sbt -batch compile 2>&1 | tee out.log
+          grep -qiE "(success|done compiling)" out.log
+
+      - name: hostile sbt fixture — cats-effect compile + MUnit test
+        run: |
+          set -euo pipefail
+          cd fixtures/scala
+          rm -rf target project/target project/project
+          # The build.sbt evaluates on every sbt task and runs the attack
+          # matrix (10 probes, each subprocess capped at 5s via
+          # ProcessBuilder.waitFor). `sbt test` exercises a full compile +
+          # MUnit test run for the cats-effect Greeter, so the sandbox
+          # actually has work to mediate (dep resolution → ivy2, scalac,
+          # MUnit). All 10 attack IDs must come back SAFE.
+          sbe run -- sbt -batch test 2>&1 | tee out.log || true
+          ${GITHUB_WORKSPACE}/.github/workflows/verify-attacks.sh out.log
+          # Sanity: the MUnit test actually ran.
+          grep -qE "GreeterSpec" out.log || {
+            echo "FAIL: MUnit test never ran — sbt may have errored out before tests"
+            exit 1
+          }
+
+  network-filter:
+    name: network filter (proxy allowlist)
+    needs: install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo install sbe
+        run: cargo install --path apps/cli --locked --force
+
+      # The repo's project-local .sbe.yaml forces enableProxy: false for the
+      # rust profile (so the in-tree proxy integration tests can do real
+      # TCP). For an honest network-filter test we cd out of the repo so
+      # that override does NOT apply.
+      - name: curl to an ALLOWLISTED domain succeeds (registry.npmjs.org)
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/sbe-netfilter" && cd "$HOME/sbe-netfilter"
+          out=$(sbe run --profile rust --allow-fetch registry.npmjs.org -- \
+                /usr/bin/curl -sSL --max-time 10 -o /dev/null \
+                -w "%{http_code}" https://registry.npmjs.org/)
+          echo "code=$out"
+          case "$out" in 2*|3*) ;; *) echo "FAIL: expected 2xx/3xx, got $out"; exit 1;; esac
+
+      - name: curl to a NON-allowlisted domain gets a non-2xx (proxy 403)
+        run: |
+          set -euo pipefail
+          cd "$HOME/sbe-netfilter"
+          out=$(sbe run --profile rust --allow-fetch registry.npmjs.org -- \
+                /usr/bin/curl -sSL --max-time 10 -o /dev/null \
+                -w "%{http_code}" https://evil.example.invalid/ || true)
+          echo "code=$out"
+          case "$out" in 2*) echo "FAIL: proxy let evil through (got $out)"; exit 1;; *) ;; esac

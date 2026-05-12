@@ -2,10 +2,12 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-/// sbe — Run commands in a macOS sandbox with supply chain attack protection.
+/// sbe — Run commands in a kernel-enforced sandbox with supply chain attack
+/// protection.
 ///
-/// Wraps any command in a macOS sandbox-exec sandbox with sensible defaults
-/// per language ecosystem (Node.js, Rust, Python, Elixir, Java).
+/// Wraps any command in `sandbox-exec` (macOS) or Landlock + seccomp (Linux)
+/// with sensible defaults per language ecosystem (Node.js, Rust, Python,
+/// Elixir, Java).
 #[derive(Debug, Parser)]
 #[command(name = "sbe", version, about, long_about = None)]
 pub struct Cli {
@@ -18,7 +20,8 @@ pub enum Commands {
     /// Execute a command inside the sandbox.
     Run(RunArgs),
 
-    /// Print resolved config and generated SBPL without executing.
+    /// Print resolved config and the policy that would be installed
+    /// (SBPL on macOS, Landlock+seccomp YAML on Linux) without executing.
     Inspect(InspectArgs),
 
     /// List available profiles and their defaults.
@@ -67,6 +70,12 @@ pub struct RunArgs {
     /// Disable proxy (use SBPL-only network rules).
     #[arg(long)]
     pub no_proxy: bool,
+
+    /// Proceed even when the kernel cannot fully enforce the requested
+    /// profile (e.g., Landlock ABI <v4 — net pinning falls back to a
+    /// seccomp arg filter). Prints a warning naming the missing capability.
+    #[arg(long)]
+    pub allow_degraded: bool,
 
     /// Stream sandbox violations to stderr.
     #[arg(long)]
@@ -135,6 +144,10 @@ pub struct InspectArgs {
     #[arg(long)]
     pub no_proxy: bool,
 
+    /// Proceed under a degraded kernel (see RunArgs).
+    #[arg(long)]
+    pub allow_degraded: bool,
+
     /// Use specific config file.
     #[arg(short = 'c', long)]
     pub config: Option<PathBuf>,
@@ -158,6 +171,7 @@ impl InspectArgs {
             allow_fetch: self.allow_fetch.clone(),
             allow_all_network: self.allow_all_network,
             no_proxy: self.no_proxy,
+            allow_degraded: self.allow_degraded,
             audit: false,
             audit_log: None,
             dry_run: true,

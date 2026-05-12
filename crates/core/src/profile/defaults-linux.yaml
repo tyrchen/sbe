@@ -1,0 +1,398 @@
+# sbe built-in default profiles — Linux.
+# Embedded into the binary at compile time via include_str!.
+#
+# Path conventions:
+#   ~ expands to home dir, $PWD to working directory
+#   Trailing / means directory → Landlock path-beneath (recursive match)
+#   No trailing / means file   → Landlock path-beneath on the file FD only
+#
+# Per the cross-platform-backend-design spec (§8) Linux differs from macOS:
+#   - denyRead is sealed forbidden-list, not a subtractive deny (see §8).
+#   - allowExec MUST be per-binary literals — directory subpaths defeat
+#     the threat model on Linux (a /usr/bin subpath grants sudo).
+#   - denyExec is ignored (Landlock is allowlist-only).
+
+common:
+  # Sealed forbidden-read list. The Linux backend refuses to silently add
+  # these paths to the read allowlist, even via user config.
+  denyRead:
+    # SSH / GPG
+    - "~/.ssh/"
+    - "~/.gnupg/"
+    # Cloud credentials
+    - "~/.aws/"
+    - "~/.azure/"
+    - "~/.config/gcloud/"
+    - "~/.kube/config"
+    # Container / registry auth
+    - "~/.docker/config.json"
+    - "~/.netrc"
+    # Password managers
+    - "~/.password-store/"
+    # Package manager tokens
+    - "~/.cargo/credentials.toml"
+    - "~/.cargo/credentials"
+    - "~/.pypirc"
+    - "~/.hex/hex_api_key"
+    - "~/.config/gh/"
+    # Environment secrets
+    - "$PWD/.env"
+    - "$PWD/.env.local"
+    - "$PWD/.env.production"
+    # Browser profiles
+    - "~/.mozilla/"
+    - "~/.config/google-chrome/"
+    - "~/.config/chromium/"
+    - "~/.config/BraveSoftware/"
+
+  # On Linux, denyExec is ignored (Landlock is allowlist-only). We keep the
+  # field so the schema stays cross-OS; the backend warns when it's set.
+  denyExec: []
+
+  allowExec:
+    # Shells
+    - "/bin/sh"
+    - "/bin/bash"
+    - "/usr/bin/env"
+    - "/usr/bin/sh"
+    - "/usr/bin/bash"
+    # Core utilities — each one explicit (no /usr/bin subpath)
+    - "/bin/cat"
+    - "/bin/cp"
+    - "/bin/mv"
+    - "/bin/rm"
+    - "/bin/mkdir"
+    - "/bin/rmdir"
+    - "/bin/ls"
+    - "/bin/ln"
+    - "/bin/chmod"
+    - "/bin/date"
+    - "/bin/echo"
+    - "/bin/dd"
+    - "/usr/bin/cat"
+    - "/usr/bin/cp"
+    - "/usr/bin/mv"
+    - "/usr/bin/rm"
+    - "/usr/bin/mkdir"
+    - "/usr/bin/rmdir"
+    - "/usr/bin/ls"
+    - "/usr/bin/ln"
+    - "/usr/bin/chmod"
+    - "/usr/bin/date"
+    - "/usr/bin/echo"
+    - "/usr/bin/basename"
+    - "/usr/bin/dirname"
+    - "/usr/bin/head"
+    - "/usr/bin/tail"
+    - "/usr/bin/cut"
+    - "/usr/bin/tr"
+    - "/usr/bin/sed"
+    - "/usr/bin/awk"
+    - "/usr/bin/grep"
+    - "/usr/bin/sort"
+    - "/usr/bin/uniq"
+    - "/usr/bin/wc"
+    - "/usr/bin/tee"
+    - "/usr/bin/xargs"
+    - "/usr/bin/find"
+    - "/usr/bin/touch"
+    - "/usr/bin/mktemp"
+    - "/usr/bin/install"
+    - "/usr/bin/test"
+    - "/usr/bin/expr"
+    - "/usr/bin/printf"
+    - "/usr/bin/readlink"
+    - "/usr/bin/uname"
+    - "/usr/bin/which"
+    - "/usr/bin/file"
+    - "/usr/bin/stat"
+    # Archive / compression
+    - "/usr/bin/tar"
+    - "/usr/bin/gzip"
+    - "/usr/bin/gunzip"
+    - "/usr/bin/bzip2"
+    - "/usr/bin/bunzip2"
+    - "/usr/bin/xz"
+    - "/usr/bin/zstd"
+    - "/usr/bin/unzip"
+    - "/usr/bin/zip"
+    # Build toolchain — each binary explicit
+    - "/usr/bin/cc"
+    - "/usr/bin/gcc"
+    - "/usr/bin/g++"
+    - "/usr/bin/clang"
+    - "/usr/bin/clang++"
+    - "/usr/bin/ld"
+    - "/usr/bin/ld.gold"
+    - "/usr/bin/ld.lld"
+    - "/usr/bin/as"
+    - "/usr/bin/ar"
+    - "/usr/bin/ranlib"
+    - "/usr/bin/strip"
+    - "/usr/bin/nm"
+    - "/usr/bin/objdump"
+    - "/usr/bin/objcopy"
+    - "/usr/bin/make"
+    - "/usr/bin/cmake"
+    - "/usr/bin/pkg-config"
+    - "/usr/local/bin/cmake"
+    - "/usr/local/bin/pkg-config"
+    # Dynamic linker — Landlock EXECUTE is required to start any
+    # dynamically-linked binary on Linux.
+    - "/lib64/ld-linux-x86-64.so.2"
+    - "/lib/ld-linux-x86-64.so.2"
+    - "/lib/ld-linux-aarch64.so.1"
+    - "/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1"
+    # Shared libraries — directory subpaths are acceptable here because
+    # these trees contain no shell-callable binaries, only .so files.
+    - "/lib/"
+    - "/lib32/"
+    - "/lib64/"
+    - "/usr/lib/"
+    - "/usr/lib32/"
+    - "/usr/lib64/"
+    - "/usr/local/lib/"
+    # Git (used by cargo, mix deps.get, etc.)
+    - "/usr/bin/git"
+    - "/usr/local/bin/git"
+    # Temp directories — build tools create wrapper scripts here
+    - "/tmp/"
+    - "/var/tmp/"
+    # /opt — Homebrew on Linux, Snapcraft, language-specific installs,
+    # GitHub Actions hosted-tool cache (/opt/hostedtoolcache/). Subpath
+    # is safe here because the privilege-escalation lint guards
+    # /usr/bin/sudo + /bin/sudo + similar — /opt/ is not on that list.
+    - "/opt/"
+
+profiles:
+  node:
+    allowWrite:
+      - "$PWD/"
+      - "~/.npm/"
+      - "~/.cache/yarn/"
+      - "~/.yarn/"
+      - "~/.local/share/pnpm/"
+      - "~/.bun/"
+      - "~/.cache/bun/"
+      # GH Actions setup-node caches node here; allow writes to its cache
+      # subtree so `npm install` can populate the local store.
+      - "/opt/hostedtoolcache/node/"
+    allowDomains:
+      - "registry.npmjs.org"
+      - "registry.yarnpkg.com"
+      - "registry.npmmirror.com"
+      - "github.com"
+      - "codeload.github.com"
+      - "objects.githubusercontent.com"
+    allowExec:
+      - "/usr/local/bin/node"
+      - "/usr/bin/node"
+      - "/usr/bin/npm"
+      - "/usr/bin/npx"
+      - "/usr/local/bin/npm"
+      - "/usr/local/bin/npx"
+      - "/usr/local/bin/yarn"
+      - "/usr/local/bin/pnpm"
+      - "/usr/local/bin/bun"
+      - "~/.nvm/"
+      - "~/.volta/"
+      - "~/.fnm/"
+      - "~/.local/share/fnm/"
+      - "~/.local/state/fnm_multishells/"
+      # mise (polyglot version manager)
+      - "~/.local/share/mise/"
+      # asdf shim layout
+      - "~/.asdf/"
+
+  rust:
+    allowWrite:
+      - "$PWD/"
+      - "~/.cargo/registry/"
+      - "~/.cargo/git/"
+      # NOTE: ~/.cargo/bin/ is NOT writable — prevents trojaning cargo binaries
+      - "~/.rustup/"
+      - "~/.cache/zig/"
+    allowDomains:
+      - "crates.io"
+      - "static.crates.io"
+      - "index.crates.io"
+      - "static.rust-lang.org"
+      - "github.com"
+      - "codeload.github.com"
+      - "objects.githubusercontent.com"
+    allowExec:
+      - "~/.cargo/bin/"
+      - "~/.rustup/toolchains/"
+
+  python:
+    allowWrite:
+      - "$PWD/"
+      - "~/.cache/pip/"
+      - "~/.cache/uv/"
+      - "~/.local/lib/"
+      # NOTE: ~/.local/bin/ is NOT writable — prevents trojaning user binaries
+      - "$PWD/.venv/"
+      - "$PWD/venv/"
+      # uv Python version downloads and tool installs
+      - "~/.local/share/uv/"
+      # Poetry cache
+      - "~/.cache/pypoetry/"
+      # PDM cache
+      - "~/.local/share/pdm/"
+      # Rye
+      - "~/.rye/"
+      # GH Actions setup-uv and setup-python tool cache.
+      - "/opt/hostedtoolcache/uv/"
+      - "/opt/hostedtoolcache/Python/"
+    allowDomains:
+      - "pypi.org"
+      - "files.pythonhosted.org"
+      - "github.com"
+      - "codeload.github.com"
+      - "objects.githubusercontent.com"
+    allowExec:
+      - "/usr/bin/python3"
+      - "/usr/local/bin/python3"
+      - "/usr/bin/pip3"
+      - "/usr/local/bin/pip3"
+      - "/usr/local/bin/uv"
+      - "/usr/bin/uv"
+      - "/usr/local/bin/poetry"
+      - "/usr/local/bin/pdm"
+      # Version managers
+      - "~/.pyenv/"
+      - "~/.local/bin/"
+      # uv-managed Python installations
+      - "~/.local/share/uv/"
+      # Rye-managed Python
+      - "~/.rye/"
+      # Virtual env binaries within project
+      - "$PWD/.venv/"
+      - "$PWD/venv/"
+      # mise (polyglot version manager)
+      - "~/.local/share/mise/"
+      # asdf
+      - "~/.asdf/"
+
+  elixir:
+    allowWrite:
+      - "$PWD/"
+      - "~/.hex/"
+      - "~/.mix/"
+      - "~/.cache/rebar3/"
+    allowDomains:
+      - "hex.pm"
+      - "repo.hex.pm"
+      - "builds.hex.pm"
+      - "cdn.hex.pm"
+      - "github.com"
+      - "codeload.github.com"
+      - "objects.githubusercontent.com"
+    allowExec:
+      - "/usr/bin/elixir"
+      - "/usr/bin/mix"
+      - "/usr/bin/iex"
+      - "/usr/bin/erl"
+      - "/usr/bin/epmd"
+      - "/usr/local/bin/elixir"
+      - "/usr/local/bin/mix"
+      - "/usr/local/bin/iex"
+      - "/usr/local/bin/erl"
+      - "/usr/local/bin/epmd"
+      # rebar3 downloads and runs plugins
+      - "~/.cache/rebar3/"
+      # Version managers
+      - "~/.asdf/"
+      - "~/.kiex/"
+      - "~/.local/share/mise/"
+
+  java:
+    # JVM HTTP clients (Maven, Gradle, sbt's resolver) do NOT honour the
+    # standard HTTP_PROXY / HTTPS_PROXY env vars — they require
+    # `-Dhttps.proxyHost` system properties which sbe cannot set
+    # dynamically since the proxy port is allocated at runtime. Keep
+    # `enableProxy: false` so the Linux backend opens TCP port 443 to
+    # *any* host instead of pinning to the proxy. The kernel filter still
+    # blocks every non-443 outbound, and seccomp/Landlock filesystem +
+    # exec rules continue to apply. Trade-off: domain-level filtering is
+    # delegated to network controls outside sbe. On macOS, SBPL has the
+    # same trade-off when allowDomains is empty; sbe's behaviour is
+    # consistent across platforms.
+    enableProxy: false
+    # Maven keeps `settings.xml` and `settings-security.xml` at the `~/.m2/`
+    # root, not under `repository/`. Landlock's per-path grant means we have
+    # to allow read on the parent explicitly — on macOS SBPL this works
+    # implicitly because reads are allowed-by-default.
+    allowRead:
+      - "~/.m2/"
+      - "~/.sbt/"
+      - "~/.ivy2/"
+      - "~/.gradle/"
+    allowWrite:
+      - "$PWD/"
+      - "~/.m2/repository/"
+      - "~/.gradle/caches/"
+      - "~/.gradle/wrapper/"
+      - "~/.gradle/daemon/"
+      - "~/.gradle/native/"
+      - "~/.gradle/.tmp/"
+      - "~/.gradle/notifications/"
+      - "$PWD/.gradle/"
+      - "$PWD/build/"
+      - "$PWD/target/"
+      # Scala / sbt
+      - "~/.sbt/"
+      - "~/.ivy2/"
+      # sbt 1.x server's UDS socket lives at
+      # $XDG_RUNTIME_DIR/.sbt/<hash>/... and on systemd hosts XDG_RUNTIME_DIR
+      # is /run/user/<uid>/. POSIX perms on that dir are 0700 owned by the
+      # invoking user, so the broadened Landlock grant only covers this
+      # process's own runtime tree.
+      - "/run/user/"
+      # Coursier (Scala dependency manager)
+      - "~/.cache/coursier/"
+      # GH Actions setup-java tool cache
+      - "/opt/hostedtoolcache/Java_Temurin-Hotspot_jdk/"
+      - "/opt/hostedtoolcache/java/"
+    allowDomains:
+      - "repo1.maven.org"
+      - "repo.maven.apache.org"
+      - "plugins.gradle.org"
+      - "services.gradle.org"
+      - "downloads.gradle.org"
+      - "downloads.gradle-dn.com"
+      - "jcenter.bintray.com"
+      - "github.com"
+      - "codeload.github.com"
+      - "objects.githubusercontent.com"
+      # Scala
+      - "repo.scala-sbt.org"
+      - "repo1.scala-sbt.org"
+      - "scala-ci.typesafe.com"
+      - "downloads.lightbend.com"
+    allowExec:
+      - "/usr/bin/java"
+      - "/usr/bin/javac"
+      - "/usr/bin/jar"
+      - "/usr/bin/jshell"
+      - "/usr/lib/jvm/"
+      - "~/.sdkman/"
+      # Gradle wrapper and daemon execs from here
+      - "~/.gradle/"
+      # Coursier downloads launchers here
+      - "~/.cache/coursier/"
+      # Scala / sbt tools
+      - "/usr/bin/sbt"
+      - "/usr/bin/scala"
+      - "/usr/bin/scalac"
+      - "/usr/local/bin/sbt"
+      - "/usr/local/bin/scala"
+      - "/usr/local/bin/scalac"
+      - "/usr/share/sbt/"
+      # Project-local gradlew / mvnw wrapper scripts
+      - "$PWD/gradlew"
+      - "$PWD/mvnw"
+      # Version managers
+      - "~/.local/share/mise/"
+      - "~/.asdf/"
+      - "~/.jenv/"

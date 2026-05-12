@@ -33,6 +33,10 @@ pub struct ProfileConfig {
     #[serde(default)]
     pub deny_read: Vec<String>,
 
+    /// Linux read-allowlist extensions. macOS ignores this field.
+    #[serde(default)]
+    pub allow_read: Vec<String>,
+
     #[serde(default)]
     pub allow_domains: Vec<String>,
 
@@ -57,6 +61,11 @@ pub struct ProfileConfig {
     /// Whether to enable the domain-filtering proxy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enable_proxy: Option<bool>,
+
+    /// Opt-in to proceed under a degraded kernel (Linux only). See
+    /// `cross-platform-backend-design.md` §13 D1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_degraded: Option<bool>,
 
     #[serde(default)]
     pub env: HashMap<String, String>,
@@ -118,6 +127,9 @@ impl ProfileConfig {
         for p in &self.deny_read {
             profile.deny_read.push(expand_path(p, home, pwd));
         }
+        for p in &self.allow_read {
+            profile.allow_read.push(expand_path(p, home, pwd));
+        }
         for d in &self.allow_domains {
             profile.allow_domains.push(DomainPattern(d.clone()));
         }
@@ -138,6 +150,9 @@ impl ProfileConfig {
         }
         if let Some(enable_proxy) = self.enable_proxy {
             profile.enable_proxy = enable_proxy;
+        }
+        if let Some(allow_degraded) = self.allow_degraded {
+            profile.allow_degraded = allow_degraded;
         }
         for (k, v) in &self.env {
             profile.env.insert(k.clone(), v.clone());

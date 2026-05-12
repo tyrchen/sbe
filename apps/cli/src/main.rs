@@ -33,9 +33,12 @@ async fn main() -> ExitCode {
             let run_args = args.as_run_args();
             executor::execute(&run_args).await
         }
-        Commands::Profiles => {
-            executor::print_profiles();
-            ExitCode::SUCCESS
-        }
+        Commands::Profiles => match executor::print_profiles() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("sbe: {e:#}");
+                ExitCode::from(125)
+            }
+        },
     }
 }
