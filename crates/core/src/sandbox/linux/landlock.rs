@@ -39,9 +39,27 @@ use crate::{
 /// `allow_write`.
 pub const READ_ALLOWLIST_ANCHORS: &[&str] = &[
     // Dynamic linker, NSS, system config
-    "/etc", "/lib", "/lib32", "/lib64", "/usr", "/proc", "/sys", // Temp
-    "/tmp", "/var/tmp", // Devices we explicitly allow
+    "/etc",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/usr",
+    "/proc",
+    "/sys",
+    // Temp
+    "/tmp",
+    "/var/tmp",
+    // Devices we explicitly allow
     "/dev",
+    // systemd-resolved stub on Ubuntu/Debian/Fedora: /etc/resolv.conf is a
+    // symlink to /run/systemd/resolve/stub-resolv.conf. Landlock follows
+    // symlinks to the canonical path, so the resolver can't read the
+    // nameserver list without this entry — every tool that does direct
+    // DNS (Maven/Gradle/sbt, anything not using HTTP_PROXY) gets
+    // EAI_AGAIN otherwise. The narrower socket dir is preferred over
+    // exposing all of /run/ (which would expose every running service's
+    // pid files and the system DBus socket).
+    "/run/systemd/resolve",
 ];
 
 /// Baseline writable paths injected into every Linux ruleset.
