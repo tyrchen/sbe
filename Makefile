@@ -1,8 +1,15 @@
 build:
 	@cargo build
 
+# Unit + lib tests run under sbe (true dogfooding of the rust profile).
+# Proxy integration tests run bare — they exercise the proxy server in
+# isolation by binding 127.0.0.1:0 and connecting to that ephemeral
+# port, which Landlock v4 cannot express; running them inside sbe would
+# either require allowAllNetwork (defeats the purpose for this repo) or
+# test nothing about sandboxing that the fixtures don't already cover.
 test:
-	@sbe run -- cargo nextest run --all-features
+	@sbe run -- cargo nextest run --all-features -E 'not binary(proxy_integration)'
+	@cargo nextest run --all-features -E 'binary(proxy_integration)'
 
 fmt:
 	@cargo +nightly fmt
