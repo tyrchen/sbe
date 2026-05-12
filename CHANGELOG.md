@@ -3,6 +3,17 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [sbexec-v0.3.0](https://github.com/compare/sbexec-v0.2.1..sbexec-v0.3.0) - 2026-05-12
+
+### Features
+
+- cross-platform sandbox backend (Linux + macOS) (#1) - ([190d0ae](https://github.com/commit/190d0aeb29d62a027799cc88bb2585a2ea39f906)) - Tyr Chen
+
+### Other
+
+- Update CHANGELOG.md - ([6ff093e](https://github.com/commit/6ff093e69af35289f497510c763bb6b1182efdf9)) - Tyr Chen
+
+---
 ## [sbexec-v0.2.1](https://github.com/compare/sbexec-v0.2.0..sbexec-v0.2.1) - 2026-05-12
 
 ### Bug Fixes
