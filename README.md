@@ -192,15 +192,24 @@ UX still works. Documented here so you know what you're getting:
   egress are not subject to per-port enforcement. The seccomp baseline blocks
   `AF_PACKET` raw sockets but not `SOCK_DGRAM` on `AF_INET`. The HTTP CONNECT
   proxy is TCP-only by design.
+- **JVM tools don't get domain filtering.** The java profile ships with
+  `enableProxy: false` on both macOS and Linux, because JVM HTTP clients
+  (Maven, Gradle's resolver, sbt's coursier) do not honour the standard
+  `HTTP_PROXY` / `HTTPS_PROXY` env vars — they require
+  `-Dhttps.proxyHost` system properties which sbe cannot inject
+  dynamically (the proxy port is allocated at runtime). The kernel filter
+  still pins TCP egress to port 443 (no random ports, no port-80 sneaking),
+  but per-domain filtering is delegated to whatever network controls you
+  run outside sbe.
 - **Gradle on Linux requires opt-in.** Gradle's CLI talks to a separate
-  daemon over TCP on a kernel-chosen random localhost port. Landlock ABI
-  v4 filters TCP by port only — there's no way to express "any port on
-  127.0.0.1" the way macOS SBPL can. Gradle does not accept a fixed
+  daemon over TCP on a kernel-chosen *random* localhost port. Landlock
+  ABI v4 filters TCP by port only — there's no way to express "any port
+  on 127.0.0.1" the way macOS SBPL can. Gradle does not accept a fixed
   daemon port via any CLI flag. To run Gradle under sbe on Linux, set
   `allowAllNetwork: true` for the `java` profile in your `.sbe.yaml` —
-  this disables both kernel TCP filtering and the domain-filtering proxy
-  for that profile. sbt (default UDS IPC) and Maven (single-JVM) work
-  without this opt-in. macOS users are unaffected.
+  this disables kernel TCP filtering entirely for that profile. sbt
+  (default UDS IPC) and Maven (single-JVM) work without this opt-in.
+  macOS users are unaffected (SBPL has `(remote ip "localhost:*")`).
 - **DBus-resolved DNS may fail.** Tools that resolve via systemd-resolved's
   DBus path (some Python/Node DNS libraries through `nss-systemd`) will hit
   `EACCES` on `/run/dbus/system_bus_socket`. The fallback through glibc's

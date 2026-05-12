@@ -275,6 +275,15 @@ profiles:
       - "~/.local/share/mise/"
 
   java:
+    # JVM HTTP clients (Maven, Gradle, sbt's resolver) do NOT honour the
+    # standard HTTP_PROXY / HTTPS_PROXY env vars. With `enableProxy: true`
+    # SBPL would pin egress to `localhost:<proxy>` only, and the JVM's
+    # direct HTTPS to repo.maven.apache.org would be denied. Keep the
+    # proxy off so SBPL falls back to `(remote tcp "*:443")` — kernel
+    # allows HTTPS to any host on port 443, no domain filtering at the
+    # proxy layer. Linux's java profile uses the identical setting; the
+    # behaviour is consistent across platforms.
+    enableProxy: false
     allowWrite:
       - "$PWD/"
       - "~/.m2/repository/"

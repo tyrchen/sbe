@@ -248,7 +248,7 @@ impl SandboxProfile {
             allow_domains,
             deny_exec,
             allow_exec,
-            enable_proxy: true,
+            enable_proxy: eco_cfg.enable_proxy.unwrap_or(true),
             allow_all_network: false,
             allow_fetch: vec![],
             env: Default::default(),
@@ -436,6 +436,15 @@ struct EcosystemDefaults {
     allow_domains: Vec<String>,
     #[serde(default)]
     allow_exec: Vec<String>,
+    /// Whether to start the domain-filtering proxy. Some ecosystems whose
+    /// HTTP stack does not respect `HTTP_PROXY` env (notably JVM tools like
+    /// Maven and Gradle) cannot benefit from the proxy and need the kernel
+    /// to open port 443 directly. Set this to `false` in those profiles —
+    /// kernel TCP filter still enforces "egress on port 443 only", but
+    /// domain filtering is delegated to the proxy when set to true.
+    /// Defaults to `true`.
+    #[serde(default)]
+    enable_proxy: Option<bool>,
 }
 
 // --- Rust-specific cargo target dir resolution ---

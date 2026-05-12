@@ -307,6 +307,18 @@ profiles:
       - "~/.local/share/mise/"
 
   java:
+    # JVM HTTP clients (Maven, Gradle, sbt's resolver) do NOT honour the
+    # standard HTTP_PROXY / HTTPS_PROXY env vars — they require
+    # `-Dhttps.proxyHost` system properties which sbe cannot set
+    # dynamically since the proxy port is allocated at runtime. Keep
+    # `enableProxy: false` so the Linux backend opens TCP port 443 to
+    # *any* host instead of pinning to the proxy. The kernel filter still
+    # blocks every non-443 outbound, and seccomp/Landlock filesystem +
+    # exec rules continue to apply. Trade-off: domain-level filtering is
+    # delegated to network controls outside sbe. On macOS, SBPL has the
+    # same trade-off when allowDomains is empty; sbe's behaviour is
+    # consistent across platforms.
+    enableProxy: false
     # Maven keeps `settings.xml` and `settings-security.xml` at the `~/.m2/`
     # root, not under `repository/`. Landlock's per-path grant means we have
     # to allow read on the parent explicitly — on macOS SBPL this works
