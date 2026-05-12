@@ -12,7 +12,18 @@ use crate::{
 };
 
 /// Embedded default profiles YAML, compiled into the binary.
-const DEFAULTS_YAML: &str = include_str!("defaults.yaml");
+///
+/// Selection is `cfg(target_os = ...)` so each binary ships exactly the
+/// defaults that match its sandbox backend. Both files deserialize through
+/// the same [`DefaultsFile`] schema (verified in tests).
+#[cfg(target_os = "macos")]
+const DEFAULTS_YAML: &str = include_str!("defaults-macos.yaml");
+
+#[cfg(target_os = "linux")]
+const DEFAULTS_YAML: &str = include_str!("defaults-linux.yaml");
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+const DEFAULTS_YAML: &str = include_str!("defaults-macos.yaml");
 
 /// A pattern for matching domain names.
 ///
@@ -91,6 +102,12 @@ pub struct SandboxProfile {
     /// Additional environment variables to inject.
     #[serde(default)]
     pub env: HashMap<String, String>,
+
+    /// Proceed under a less-capable kernel even when a requested feature
+    /// (currently: Landlock ABI v4 net filter) is unavailable. See §13 D1
+    /// of the cross-platform backend design.
+    #[serde(default)]
+    pub allow_degraded: bool,
 }
 
 fn default_true() -> bool {
@@ -118,12 +135,15 @@ impl SandboxProfile {
             .map(|p| expand_path(p, home, pwd))
             .collect();
 
-        // Build deny_exec: from common (also resolve symlinks for deny rules)
+        // Build deny_exec: from common (also resolve symlinks for deny rules
+        // on macOS — on Linux denyExec is a no-op so symlinks don't matter).
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut deny_exec: Vec<SandboxPath> = common
             .deny_exec
             .iter()
             .map(|p| expand_path(p, home, pwd))
             .collect();
+        #[cfg(target_os = "macos")]
         resolve_symlinks(&mut deny_exec);
 
         // Build deny_read: from common
@@ -189,9 +209,12 @@ impl SandboxProfile {
             allow_exec.push(SandboxPath::dir(PathBuf::from(java_home)));
         }
 
-        // Resolve symlinks: SBPL checks the real path after kernel symlink
-        // resolution, so /opt/homebrew/bin/zig (symlink) won't match unless
-        // we also allow the resolved /opt/homebrew/Cellar/.../zig path.
+        // Resolve symlinks: SBPL on macOS checks the real path after kernel
+        // symlink resolution, so /opt/homebrew/bin/zig (a symlink to
+        // /opt/homebrew/Cellar/.../zig) won't match unless we also allow the
+        // resolved Cellar path. Landlock on Linux dereferences via the
+        // preopened FD; symlink resolution there is a non-issue.
+        #[cfg(target_os = "macos")]
         resolve_symlinks(&mut allow_exec);
 
         SandboxProfile {
@@ -205,6 +228,7 @@ impl SandboxProfile {
             allow_all_network: false,
             allow_fetch: vec![],
             env: Default::default(),
+            allow_degraded: false,
         }
     }
 
@@ -232,6 +256,9 @@ impl SandboxProfile {
         }
         if overrides.no_proxy {
             self.enable_proxy = false;
+        }
+        if overrides.allow_degraded {
+            self.allow_degraded = true;
         }
 
         for (k, v) in &overrides.env {
@@ -271,6 +298,7 @@ impl SandboxProfile {
 /// For Homebrew Cellar paths, we add the package root directory (e.g.,
 /// `/opt/homebrew/Cellar/zig/0.15.2/`) rather than just the binary, because
 /// tools like zig spawn sub-tools from their lib/ directory.
+#[cfg(target_os = "macos")]
 #[allow(clippy::disallowed_methods)]
 fn resolve_symlinks(paths: &mut Vec<SandboxPath>) {
     let additional: Vec<SandboxPath> = paths
@@ -346,6 +374,7 @@ pub struct ProfileOverrides {
     pub allow_fetch: Vec<DomainPattern>,
     pub allow_all_network: bool,
     pub no_proxy: bool,
+    pub allow_degraded: bool,
     pub env: HashMap<String, String>,
 }
 
@@ -456,8 +485,24 @@ mod tests {
                 !profile.allow_domains.is_empty(),
                 "no allow_domains for {eco}"
             );
-            assert!(!profile.deny_exec.is_empty(), "no deny_exec for {eco}");
             assert!(!profile.allow_exec.is_empty(), "no allow_exec for {eco}");
+            // denyExec is macOS-only — Linux Landlock is allowlist-only.
+            #[cfg(target_os = "macos")]
+            assert!(!profile.deny_exec.is_empty(), "no deny_exec for {eco}");
+        }
+    }
+
+    /// Both YAML defaults files must deserialize through [`DefaultsFile`]
+    /// (regression guard for the macOS/Linux schema split).
+    #[test]
+    fn test_should_parse_both_defaults_files() {
+        let macos: DefaultsFile =
+            serde_yaml::from_str(include_str!("defaults-macos.yaml")).expect("macOS defaults");
+        let linux: DefaultsFile =
+            serde_yaml::from_str(include_str!("defaults-linux.yaml")).expect("Linux defaults");
+        for name in ["node", "rust", "python", "elixir", "java"] {
+            assert!(macos.profiles.contains_key(name), "macos missing {name}");
+            assert!(linux.profiles.contains_key(name), "linux missing {name}");
         }
     }
 
@@ -492,6 +537,8 @@ mod tests {
                 has(&profile.allow_exec, "/usr/bin/cc"),
                 "missing /usr/bin/cc for {eco}"
             );
+            // osascript deny only exists in the macOS defaults.
+            #[cfg(target_os = "macos")]
             assert!(
                 has(&profile.deny_exec, "/usr/bin/osascript"),
                 "missing osascript deny for {eco}"

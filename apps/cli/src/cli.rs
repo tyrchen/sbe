@@ -68,6 +68,12 @@ pub struct RunArgs {
     #[arg(long)]
     pub no_proxy: bool,
 
+    /// Proceed even when the kernel cannot fully enforce the requested
+    /// profile (e.g., Landlock ABI <v4 — net pinning falls back to a
+    /// seccomp arg filter). Prints a warning naming the missing capability.
+    #[arg(long)]
+    pub allow_degraded: bool,
+
     /// Stream sandbox violations to stderr.
     #[arg(long)]
     pub audit: bool,
@@ -135,6 +141,10 @@ pub struct InspectArgs {
     #[arg(long)]
     pub no_proxy: bool,
 
+    /// Proceed under a degraded kernel (see RunArgs).
+    #[arg(long)]
+    pub allow_degraded: bool,
+
     /// Use specific config file.
     #[arg(short = 'c', long)]
     pub config: Option<PathBuf>,
@@ -158,6 +168,7 @@ impl InspectArgs {
             allow_fetch: self.allow_fetch.clone(),
             allow_all_network: self.allow_all_network,
             no_proxy: self.no_proxy,
+            allow_degraded: self.allow_degraded,
             audit: false,
             audit_log: None,
             dry_run: true,

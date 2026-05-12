@@ -1,8 +1,8 @@
 [package]
 name = "sbe-core"
-description = "Core library for sbe — macOS sandbox executor for supply chain defense"
+description = "Core library for sbe — cross-platform sandbox executor for supply chain defense"
 categories = ["development-tools"]
-keywords = ["sandbox", "security", "macos", "supply-chain"]
+keywords = ["sandbox", "security", "macos", "linux", "supply-chain"]
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -19,3 +19,11 @@ serde_yaml.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tempfile.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock.workspace = true
+libc.workspace = true
+seccompiler.workspace = true

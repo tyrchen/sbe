@@ -36,6 +36,11 @@ tokio = { version = "1.52.3", features = [
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
 
+# Linux-only deps for the Landlock + seccomp backend.
+libc = "0.2"
+landlock = "~0.4"
+seccompiler = "~0.5"
+
 # workspace crates
 sbe-core = { path = "crates/core", version = "0.2.2" }
 sbe-proxy = { path = "crates/proxy", version = "0.2.2" }

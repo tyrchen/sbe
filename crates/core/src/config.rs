@@ -58,6 +58,11 @@ pub struct ProfileConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enable_proxy: Option<bool>,
 
+    /// Opt-in to proceed under a degraded kernel (Linux only). See
+    /// `cross-platform-backend-design.md` §13 D1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_degraded: Option<bool>,
+
     #[serde(default)]
     pub env: HashMap<String, String>,
 }
@@ -138,6 +143,9 @@ impl ProfileConfig {
         }
         if let Some(enable_proxy) = self.enable_proxy {
             profile.enable_proxy = enable_proxy;
+        }
+        if let Some(allow_degraded) = self.allow_degraded {
+            profile.allow_degraded = allow_degraded;
         }
         for (k, v) in &self.env {
             profile.env.insert(k.clone(), v.clone());
