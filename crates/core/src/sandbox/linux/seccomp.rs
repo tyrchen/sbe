@@ -144,8 +144,15 @@ fn syscall_number(name: &str) -> Option<i64> {
         "bpf" => libc::SYS_bpf,
         "perf_event_open" => libc::SYS_perf_event_open,
         "kexec_load" => libc::SYS_kexec_load,
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        #[cfg(target_arch = "x86_64")]
         "kexec_file_load" => libc::SYS_kexec_file_load,
+        // libc-rs doesn't expose SYS_kexec_file_load on aarch64-musl
+        // (still missing as of 0.2.186). The syscall number is stable
+        // kernel ABI — arch/arm64/include/uapi/asm/unistd.h #294 — so
+        // hardcode it to keep aarch64-musl builds blocking the syscall
+        // identically to aarch64-glibc.
+        #[cfg(target_arch = "aarch64")]
+        "kexec_file_load" => 294,
         "init_module" => libc::SYS_init_module,
         "finit_module" => libc::SYS_finit_module,
         "delete_module" => libc::SYS_delete_module,
