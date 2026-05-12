@@ -45,3 +45,23 @@ Each row reports one of:
 2. Implement the probe in each fixture (`build.rs`, `check.js`,
    `hatch_build.py`, `mix.exs`, `build.sbt`).
 3. Reuse the `SAFE:`/`PWNED:` reporting format so the CI grep stays generic.
+
+## Java/Scala scope
+
+Coverage on Linux is sbt + Maven only.
+
+**Gradle on Linux**: Gradle's CLI talks to a separate daemon process over
+TCP on a kernel-chosen random localhost port. Landlock ABI v4 filters TCP
+by port number only — it cannot express "allow any port on 127.0.0.1"
+the way macOS SBPL's `(remote ip "localhost:*")` does. The Gradle daemon
+also doesn't accept a fixed port via any CLI flag. Until Landlock gains
+IP-based filtering, Linux Gradle users must opt into
+`allowAllNetwork: true` in their `.sbe.yaml` for the `java` profile,
+fully aware that this disables both the kernel TCP filter AND the
+domain-filtering proxy. The README documents this trade-off.
+
+**sbt 1.x** defaults to Unix-domain-socket IPC (since 1.1), which is not
+gated by `NET_CONNECT_TCP`, so it works under the default `java` profile.
+
+**Maven** runs in a single JVM with no IPC, so it works under the default
+`java` profile as well.

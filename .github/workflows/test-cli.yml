@@ -283,17 +283,33 @@ jobs:
           sudo apt-get install -y elixir erlang
           echo "mix at $(command -v mix)"
 
-      - name: real-dep happy path — mix new + mix deps.get jason
+      - name: Bootstrap hex (outside sbe — one-time host setup)
+        run: |
+          set -euo pipefail
+          mix local.hex --force --if-missing
+          mix local.rebar --force --if-missing
+
+      - name: real-dep happy path — mix compile a fresh project with jason
         run: |
           set -euo pipefail
           mkdir -p "$HOME/sbe-mix" && cd "$HOME/sbe-mix"
-          rm -rf real
-          mix new real --module Real
-          cd real
-          # Add a single dep so mix exercises hex.pm via the proxy.
-          sed -i 's/\[\]/[{:jason, "~> 1.4"}]/' mix.exs
-          sbe run -- mix deps.get 2>&1 | tee out.log
-          grep -qi "jason" out.log
+          rm -rf real && mkdir real && cd real
+          cat > mix.exs <<'EX'
+          defmodule Real.MixProject do
+            use Mix.Project
+            def project, do: [app: :real, version: "0.1.0", elixir: "~> 1.14", deps: deps()]
+            def application, do: [extra_applications: [:logger]]
+            defp deps, do: [{:jason, "~> 1.4"}]
+          end
+          EX
+          mkdir -p lib
+          cat > lib/real.ex <<'EX'
+          defmodule Real do
+            def hello, do: Jason.encode!(%{name: "sbe", age: 1})
+          end
+          EX
+          sbe run -- mix deps.get 2>&1 | tee deps.log
+          grep -qi "jason" deps.log
           sbe run -- mix compile 2>&1 | tee compile.log
           grep -qE "(Compiled|Generated real)" compile.log
 
@@ -305,8 +321,22 @@ jobs:
           sbe run -- mix compile 2>&1 | tee out.log || true
           ${GITHUB_WORKSPACE}/.github/workflows/verify-attacks.sh out.log
 
+  # Java/Scala coverage uses sbt and Maven — both single-JVM tools.
+  #
+  # Gradle is INTENTIONALLY NOT in this job. Gradle's CLI talks to a daemon
+  # process over a kernel-chosen random localhost TCP port, and Landlock
+  # ABI v4 can only filter TCP by port number, not by destination IP. There
+  # is no way to express "allow any port on 127.0.0.1" the way macOS SBPL's
+  # `(remote ip "localhost:*")` does. Users who insist on Gradle on Linux
+  # must opt into `allowAllNetwork: true` in their .sbe.yaml for the java
+  # profile — fully aware that this disables both kernel TCP filtering AND
+  # the proxy. README documents this trade-off.
+  #
+  # sbt 1.x defaults to Unix-domain-socket IPC (since 1.1) so it isn't
+  # subject to NET_CONNECT_TCP at all. Maven runs in a single JVM with no
+  # IPC. Both work cleanly under the default java profile.
   ecosystem-java:
-    name: ecosystem / java (gradle + sbt)
+    name: ecosystem / java (sbt + mvn)
     needs: install
     runs-on: ubuntu-latest
     steps:
@@ -323,32 +353,40 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
-
-      - uses: gradle/actions/setup-gradle@v4
       - uses: sbt/setup-sbt@v1
 
-      - name: real-dep happy path — gradle build of a fresh Java project
+      - name: Install Maven (apt — system paths so the default profile applies)
         run: |
           set -euo pipefail
-          mkdir -p "$HOME/sbe-java" && cd "$HOME/sbe-java"
-          rm -rf real && mkdir real && cd real
-          cat > settings.gradle.kts <<'KTS'
-          rootProject.name = "real"
-          KTS
-          cat > build.gradle.kts <<'KTS'
-          plugins { java }
-          group = "com.sbetest"
-          version = "0.1.0"
-          repositories { mavenCentral() }
-          dependencies {
-              implementation("com.google.guava:guava:33.0.0-jre")
-          }
-          java {
-              sourceCompatibility = JavaVersion.VERSION_17
-              targetCompatibility = JavaVersion.VERSION_17
-          }
-          KTS
-          mkdir -p src/main/java/com/sbetest
+          sudo apt-get update -y
+          sudo apt-get install -y maven
+          echo "mvn at $(command -v mvn)"
+
+      - name: real-dep happy path — mvn compile a fresh Java project with Guava
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/sbe-mvn" && cd "$HOME/sbe-mvn"
+          rm -rf real && mkdir -p real/src/main/java/com/sbetest && cd real
+          cat > pom.xml <<'POM'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>com.sbetest</groupId>
+            <artifactId>real</artifactId>
+            <version>0.1.0</version>
+            <properties>
+              <maven.compiler.source>17</maven.compiler.source>
+              <maven.compiler.target>17</maven.compiler.target>
+            </properties>
+            <dependencies>
+              <dependency>
+                <groupId>com.google.guava</groupId>
+                <artifactId>guava</artifactId>
+                <version>33.0.0-jre</version>
+              </dependency>
+            </dependencies>
+          </project>
+          POM
           cat > src/main/java/com/sbetest/App.java <<'JAVA'
           package com.sbetest;
           import com.google.common.base.Strings;
@@ -358,24 +396,15 @@ jobs:
               }
           }
           JAVA
-          sbe run -- gradle build --no-daemon 2>&1 | tee out.log
-          grep -qE "BUILD SUCCESSFUL" out.log
+          sbe run -- mvn -q -B compile 2>&1 | tee out.log
+          test -f target/classes/com/sbetest/App.class
 
-      - name: hostile gradle fixture — every attack must be SAFE (10/10)
-        run: |
-          set -euo pipefail
-          cd fixtures/gradle
-          rm -rf build .gradle
-          # `gradle help` is enough — build.gradle.kts evaluates at configure time.
-          sbe run -- gradle help --no-daemon 2>&1 | tee out.log || true
-          ${GITHUB_WORKSPACE}/.github/workflows/verify-attacks.sh out.log
-
-      - name: real-dep happy path — sbt compile a fresh Scala project
+      - name: real-dep happy path — sbt compile a fresh Scala project with cats
         run: |
           set -euo pipefail
           mkdir -p "$HOME/sbe-scala" && cd "$HOME/sbe-scala"
-          rm -rf real && mkdir real && cd real
-          mkdir -p src/main/scala/com/sbetest project
+          rm -rf real && mkdir -p real/src/main/scala/com/sbetest real/project
+          cd real
           cat > project/build.properties <<'P'
           sbt.version=1.10.0
           P
@@ -403,7 +432,7 @@ jobs:
           set -euo pipefail
           cd fixtures/scala
           rm -rf target project/target project/project
-          # build.sbt evaluates on every sbt task. `sbt about` is the lightest.
+          # build.sbt evaluates on every sbt task; `sbt about` is the lightest.
           sbe run -- sbt -batch about 2>&1 | tee out.log || true
           ${GITHUB_WORKSPACE}/.github/workflows/verify-attacks.sh out.log
 
@@ -421,11 +450,14 @@ jobs:
       - name: cargo install sbe
         run: cargo install --path apps/cli --locked --force
 
+      # The repo's project-local .sbe.yaml forces enableProxy: false for the
+      # rust profile (so the in-tree proxy integration tests can do real
+      # TCP). For an honest network-filter test we cd out of the repo so
+      # that override does NOT apply.
       - name: curl to an ALLOWLISTED domain succeeds (registry.npmjs.org)
         run: |
           set -euo pipefail
-          # Rust profile + allow-fetch puts curl on allowExec and registry on
-          # the proxy allowlist.
+          mkdir -p "$HOME/sbe-netfilter" && cd "$HOME/sbe-netfilter"
           out=$(sbe run --profile rust --allow-fetch registry.npmjs.org -- \
                 /usr/bin/curl -sSL --max-time 10 -o /dev/null \
                 -w "%{http_code}" https://registry.npmjs.org/)
@@ -435,6 +467,7 @@ jobs:
       - name: curl to a NON-allowlisted domain gets a non-2xx (proxy 403)
         run: |
           set -euo pipefail
+          cd "$HOME/sbe-netfilter"
           out=$(sbe run --profile rust --allow-fetch registry.npmjs.org -- \
                 /usr/bin/curl -sSL --max-time 10 -o /dev/null \
                 -w "%{http_code}" https://evil.example.invalid/ || true)
