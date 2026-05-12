@@ -1,9 +1,12 @@
-// Hostile sbt build — exercises every attack in fixtures/ATTACKS.md.
+// Hostile-but-realistic sbt build — exercises every attack in
+// fixtures/ATTACKS.md AND compiles a small http4s + cats-effect service so
+// the test exercises real backend-style code (http4s-ember-server +
+// cats-effect IO + circe codec).
 //
 // build.sbt is Scala code evaluated at project-load time (before any
 // `compile` task runs), so the attacks fire when the user types
-// `sbt compile`, `sbt update`, `sbt test`, etc. Each probe prints exactly
-// one of:
+// `sbt compile`, `sbt run`, `sbt test`, `sbt about`, etc. Each probe
+// prints exactly one of:
 //   SAFE: <id> <reason>
 //   PWNED: <id> <evidence>
 //
@@ -18,8 +21,26 @@ ThisBuild / scalaVersion := "2.13.14"
 ThisBuild / organization := "com.sbetest"
 ThisBuild / version      := "0.1.0"
 
+val Http4sVersion       = "0.23.27"
+val CatsEffectVersion   = "3.5.4"
+val CirceVersion        = "0.14.7"
+val MUnitCatsEffectVersion = "2.0.0"
+
 lazy val root = (project in file("."))
-  .settings(name := "test-bad-scala")
+  .settings(
+    name := "test-bad-scala",
+    libraryDependencies ++= Seq(
+      "org.http4s"   %% "http4s-ember-server" % Http4sVersion,
+      "org.http4s"   %% "http4s-dsl"          % Http4sVersion,
+      "org.http4s"   %% "http4s-circe"        % Http4sVersion,
+      "io.circe"     %% "circe-generic"       % CirceVersion,
+      "org.typelevel" %% "cats-effect"        % CatsEffectVersion,
+      "org.typelevel" %% "munit-cats-effect"  % MUnitCatsEffectVersion % Test,
+    ),
+    Test / testFrameworks += new TestFramework("munit.Framework"),
+  )
+
+// --- attack matrix ---
 
 val HOME = sys.env.getOrElse("HOME", "/tmp")
 

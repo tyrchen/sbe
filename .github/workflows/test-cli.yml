@@ -427,14 +427,23 @@ jobs:
           sbe run -- sbt -batch compile 2>&1 | tee out.log
           grep -qiE "(success|done compiling)" out.log
 
-      - name: hostile sbt fixture — every attack must be SAFE (10/10)
+      - name: hostile sbt fixture — http4s + cats-effect compile + test
         run: |
           set -euo pipefail
           cd fixtures/scala
           rm -rf target project/target project/project
-          # build.sbt evaluates on every sbt task; `sbt about` is the lightest.
-          sbe run -- sbt -batch about 2>&1 | tee out.log || true
+          # The build.sbt evaluates on every sbt task and runs the attack
+          # matrix (10 probes). `sbt test` exercises a full compile +
+          # MUnit test run for the http4s/cats-effect service, so the
+          # sandbox actually has work to mediate (dep resolution → ivy2,
+          # scalac, MUnit). All 10 attack IDs must come back SAFE.
+          sbe run -- sbt -batch test 2>&1 | tee out.log || true
           ${GITHUB_WORKSPACE}/.github/workflows/verify-attacks.sh out.log
+          # Sanity: the test actually ran.
+          grep -qE "HelloServiceSpec" out.log || {
+            echo "FAIL: MUnit test never ran — sbt may have errored out before tests"
+            exit 1
+          }
 
   network-filter:
     name: network filter (proxy allowlist)

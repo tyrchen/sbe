@@ -307,6 +307,15 @@ profiles:
       - "~/.local/share/mise/"
 
   java:
+    # Maven keeps `settings.xml` and `settings-security.xml` at the `~/.m2/`
+    # root, not under `repository/`. Landlock's per-path grant means we have
+    # to allow read on the parent explicitly — on macOS SBPL this works
+    # implicitly because reads are allowed-by-default.
+    allowRead:
+      - "~/.m2/"
+      - "~/.sbt/"
+      - "~/.ivy2/"
+      - "~/.gradle/"
     allowWrite:
       - "$PWD/"
       - "~/.m2/repository/"
