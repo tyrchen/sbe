@@ -197,9 +197,6 @@ pub fn compile(
     let forbidden_reads = build_forbidden_reads(profile)?;
     lint_forbidden_reads_against_grants(profile, &forbidden_reads, options)?;
 
-    // 2. Resolve read-allowlist (curated anchors + extra paths from profile).
-    let read_paths = build_read_paths(profile, &forbidden_reads, options)?;
-
     let abi = highest_abi(probe);
     let ruleset = Ruleset::default()
         .set_compatibility(CompatLevel::BestEffort)
@@ -215,30 +212,70 @@ pub fn compile(
     // invariant that the closure performs exactly the documented syscalls.
     let mut created = ruleset.create()?.set_no_new_privs(false);
 
-    // Read allowlist
-    created = add_path_rules(created, &read_paths, read_access(abi))?;
+    // Read allowlist. Per-entry symlink policy via `symlink_policy_for`:
+    // root-owned system paths can be symlinks (usr-merge), user paths
+    // cannot (TOCTOU attack vector).
+    let baseline_reads: Vec<PathBuf> = READ_ALLOWLIST_ANCHORS.iter().map(PathBuf::from).collect();
+    for path in &baseline_reads {
+        let policy = symlink_policy_for(path);
+        created = add_path_rules(
+            created,
+            std::slice::from_ref(path),
+            read_access(abi),
+            policy,
+        )?;
+    }
+    for sp in &profile.allow_read {
+        let policy = symlink_policy_for(&sp.path);
+        created = add_path_rules(
+            created,
+            std::slice::from_ref(&sp.path),
+            read_access(abi),
+            policy,
+        )?;
+    }
 
     // Write allowlist: ensure each writable directory exists before opening
     // an FD — Landlock can't grant a rule on a non-existent path, and
     // tools like npm/cargo expect their cache dirs to be writable
-    // even on first invocation. We chmod 0700 so secrets in $HOME stay
-    // private.
-    let write_paths: Vec<PathBuf> = profile
+    // even on first invocation. chmod 0700 keeps $HOME caches private.
+    let user_writes: Vec<PathBuf> = profile
         .allow_write
         .iter()
         .map(|sp| sp.path.clone())
-        .chain(BASELINE_WRITE_PATHS.iter().map(PathBuf::from))
         .collect();
-    ensure_writable_dirs(&write_paths);
-    created = add_path_rules(created, &write_paths, write_access(abi))?;
-
-    // Exec allowlist (read+exec); covers shared libraries too.
-    let exec_paths: Vec<PathBuf> = profile
-        .allow_exec
+    let baseline_writes: Vec<PathBuf> = BASELINE_WRITE_PATHS.iter().map(PathBuf::from).collect();
+    let all_writes: Vec<PathBuf> = user_writes
         .iter()
-        .map(|sp| sp.path.clone())
+        .chain(baseline_writes.iter())
+        .cloned()
         .collect();
-    created = add_path_rules(created, &exec_paths, exec_access(abi))?;
+    ensure_writable_dirs(&all_writes);
+    for path in &all_writes {
+        let policy = symlink_policy_for(path);
+        created = add_path_rules(
+            created,
+            std::slice::from_ref(path),
+            write_access(abi),
+            policy,
+        )?;
+    }
+
+    // Exec allowlist (read+exec); covers shared libraries too. Per-entry
+    // policy: Follow for root-owned system paths (/lib, /usr/, /bin, …)
+    // because those are symlinks on usr-merge distros and only root can
+    // tamper with them; Refuse for anything else (notably $HOME-relative
+    // entries like ~/.cargo/bin/, ~/.nvm/) because a hostile earlier
+    // build can plant a symlink there.
+    for sp in &profile.allow_exec {
+        let policy = symlink_policy_for(&sp.path);
+        created = add_path_rules(
+            created,
+            std::slice::from_ref(&sp.path),
+            exec_access(abi),
+            policy,
+        )?;
+    }
 
     // Net rules — only on v4+. Loopback (proxy) or :443 fallback.
     if probe.abi.supports_net_port_filter() && !profile.allow_all_network {
@@ -252,19 +289,29 @@ pub fn compile(
     Ok(CompiledLandlock { ruleset: created })
 }
 
+/// Per-call policy for symlinked allowlist entries. Baseline anchors
+/// (`/lib`, `/usr/bin`, `/tmp`, …) are symlinks on usr-merge distros and
+/// sbe ships the canonical strings — they're trusted to point where
+/// they appear to point. User-derived entries (per-ecosystem additions
+/// plus `.sbe.yaml` overrides plus CLI flags) are untrusted: an earlier
+/// hostile build can plant `~/.npm → ~/.ssh` to redirect the next
+/// Landlock grant.
+#[derive(Debug, Clone, Copy)]
+enum SymlinkPolicy {
+    /// Trust the symlink (used for baseline anchors only).
+    Follow,
+    /// Refuse with a ProfileLint error.
+    Refuse,
+}
+
 fn add_path_rules(
     mut created: RulesetCreated,
     paths: &[PathBuf],
     access: BitFlags<AccessFs>,
+    policy: SymlinkPolicy,
 ) -> Result<RulesetCreated, CoreError> {
     for path in paths {
-        // Refuse symlinks. A pre-existing symlink along this path lets an
-        // attacker redirect the Landlock grant onto a target of their
-        // choosing — e.g. an earlier build leaves ~/.npm → ~/.ssh, and the
-        // next sbe invocation hands write access on ~/.ssh to the
-        // sandboxed process. Landlock's PathFd::new uses File::open which
-        // follows symlinks; we screen with symlink_metadata first.
-        if is_symlink(path) {
+        if matches!(policy, SymlinkPolicy::Refuse) && is_symlink(path) {
             return Err(CoreError::ProfileLint(format!(
                 "Landlock allowlist entry '{}' is a symlink. Refusing to open it — a symlink lets \
                  an attacker redirect the grant onto a target of their choosing. Replace the \
@@ -293,6 +340,48 @@ fn is_symlink(p: &Path) -> bool {
     std::fs::symlink_metadata(p)
         .map(|m| m.file_type().is_symlink())
         .unwrap_or(false)
+}
+
+/// Hardcoded list of root-owned filesystem roots where symlinks are
+/// considered safe — only root can modify these on a stock Linux box, so
+/// a path under here being a symlink reflects distro layout (usr-merge,
+/// /bin → /usr/bin, /lib → /usr/lib, /sbin → /usr/sbin), not an attack.
+///
+/// Any path NOT under one of these prefixes is assumed user-writable
+/// (notably $HOME-relative paths from ecosystem defaults like
+/// ~/.cargo/bin/) and gets [`SymlinkPolicy::Refuse`].
+const ROOT_TRUSTED_PREFIXES: &[&str] = &[
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/usr",
+    "/etc",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/tmp",
+    "/var/tmp",
+    "/var/log",
+    "/var/cache",
+    "/var/lib",
+    "/var/run",
+    "/run",
+    "/opt",
+    "/boot",
+    "/srv",
+];
+
+fn symlink_policy_for(p: &Path) -> SymlinkPolicy {
+    if ROOT_TRUSTED_PREFIXES
+        .iter()
+        .any(|root| p == Path::new(root) || p.starts_with(root))
+    {
+        SymlinkPolicy::Follow
+    } else {
+        SymlinkPolicy::Refuse
+    }
 }
 
 /// Create any missing directories from `allow_write` so Landlock can open
@@ -409,23 +498,6 @@ fn lint_forbidden_reads_against_grants(
         }
     }
     Ok(())
-}
-
-fn build_read_paths(
-    profile: &SandboxProfile,
-    _forbidden: &BTreeSet<PathBuf>,
-    _options: BackendOptions,
-) -> Result<Vec<PathBuf>, CoreError> {
-    // Lint already ran in `lint_forbidden_reads_against_grants` (covers
-    // allow_read alongside allow_write and allow_exec). Here we just
-    // assemble the baseline anchors + per-profile read extensions.
-    let mut out: Vec<PathBuf> = READ_ALLOWLIST_ANCHORS.iter().map(PathBuf::from).collect();
-    for sp in &profile.allow_read {
-        out.push(sp.path.clone());
-    }
-    out.sort();
-    out.dedup();
-    Ok(out)
 }
 
 fn lint_allow_exec_for_priv_escalation(
@@ -556,8 +628,6 @@ mod tests {
         let lint =
             lint_forbidden_reads_against_grants(&profile, &forbidden, BackendOptions::default());
         assert!(lint.is_ok(), "baseline anchor overlap must not lint");
-        let res = build_read_paths(&profile, &forbidden, BackendOptions::default());
-        assert!(res.is_ok());
     }
 
     #[test]
