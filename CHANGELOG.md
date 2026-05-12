@@ -3,6 +3,17 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [sbexec-v0.3.2](https://github.com/compare/sbexec-v0.3.1..sbexec-v0.3.2) - 2026-05-12
+
+### Miscellaneous Chores
+
+- remove x86 osx support and bump to 0.3.2 - ([99731b2](https://github.com/commit/99731b260b6f4a231c4e490a000d17a71054ce23)) - Tyr Chen
+
+### Other
+
+- Update CHANGELOG.md - ([a20fa98](https://github.com/commit/a20fa98b2e695d50329ecdd48931eaca6607c0e1)) - Tyr Chen
+
+---
 ## [sbexec-v0.3.1](https://github.com/compare/sbexec-v0.3.0..sbexec-v0.3.1) - 2026-05-12
 
 ### Bug Fixes
