@@ -47,12 +47,26 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # - name: Install Protoc
       #   uses: arduino/setup-protoc@v2
+
+      # Dogfood the published action: install sbe and run the build/lint
+      # steps inside the sandbox. nextest stays outside because the proxy
+      # integration tests bind to random localhost TCP ports, which the
+      # rust profile's port-based TCP filter (Landlock ABI v4) would block.
+      - name: Install sbe (dogfood)
+        uses: tyrchen/sbe@sbexec-v0.3.2
+        with:
+          version: '0.3.2'
+      - name: sbe smoke
+        run: |
+          sbe --version
+          sbe profiles >/dev/null
+
       - name: Check code format
         run: cargo fmt --all -- --check
       - name: Check the package for errors
-        run: cargo check --all
+        run: sbe run -- cargo check --all
       - name: Lint rust sources
-        run: cargo clippy --all-targets --all-features --tests --benches -- -D warnings
+        run: sbe run -- cargo clippy --all-targets --all-features --tests --benches -- -D warnings
       - name: Execute rust tests
         run: cargo nextest run --all-features
       - name: Generate a changelog

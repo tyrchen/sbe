@@ -54,6 +54,39 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+
+      # Dogfood the published action before the real release build. On
+      # native targets (host arch + std-libc) the cargo build inside sbe
+      # warms taiki-e/upload-rust-binary-action's cache for the upload
+      # step that follows. On cross-musl targets we skip the build (no
+      # cross toolchain configured here) and fall back to `cargo check`
+      # against the host, which still exercises the sandbox end-to-end.
+      - name: Install sbe (dogfood)
+        uses: tyrchen/sbe@sbexec-v0.3.2
+        with:
+          version: '0.3.2'
+      - name: Pre-build under sbe (dogfood)
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          case "$TARGET" in
+            aarch64-apple-darwin)
+              rustup target add "$TARGET"
+              sbe run -- cargo build --release --locked --target "$TARGET" \
+                --manifest-path apps/cli/Cargo.toml
+              ;;
+            *)
+              # x86_64/aarch64 musl on ubuntu need a musl/cross linker that
+              # upload-rust-binary-action provisions internally — avoid
+              # duplicating that here. A host-native `cargo check` still
+              # gives us a real sbe workload to dogfood against.
+              sbe run -- cargo check --locked \
+                --manifest-path apps/cli/Cargo.toml
+              ;;
+          esac
+
       - name: Build and upload binary to release
         uses: taiki-e/upload-rust-binary-action@v1
         with:
