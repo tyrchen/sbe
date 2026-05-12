@@ -1,6 +1,6 @@
 //! macOS execution path: write SBPL to tempfile, spawn `sandbox-exec`.
 
-use std::{collections::HashMap, process::ExitStatus};
+use std::{collections::HashMap, os::unix::fs::PermissionsExt, process::ExitStatus};
 
 use tempfile::NamedTempFile;
 use tokio::process::Command;
@@ -55,7 +55,6 @@ async fn write_sbpl_tempfile(content: &str) -> Result<NamedTempFile, CoreError> 
         .await
         .map_err(|e| CoreError::Backend(format!("failed to write SBPL temp file: {e}")))?;
 
-    use std::os::unix::fs::PermissionsExt;
     let perms = std::fs::Permissions::from_mode(0o400);
     tokio::fs::set_permissions(file.path(), perms)
         .await

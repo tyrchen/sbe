@@ -69,8 +69,23 @@ pub struct SandboxProfile {
     pub allow_write: Vec<SandboxPath>,
 
     /// Paths denied for reading (expanded, absolute).
+    ///
+    /// On macOS this is a subtractive `(deny file-read* …)` rule. On Linux
+    /// Landlock cannot subtract from an allowed subtree, so the backend
+    /// instead treats this list as a *sealed forbidden-list*: paths here are
+    /// guaranteed never to be silently added to [`Self::allow_read`], and
+    /// any user config that would overlap is rejected.
     #[serde(default)]
     pub deny_read: Vec<SandboxPath>,
+
+    /// Read-allowlist extensions on Linux (no-op on macOS).
+    ///
+    /// macOS uses an "allow all reads then subtract" model, so this field
+    /// goes unused there. On Linux the backend merges these into the
+    /// curated read-anchors and runs the [`Self::deny_read`] forbidden-list
+    /// lint against the merged set.
+    #[serde(default)]
+    pub allow_read: Vec<SandboxPath>,
 
     /// Domains allowed for outbound HTTPS.
     #[serde(default)]
@@ -217,10 +232,19 @@ impl SandboxProfile {
         #[cfg(target_os = "macos")]
         resolve_symlinks(&mut allow_exec);
 
+        // Linux read-allowlist additions from defaults (macOS ignores).
+        let allow_read: Vec<SandboxPath> = common
+            .allow_read
+            .iter()
+            .chain(eco_cfg.allow_read.iter())
+            .map(|p| expand_path(p, home, pwd))
+            .collect();
+
         SandboxProfile {
             name: profile_name,
             allow_write,
             deny_read,
+            allow_read,
             allow_domains,
             deny_exec,
             allow_exec,
@@ -237,6 +261,7 @@ impl SandboxProfile {
         self.allow_write
             .extend(overrides.allow_write.iter().cloned());
         self.deny_read.extend(overrides.deny_read.iter().cloned());
+        self.allow_read.extend(overrides.allow_read.iter().cloned());
         self.allow_domains
             .extend(overrides.allow_domains.iter().cloned());
         self.deny_exec.extend(overrides.deny_exec.iter().cloned());
@@ -367,6 +392,7 @@ fn find_git_root(start: &Path) -> Option<PathBuf> {
 pub struct ProfileOverrides {
     pub allow_write: Vec<SandboxPath>,
     pub deny_read: Vec<SandboxPath>,
+    pub allow_read: Vec<SandboxPath>,
     pub allow_domains: Vec<DomainPattern>,
     pub deny_domains: Vec<DomainPattern>,
     pub allow_exec: Vec<SandboxPath>,
@@ -392,6 +418,8 @@ struct CommonDefaults {
     #[serde(default)]
     deny_read: Vec<String>,
     #[serde(default)]
+    allow_read: Vec<String>,
+    #[serde(default)]
     deny_exec: Vec<String>,
     #[serde(default)]
     allow_exec: Vec<String>,
@@ -402,6 +430,8 @@ struct CommonDefaults {
 struct EcosystemDefaults {
     #[serde(default)]
     allow_write: Vec<String>,
+    #[serde(default)]
+    allow_read: Vec<String>,
     #[serde(default)]
     allow_domains: Vec<String>,
     #[serde(default)]

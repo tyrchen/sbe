@@ -99,17 +99,27 @@ pub fn render(
     }
 
     let _ = writeln!(out, "seccomp:");
-    let _ = writeln!(out, "  defaultAction: allow");
-    let _ = writeln!(out, "  killOnMatch:");
+    let _ = writeln!(out, "  filters:");
+    let _ = writeln!(out, "    - name: kill");
+    let _ = writeln!(out, "      defaultAction: allow");
+    let _ = writeln!(out, "      onMatch: kill-process");
+    let _ = writeln!(out, "      syscalls:");
     for syscall in super::seccomp::KILL_LIST {
-        let _ = writeln!(out, "    - {syscall}");
+        let _ = writeln!(out, "        - {syscall}");
     }
-    let _ = writeln!(out, "  errnoOnMatch:");
+    let _ = writeln!(out, "    - name: errno");
+    let _ = writeln!(out, "      defaultAction: allow");
+    let _ = writeln!(out, "      onMatch: errno(EPERM)");
+    let _ = writeln!(out, "      syscalls:");
     for syscall in super::seccomp::ERRNO_LIST {
-        let _ = writeln!(out, "    - {syscall}");
+        let _ = writeln!(out, "        - {syscall}");
     }
     if !features.net_port_filter && !profile.allow_all_network && proxy_port.is_some() {
-        let _ = writeln!(out, "  connectArgFilter: loopback-only");
+        let _ = writeln!(
+            out,
+            "  netFallback: seccomp connect()-arg filtering is intentionally not enforced — \
+             relies on Landlock path filter and proxy loopback bind"
+        );
     }
 
     let _ = writeln!(out, "proxy:");

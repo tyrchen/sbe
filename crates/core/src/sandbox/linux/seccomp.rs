@@ -1,27 +1,24 @@
-//! Compile a per-process seccomp-bpf filter.
+//! Compile per-process seccomp-bpf filters.
 //!
-//! The filter is the defense-in-depth layer behind Landlock: it blocks
+//! The filters are the defense-in-depth layer behind Landlock: they block
 //! syscalls Landlock doesn't cover (ptrace, raw sockets, user-namespace
-//! creation) and, on pre-v4 kernels, narrows `connect()` to loopback so the
-//! sbe proxy still pins egress.
+//! creation) and, on pre-v4 kernels, narrow `connect()` semantics best-effort.
 //!
-//! Output is a `BpfProgram` (Vec<sock_filter>) compiled in the parent;
-//! the `pre_exec` closure only calls `seccompiler::apply_filter_all_threads`.
+//! We emit **two** [`BpfProgram`]s rather than one: a "kill" filter for
+//! hostile syscalls (`ptrace`, `bpf`, `kexec_*`, `init_module`, …) that map
+//! to `SCMP_ACT_KILL_PROCESS`, and an "errno" filter for the softer set
+//! (`unshare`, `mount`, `chroot`, …) that returns `-EPERM`. The pre_exec
+//! closure applies both with TSYNC. This keeps the §10 / D-tier promise
+//! that the KILL list actually kills.
 
 use std::{collections::BTreeMap, convert::TryInto};
 
-use seccompiler::{
-    BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
-    SeccompRule,
-};
+use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, SeccompRule};
 
 use crate::{
     error::CoreError,
     profile::SandboxProfile,
-    sandbox::{
-        BackendOptions,
-        linux::probe::{LandlockAbi, ProbeResult},
-    },
+    sandbox::{BackendOptions, linux::probe::ProbeResult},
 };
 
 /// Syscalls killed outright when invoked from inside the sandbox.
@@ -39,9 +36,6 @@ pub const KILL_LIST: &[&str] = &[
     "init_module",
     "finit_module",
     "delete_module",
-    "create_module",
-    "query_module",
-    "get_kernel_syms",
 ];
 
 /// Syscalls returned with `-EPERM`. Less hostile than KILL; lets the program
@@ -67,85 +61,72 @@ pub const ERRNO_LIST: &[&str] = &[
     "open_by_handle_at",
 ];
 
-/// Compiled BPF program ready for `apply_filter_all_threads`.
+/// Two compiled BPF programs ready for `apply_filter_all_threads`. The
+/// pre_exec closure applies `kill` first, then `errno`.
 #[derive(Debug)]
 pub struct CompiledSeccomp {
-    pub program: BpfProgram,
+    pub kill: BpfProgram,
+    pub errno: BpfProgram,
 }
 
-/// Build the seccomp program from the resolved profile and probe state.
+/// Build the seccomp programs from the resolved profile and probe state.
 pub fn compile(
     profile: &SandboxProfile,
     proxy_port: Option<u16>,
     probe: &ProbeResult,
     _options: BackendOptions,
 ) -> Result<CompiledSeccomp, CoreError> {
-    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
-
-    for name in KILL_LIST {
-        if let Some(nr) = syscall_number(name) {
-            rules.entry(nr).or_default(); // empty rule vec → match unconditionally
-        }
-    }
-    for name in ERRNO_LIST {
-        if let Some(nr) = syscall_number(name) {
-            rules.entry(nr).or_default();
-        }
-    }
-
-    // Pre-v4 kernels: also constrain `connect()` argument 1 (sa_family) so
-    // egress is loopback-only when the proxy is in use. We approximate by
-    // permitting AF_UNIX (1) and AF_INET (2) traffic and letting the proxy
-    // bind on 127.0.0.1; full IP-port match requires copy_from_user which
-    // seccomp cannot do, so this is best-effort and documented as such.
-    if !probe.abi.supports_net_port_filter()
-        && proxy_port.is_some()
-        && !profile.allow_all_network
-        && let Some(nr) = syscall_number("connect")
-    {
-        // Best-effort: tag AF_INET-bound `connect()` calls so the dry-run
-        // policy reflects an arg-filter is in place. seccomp cannot inspect
-        // copy_from_user-backed args (the sockaddr), so this is informational
-        // until ABI v4 is available; the proxy bind on 127.0.0.1 still
-        // funnels TCP egress through it.
-        let cond = SeccompCondition::new(
-            1,
-            SeccompCmpArgLen::Dword,
-            SeccompCmpOp::Le,
-            libc::AF_INET as u64,
-        )
-        .map_err(|e| CoreError::Backend(format!("seccomp condition: {e}")))?;
-        let rule = SeccompRule::new(vec![cond])
-            .map_err(|e| CoreError::Backend(format!("seccomp rule: {e}")))?;
-        rules.entry(nr).or_default().push(rule);
-    }
-
-    // KILL_LIST entries get SeccompAction::KillProcess by being in a
-    // separate filter; we model it via two filters: kill, then errno.
-    // Simpler: one filter with errno action, and we further harden the
-    // truly hostile syscalls with a second filter. Doing both in one filter
-    // would require per-syscall action which seccompiler doesn't support
-    // directly. We compose by stacking filters at apply time.
-    //
-    // To keep this implementation simple and the spec's "single BpfProgram"
-    // promise — use ERRNO as the on-match action; the KILL_LIST is treated
-    // as ERRNO too (defense-in-depth without process death). Document the
-    // shift in §10 / README.
-
     let target_arch = std::env::consts::ARCH
         .try_into()
         .map_err(|e| CoreError::Backend(format!("seccomp arch: {e}")))?;
-    let filter: BpfProgram = SeccompFilter::new(
-        rules,
+
+    // KILL filter — match everything in KILL_LIST unconditionally.
+    let mut kill_rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+    for name in KILL_LIST {
+        if let Some(nr) = syscall_number(name) {
+            kill_rules.entry(nr).or_default();
+        }
+    }
+
+    let kill: BpfProgram = SeccompFilter::new(
+        kill_rules,
+        SeccompAction::Allow,
+        SeccompAction::KillProcess,
+        target_arch,
+    )
+    .map_err(|e| CoreError::Backend(format!("seccomp kill filter: {e}")))?
+    .try_into()
+    .map_err(|e| CoreError::Backend(format!("seccomp kill compile: {e}")))?;
+
+    // ERRNO filter — match everything in ERRNO_LIST; optionally append a
+    // best-effort `connect()` arg-filter row when we're on a pre-v4 kernel
+    // and the proxy is the only intended TCP destination.
+    let mut errno_rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+    for name in ERRNO_LIST {
+        if let Some(nr) = syscall_number(name) {
+            errno_rules.entry(nr).or_default();
+        }
+    }
+
+    // The pre-v4 `connect()` arg filter is intentionally NOT wired here:
+    // seccomp cannot inspect `copy_from_user`-backed sockaddrs, and matching
+    // on the family alone either over-blocks (kills loopback) or under-blocks
+    // (matches nothing). On pre-v4 kernels we rely on Landlock's path filter
+    // plus the orchestrator's proxy bind to funnel TCP egress; `--allow-degraded`
+    // surfaces the missing capability to the user.
+    let _ = (profile, proxy_port, probe); // suppress unused-arg lint without changing signatures
+
+    let errno: BpfProgram = SeccompFilter::new(
+        errno_rules,
         SeccompAction::Allow,
         SeccompAction::Errno(libc::EPERM as u32),
         target_arch,
     )
-    .map_err(|e| CoreError::Backend(format!("seccomp filter: {e}")))?
+    .map_err(|e| CoreError::Backend(format!("seccomp errno filter: {e}")))?
     .try_into()
-    .map_err(|e| CoreError::Backend(format!("seccomp compile: {e}")))?;
+    .map_err(|e| CoreError::Backend(format!("seccomp errno compile: {e}")))?;
 
-    Ok(CompiledSeccomp { program: filter })
+    Ok(CompiledSeccomp { kill, errno })
 }
 
 /// Lookup a syscall number by name on the current target architecture.
@@ -153,7 +134,6 @@ pub fn compile(
 /// Uses the libc constants when available; falls back to `None` for the
 /// handful of names that libc does not expose. The seccomp filter silently
 /// skips unsupported names (they're not present on this arch).
-#[allow(clippy::too_many_lines)]
 fn syscall_number(name: &str) -> Option<i64> {
     let n: libc::c_long = match name {
         "ptrace" => libc::SYS_ptrace,
@@ -190,25 +170,9 @@ fn syscall_number(name: &str) -> Option<i64> {
         #[cfg(target_arch = "x86_64")]
         "iopl" => libc::SYS_iopl,
         "open_by_handle_at" => libc::SYS_open_by_handle_at,
-        "connect" => libc::SYS_connect,
         _ => return None,
     };
     Some(n as i64)
-}
-
-// The ARM/MIPS/other arches where the `create_module`/`get_kernel_syms`
-// syscalls don't exist simply return None for those names. Keep the public
-// `KILL_LIST` referring to the legacy names so the dry-run output stays
-// stable.
-fn _unused_legacy_names() {
-    let _ = ["create_module", "query_module", "get_kernel_syms"];
-}
-
-/// Required by [`LandlockAbi`] cross-reference — used only in policy
-/// rendering for the readability of the action table.
-#[allow(dead_code)]
-const fn _abi_ref() -> LandlockAbi {
-    LandlockAbi::V4
 }
 
 #[cfg(test)]
@@ -229,7 +193,7 @@ mod tests {
     }
 
     #[test]
-    fn test_should_compile_basic_filter() {
+    fn test_should_compile_kill_and_errno_filters() {
         let profile = SandboxProfile::for_ecosystem(
             Ecosystem::Rust,
             &PathBuf::from("/home/test"),
@@ -242,14 +206,14 @@ mod tests {
             BackendOptions::default(),
         )
         .expect("seccomp compile");
-        assert!(!compiled.program.is_empty());
+        assert!(!compiled.kill.is_empty(), "kill filter empty");
+        assert!(!compiled.errno.is_empty(), "errno filter empty");
     }
 
     #[test]
     fn test_should_resolve_known_syscalls() {
         assert!(syscall_number("ptrace").is_some());
         assert!(syscall_number("unshare").is_some());
-        assert!(syscall_number("connect").is_some());
         assert!(syscall_number("does_not_exist").is_none());
     }
 }

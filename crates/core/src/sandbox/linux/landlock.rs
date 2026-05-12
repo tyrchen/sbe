@@ -124,7 +124,7 @@ pub fn compile(
     let forbidden_reads = build_forbidden_reads(profile)?;
 
     // 2. Resolve read-allowlist (curated anchors + extra paths from profile).
-    let read_paths = build_read_paths(profile, &forbidden_reads)?;
+    let read_paths = build_read_paths(profile, &forbidden_reads, options)?;
 
     let abi = highest_abi(probe);
     let ruleset = Ruleset::default()
@@ -136,7 +136,10 @@ pub fn compile(
         ruleset
     };
 
-    let mut created = ruleset.create()?.set_no_new_privs(true);
+    // `set_no_new_privs(false)` here because the pre_exec closure issues the
+    // prctl explicitly. Calling it twice is harmless but contradicts the §6
+    // invariant that the closure performs exactly the documented syscalls.
+    let mut created = ruleset.create()?.set_no_new_privs(false);
 
     // Read allowlist
     created = add_path_rules(created, &read_paths, read_access(abi))?;
@@ -199,35 +202,35 @@ fn build_forbidden_reads(profile: &SandboxProfile) -> Result<BTreeSet<PathBuf>, 
 }
 
 fn build_read_paths(
-    _profile: &SandboxProfile,
+    profile: &SandboxProfile,
     forbidden: &BTreeSet<PathBuf>,
+    options: BackendOptions,
 ) -> Result<Vec<PathBuf>, CoreError> {
     let mut out: Vec<PathBuf> = READ_ALLOWLIST_ANCHORS.iter().map(PathBuf::from).collect();
+    // User-supplied / per-ecosystem extensions from the merged profile.
+    for sp in &profile.allow_read {
+        out.push(sp.path.clone());
+    }
 
-    // The profile carries the per-ecosystem read additions in
-    // `allow_write` and `allow_exec` — those already grant read implicitly.
-    // The forbidden list seals anything the user named under `deny_read`;
-    // refuse to build if any anchor overlaps a forbidden entry.
-    for anchor in &out {
-        for f in forbidden {
-            if path_is_under(f, anchor) {
-                return Err(CoreError::ProfileLint(format!(
-                    "denyRead path '{}' is under baseline read-allowlist anchor '{}'; the \
-                     Landlock backend cannot subtract reads from a granted subtree. Either remove \
-                     the denyRead entry, override the anchor via a custom profile, or accept that \
-                     paths under '{}' are readable on Linux.",
-                    f.display(),
-                    anchor.display(),
-                    anchor.display(),
-                )));
+    if !options.allow_degraded {
+        // Sealed forbidden-list lint: any read-allowlist entry that overlaps
+        // a denyRead path is rejected at backend-time.
+        for anchor in &out {
+            for f in forbidden {
+                if path_is_under(f, anchor) {
+                    return Err(CoreError::ProfileLint(format!(
+                        "denyRead path '{}' is under read-allowlist entry '{}'; the Landlock \
+                         backend cannot subtract reads from a granted subtree. Either remove the \
+                         denyRead entry, narrow the allowRead entry, or pass --allow-degraded if \
+                         you understand the threat model.",
+                        f.display(),
+                        anchor.display(),
+                    )));
+                }
             }
         }
     }
 
-    // Merge any user-added read paths (carried via SandboxProfile.allow_write
-    // and allow_exec already; we don't read user-supplied "allowRead" because
-    // the SandboxProfile struct doesn't expose it directly — the per-OS
-    // defaults YAML embeds the same anchors).
     out.sort();
     out.dedup();
     Ok(out)
@@ -341,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn test_should_reject_forbidden_read_overlap() {
+    fn test_should_reject_forbidden_read_overlap_with_baseline() {
         let mut profile = SandboxProfile::for_ecosystem(
             Ecosystem::Rust,
             &PathBuf::from("/home/test"),
@@ -354,7 +357,52 @@ mod tests {
             kind: PathKind::Subpath,
         });
         let forbidden = build_forbidden_reads(&profile).unwrap();
-        let err = build_read_paths(&profile, &forbidden).unwrap_err();
+        let err = build_read_paths(&profile, &forbidden, BackendOptions::default()).unwrap_err();
         assert!(format!("{err}").contains("denyRead"));
+    }
+
+    #[test]
+    fn test_should_reject_forbidden_read_overlap_with_user_allow_read() {
+        let mut profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Rust,
+            &PathBuf::from("/home/test"),
+            &PathBuf::from("/home/test/pwd"),
+        );
+        profile.deny_read.clear();
+        profile.deny_read.push(SandboxPath {
+            path: PathBuf::from("/home/test/.ssh"),
+            kind: PathKind::Subpath,
+        });
+        // User config tries to grant ~/ as readable — overlaps denyRead.
+        profile.allow_read.push(SandboxPath {
+            path: PathBuf::from("/home/test"),
+            kind: PathKind::Subpath,
+        });
+        let forbidden = build_forbidden_reads(&profile).unwrap();
+        let err = build_read_paths(&profile, &forbidden, BackendOptions::default()).unwrap_err();
+        assert!(format!("{err}").contains("denyRead"));
+    }
+
+    #[test]
+    fn test_should_bypass_forbidden_read_overlap_under_allow_degraded() {
+        let mut profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Rust,
+            &PathBuf::from("/home/test"),
+            &PathBuf::from("/home/test/pwd"),
+        );
+        profile.deny_read.clear();
+        profile.deny_read.push(SandboxPath {
+            path: PathBuf::from("/etc/ssh"),
+            kind: PathKind::Subpath,
+        });
+        let forbidden = build_forbidden_reads(&profile).unwrap();
+        let res = build_read_paths(
+            &profile,
+            &forbidden,
+            BackendOptions {
+                allow_degraded: true,
+            },
+        );
+        assert!(res.is_ok(), "allow_degraded should bypass the seal lint");
     }
 }

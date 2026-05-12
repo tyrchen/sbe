@@ -202,6 +202,7 @@ fn build_overrides(args: &RunArgs, home: &Path, pwd: &Path) -> ProfileOverrides 
             .iter()
             .map(|p| expand_path(&p.to_string_lossy(), home, pwd))
             .collect(),
+        allow_read: Vec::new(),
         allow_domains: args
             .allow_domain
             .iter()
@@ -235,9 +236,9 @@ fn build_overrides(args: &RunArgs, home: &Path, pwd: &Path) -> ProfileOverrides 
 }
 
 /// Print available profiles and their defaults (for `sbe profiles` command).
-pub fn print_profiles() {
-    let home = dirs::home_dir().unwrap_or_else(|| "/tmp".into());
-    let pwd = std::env::current_dir().unwrap_or_else(|_| "/tmp".into());
+pub fn print_profiles() -> anyhow::Result<()> {
+    let home = dirs::home_dir().context("could not determine home directory")?;
+    let pwd = std::env::current_dir().context("failed to get current directory")?;
 
     for eco in Ecosystem::ALL {
         let profile = SandboxProfile::for_ecosystem(eco, &home, &pwd);
@@ -264,6 +265,7 @@ pub fn print_profiles() {
         }
         println!();
     }
+    Ok(())
 }
 
 #[allow(dead_code)]

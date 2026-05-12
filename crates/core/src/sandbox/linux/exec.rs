@@ -50,38 +50,40 @@ pub(super) async fn run_sandboxed(
     cmd.stderr(std::process::Stdio::inherit());
 
     // Move policy artifacts into the closure by value. The `ruleset` and
-    // `program` types both hold their resources internally; we do nothing
-    // in the closure but call the kernel APIs.
+    // `BpfProgram`s hold their resources internally; we do nothing in the
+    // closure but call the kernel APIs.
     //
     // `restrict_self` takes the ruleset by value but `pre_exec` is `FnMut`,
-    // so we wrap in `Option::take()` to consume on the (single) call. If the
-    // closure is invoked more than once we surface a stable error.
+    // so we wrap in `Option::take()` to consume on the (single) call.
     let landlock::CompiledLandlock { ruleset } = compiled_landlock;
-    let seccomp::CompiledSeccomp { program: bpf } = compiled_seccomp;
+    let seccomp::CompiledSeccomp { kill, errno } = compiled_seccomp;
     let mut ruleset_slot = Some(ruleset);
 
-    // SAFETY: see §6. The closure performs only three syscalls and never
-    // allocates, opens an FD, or reads tokio state.
+    // SAFETY: see §6. The closure performs only the documented syscalls and
+    // never allocates, opens an FD, or reads tokio state. The test
+    // `test_pre_exec_closure_uses_no_forbidden_tokens` mechanically scans
+    // this window for tokens that would violate the invariant.
+    // BEGIN PRE_EXEC
     unsafe {
         cmd.pre_exec(move || {
-            // 1. PR_SET_NO_NEW_PRIVS — required for unprivileged seccomp.
             let rc = libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
             if rc != 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            // 2. Apply Landlock — consumes the preopened ruleset FD.
             let ruleset = ruleset_slot
                 .take()
                 .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::Other))?;
             ruleset
                 .restrict_self()
                 .map_err(|_| std::io::Error::from(std::io::ErrorKind::PermissionDenied))?;
-            // 3. Apply seccomp with TSYNC.
-            seccompiler::apply_filter_all_threads(&bpf)
+            seccompiler::apply_filter_all_threads(&kill)
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::PermissionDenied))?;
+            seccompiler::apply_filter_all_threads(&errno)
                 .map_err(|_| std::io::Error::from(std::io::ErrorKind::PermissionDenied))?;
             Ok(())
         });
     }
+    // END PRE_EXEC
 
     let status = cmd
         .status()
@@ -90,6 +92,28 @@ pub(super) async fn run_sandboxed(
 
     Ok(status)
 }
+
+/// Source-tokens that must not appear inside the [`pre_exec`] closure body —
+/// see §6 of the cross-platform-backend-design spec.
+///
+/// Clippy's project-level `disallowed-methods` is global; we cannot scope it
+/// to one module without poisoning the rest of the codebase. Instead we
+/// enforce the alloc-free contract with a literal-source-scan test below.
+#[cfg_attr(not(test), allow(dead_code))]
+const PRE_EXEC_FORBIDDEN_TOKENS: &[&str] = &[
+    "format!",
+    "println!",
+    "eprintln!",
+    "write!",
+    "writeln!",
+    "String::from",
+    "String::new",
+    "Vec::new",
+    "Vec::with_capacity",
+    "Box::new",
+    "tokio::",
+    "tracing::",
+];
 
 /// §13 D1: refuse to start when the kernel can't honour the profile's
 /// network expectations, unless the user opted in via `allow_degraded`.
@@ -130,4 +154,40 @@ fn enforce_network_capability(
             probe.abi.as_str()
         ),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PRE_EXEC_FORBIDDEN_TOKENS;
+
+    /// Mechanically verify the [`pre_exec`] closure body contains none of
+    /// the heap-allocating / runtime-aware tokens enumerated in §6.
+    ///
+    /// This is a literal source-scan, not a clippy lint — clippy's
+    /// `disallowed-methods` is global and would over-restrict the rest of
+    /// the crate. The scan only inspects the slice of this file between
+    /// `BEGIN PRE_EXEC` and `END PRE_EXEC` sentinels.
+    #[test]
+    fn test_pre_exec_closure_uses_no_forbidden_tokens() {
+        // We embed this file's source at build time; the test runs even when
+        // building on macOS, so the alloc-free invariant is verified from
+        // every dev machine, not just Linux CI.
+        let src = include_str!("exec.rs");
+        let begin = src
+            .find("// BEGIN PRE_EXEC")
+            .expect("missing BEGIN PRE_EXEC sentinel in exec.rs");
+        let end = src
+            .find("// END PRE_EXEC")
+            .expect("missing END PRE_EXEC sentinel in exec.rs");
+        assert!(end > begin, "END PRE_EXEC before BEGIN PRE_EXEC");
+        let window = &src[begin..end];
+
+        for token in PRE_EXEC_FORBIDDEN_TOKENS {
+            assert!(
+                !window.contains(token),
+                "pre_exec closure body contains forbidden token `{token}` — see §6 invariants in \
+                 specs/cross-platform-backend-design.md"
+            );
+        }
+    }
 }

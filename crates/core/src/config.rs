@@ -33,6 +33,10 @@ pub struct ProfileConfig {
     #[serde(default)]
     pub deny_read: Vec<String>,
 
+    /// Linux read-allowlist extensions. macOS ignores this field.
+    #[serde(default)]
+    pub allow_read: Vec<String>,
+
     #[serde(default)]
     pub allow_domains: Vec<String>,
 
@@ -122,6 +126,9 @@ impl ProfileConfig {
         }
         for p in &self.deny_read {
             profile.deny_read.push(expand_path(p, home, pwd));
+        }
+        for p in &self.allow_read {
+            profile.allow_read.push(expand_path(p, home, pwd));
         }
         for d in &self.allow_domains {
             profile.allow_domains.push(DomainPattern(d.clone()));
