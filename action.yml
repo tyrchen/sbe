@@ -35,11 +35,10 @@ runs:
       run: |
         set -euo pipefail
 
-        # Map (RUNNER_OS, RUNNER_ARCH) → release target triple. The four
+        # Map (RUNNER_OS, RUNNER_ARCH) → release target triple. The three
         # release artifacts are:
         #   sbe-<tag>-x86_64-unknown-linux-musl.tar.gz
         #   sbe-<tag>-aarch64-unknown-linux-musl.tar.gz
-        #   sbe-<tag>-x86_64-apple-darwin.tar.gz
         #   sbe-<tag>-aarch64-apple-darwin.tar.gz
         case "$RUNNER_OS" in
           Linux)
@@ -51,9 +50,8 @@ runs:
             ;;
           macOS)
             case "$RUNNER_ARCH" in
-              X64)   target="x86_64-apple-darwin"  ;;
               ARM64) target="aarch64-apple-darwin" ;;
-              *) echo "::error::Unsupported macOS arch: $RUNNER_ARCH"; exit 1 ;;
+              *) echo "::error::Unsupported macOS arch: $RUNNER_ARCH (only Apple Silicon is supported)"; exit 1 ;;
             esac
             ;;
           *)

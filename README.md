@@ -102,7 +102,6 @@ Supported runner / architecture matrix (auto-detected via `$RUNNER_OS` and
 |---|---|---|
 | `ubuntu-*`  | x86_64 | `x86_64-unknown-linux-musl` |
 | `ubuntu-*`  | arm64  | `aarch64-unknown-linux-musl` |
-| `macos-*`   | x86_64 | `x86_64-apple-darwin` |
 | `macos-*`   | arm64  | `aarch64-apple-darwin` |
 
 Linux runners on `ubuntu-latest` / `ubuntu-24.04` (kernel 6.x) get full

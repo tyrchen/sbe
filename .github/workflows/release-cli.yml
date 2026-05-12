@@ -44,11 +44,7 @@ jobs:
             runner: ubuntu-latest
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-latest
-          # macOS: dynamic-linked darwin binaries. macos-13 is the last
-          # remaining Intel-x86_64 runner image; macos-latest is Apple
-          # Silicon (aarch64-apple-darwin native).
-          - target: x86_64-apple-darwin
-            runner: macos-13
+          # macOS: dynamic-linked darwin binary on Apple Silicon.
           - target: aarch64-apple-darwin
             runner: macos-latest
     steps:
