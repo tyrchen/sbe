@@ -343,6 +343,12 @@ profiles:
       # Scala / sbt
       - "~/.sbt/"
       - "~/.ivy2/"
+      # sbt 1.x server's UDS socket lives at
+      # $XDG_RUNTIME_DIR/.sbt/<hash>/... and on systemd hosts XDG_RUNTIME_DIR
+      # is /run/user/<uid>/. POSIX perms on that dir are 0700 owned by the
+      # invoking user, so the broadened Landlock grant only covers this
+      # process's own runtime tree.
+      - "/run/user/"
       # Coursier (Scala dependency manager)
       - "~/.cache/coursier/"
       # GH Actions setup-java tool cache
