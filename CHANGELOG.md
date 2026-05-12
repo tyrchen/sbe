@@ -3,6 +3,49 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [sbexec-v0.3.1](https://github.com/compare/sbexec-v0.3.0..sbexec-v0.3.1) - 2026-05-12
+
+### Bug Fixes
+
+- **(profile)** cover Homebrew-managed rustup; loosen .sbe.yaml for proxy tests - ([0810154](https://github.com/commit/081015491f21362e6184454ed9c9db226951f25d)) - Tyr Chen
+- **(seccomp)** hardcode kexec_file_load syscall on aarch64 - ([a0461f8](https://github.com/commit/a0461f80372f65944ae045a5225168d81ce07685)) - Tyr Chen
+
+### Miscellaneous Chores
+
+- bump to 0.3.1 - ([9d14b94](https://github.com/commit/9d14b945068a0759fa1bfe3a3bc087a4724c9330)) - Tyr Chen
+
+### Other
+
+- Update CHANGELOG.md - ([4f139a1](https://github.com/commit/4f139a1f1eb999071e2d11705f864d81f4b166a6)) - Tyr Chen
+- dogfood the sbe action in build + release workflows - ([1648d3b](https://github.com/commit/1648d3b2676a6ed4c833d0b1a44885adc18f8de0)) - Tyr Chen
+- temporary diagnostic — capture cargo path + sbe inspect on runners - ([3bd3deb](https://github.com/commit/3bd3deb1d578dbaa51a6f617d1c3165c9f57da35)) - Tyr Chen
+- Revert "ci: dogfood the sbe action in build + release workflows"
+
+Diagnostic run on macos-latest revealed sbe 0.3.0's rust profile
+allowExec (~/.cargo/bin/ + ~/.rustup/toolchains/) doesn't cover the
+Homebrew-managed rustup shim chain that GH runners use:
+
+  ~/.cargo/bin/cargo -> rustup
+                     -> /opt/homebrew/bin/rustup-init
+                     -> /opt/homebrew/Cellar/rustup/1.29.0/bin/rustup-init
+
+sandbox-exec resolves the symlinks before matching process-exec, so
+the real binary path is outside the allowlist and execvp returns
+EPERM. Linux side hit a separate issue: proxy_integration tests bind
+127.0.0.1:0 ephemeral, which Landlock v4 can't allow when
+enableProxy: false pins egress to :443.
+
+Both are real gaps to fix in a follow-up; reverting CI to bare cargo
+until the defaults cover Homebrew rustup and the Linux loopback case
+is handled.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com> - ([195eb42](https://github.com/commit/195eb42d81c1ae0fe4c202c361b78c24dd5dd5a0)) - Tyr Chen
+
+### Tests
+
+- run proxy_integration bare, drop .sbe.yaml override - ([11cc2f5](https://github.com/commit/11cc2f5bf983648d69e98ff6e05e698441d26331)) - Tyr Chen
+
+---
 ## [sbexec-v0.3.0](https://github.com/compare/sbexec-v0.2.1..sbexec-v0.3.0) - 2026-05-12
 
 ### Features
