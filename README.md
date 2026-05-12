@@ -41,6 +41,35 @@ make install
 
 Requires macOS (uses `sandbox-exec` which is macOS-only).
 
+### CI (GitHub Actions)
+
+For CI pipelines that need `sbe` available on the runner, use the bundled composite action. It installs a prebuilt static (musl) Linux binary from the matching GitHub release and adds it to `PATH`:
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: tyrchen/sbe@sbexec-v0.2.0   # or @master with `version: latest`
+        with:
+          version: latest                  # "latest" | "0.2.0" | "sbexec-v0.2.0"
+      - run: sbe --version
+```
+
+Inputs:
+
+| Input | Default | Description |
+|---|---|---|
+| `version` | `latest` | Release to install. Accepts `latest`, a semver (`0.2.0`), or a full tag (`sbexec-v0.2.0`). |
+| `github-token` | `${{ github.token }}` | Token used for releases API + asset download (avoids rate limits). |
+
+Outputs: `version` (resolved tag) and `bin-path` (absolute path to the installed binary).
+
+Supports `x86_64` and `aarch64` Linux runners only. The binary itself only executes sandboxes on macOS — install it on Linux when you need the CLI present for tooling or cross-platform wrappers, and run it on macOS runners for actual sandboxing.
+
+Prebuilt binaries are published automatically on every `sbexec-v*` tag by [`.github/workflows/release-cli.yml`](.github/workflows/release-cli.yml).
+
 ## Quick Start
 
 ```bash

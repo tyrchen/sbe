@@ -1,0 +1,62 @@
+name: release-cli
+
+on:
+  push:
+    tags:
+      - 'sbexec-v*'
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    name: Create GitHub release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Generate changelog
+        uses: orhun/git-cliff-action@v4
+        id: git-cliff
+        with:
+          config: cliff.toml
+          args: -vv --latest --strip header
+        env:
+          OUTPUT: CHANGES.md
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: ${{ steps.git-cliff.outputs.content }}
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: create-release
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build and upload binary to release
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: sbe
+          target: ${{ matrix.target }}
+          archive: $bin-$tag-$target
+          tar: all
+          zip: none
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: refs/tags/${{ github.ref_name }}
+          manifest_path: apps/cli/Cargo.toml
+          locked: true

@@ -1,0 +1,107 @@
+name: 'Setup sbe'
+description: 'Install the sbe CLI (macOS sandbox-exec wrapper) and add it to PATH on Linux CI runners'
+author: 'Tyr Chen'
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  version:
+    description: 'sbe version to install (e.g. "0.2.0", "sbexec-v0.2.0", or "latest")'
+    required: false
+    default: 'latest'
+  github-token:
+    description: 'GitHub token used to query releases and download assets (avoids API rate limits)'
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  version:
+    description: 'The resolved release tag that was installed (e.g. "sbexec-v0.2.0")'
+    value: ${{ steps.resolve.outputs.tag }}
+  bin-path:
+    description: 'Absolute path to the installed sbe binary'
+    value: ${{ steps.install.outputs.bin-path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Verify runner OS
+      shell: bash
+      run: |
+        if [[ "$RUNNER_OS" != "Linux" ]]; then
+          echo "::error::setup-sbe currently only supports Linux runners (got: $RUNNER_OS)"
+          exit 1
+        fi
+
+    - name: Resolve version and target
+      id: resolve
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        INPUT_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+
+        arch="$(uname -m)"
+        case "$arch" in
+          x86_64)         target="x86_64-unknown-linux-musl" ;;
+          aarch64|arm64)  target="aarch64-unknown-linux-musl" ;;
+          *) echo "::error::Unsupported architecture: $arch"; exit 1 ;;
+        esac
+
+        if [[ "$INPUT_VERSION" == "latest" ]]; then
+          tag="$(curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/tyrchen/sbe/releases?per_page=30" \
+            | jq -r '[.[] | select(.tag_name | startswith("sbexec-v"))][0].tag_name')"
+          if [[ -z "$tag" || "$tag" == "null" ]]; then
+            echo "::error::Could not find any sbexec-v* release on tyrchen/sbe"
+            exit 1
+          fi
+        elif [[ "$INPUT_VERSION" == sbexec-v* ]]; then
+          tag="$INPUT_VERSION"
+        else
+          tag="sbexec-v${INPUT_VERSION#v}"
+        fi
+
+        echo "tag=$tag" >> "$GITHUB_OUTPUT"
+        echo "target=$target" >> "$GITHUB_OUTPUT"
+        echo "Resolved: $tag for $target"
+
+    - name: Download and install sbe
+      id: install
+      shell: bash
+      env:
+        TAG: ${{ steps.resolve.outputs.tag }}
+        TARGET: ${{ steps.resolve.outputs.target }}
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+
+        asset="sbe-${TAG}-${TARGET}.tar.gz"
+        url="https://github.com/tyrchen/sbe/releases/download/${TAG}/${asset}"
+        tmp="$(mktemp -d)"
+        install_dir="$HOME/.local/bin"
+        mkdir -p "$install_dir"
+
+        echo "Downloading $url"
+        curl -fsSL \
+          -H "Authorization: Bearer $GH_TOKEN" \
+          -H "Accept: application/octet-stream" \
+          -o "$tmp/$asset" "$url"
+
+        tar -xzf "$tmp/$asset" -C "$tmp"
+
+        bin_path="$(find "$tmp" -type f -name sbe -not -name '*.tar.gz' | head -n1)"
+        if [[ -z "$bin_path" ]]; then
+          echo "::error::sbe binary not found inside $asset"
+          ls -lR "$tmp"
+          exit 1
+        fi
+
+        install -m 0755 "$bin_path" "$install_dir/sbe"
+        echo "$install_dir" >> "$GITHUB_PATH"
+        echo "bin-path=$install_dir/sbe" >> "$GITHUB_OUTPUT"
+        echo "Installed $("$install_dir/sbe" --version 2>/dev/null || echo sbe) to $install_dir/sbe"
