@@ -44,6 +44,15 @@ pub const READ_ALLOWLIST_ANCHORS: &[&str] = &[
     "/dev",
 ];
 
+/// Baseline writable paths injected into every Linux ruleset.
+///
+/// Matches the macOS SBPL writer's `/private/tmp` / `/private/var/folders`
+/// injection: build toolchains (cc, ld, cargo) need to drop temp files in
+/// `/tmp` or `/var/tmp`, and a sandbox that allows execution but not
+/// temp-file creation breaks almost every compiler. `/dev/null` and
+/// `/dev/zero` are routinely targeted by `Stdio::null()` in build scripts.
+const BASELINE_WRITE_PATHS: &[&str] = &["/tmp", "/var/tmp", "/dev/null", "/dev/zero", "/dev/shm"];
+
 /// Privilege-escalation binaries that must never appear under an
 /// `allow_exec` subpath. The lint refuses to build the ruleset if a
 /// user-supplied profile would re-enable any of these via a directory rule.
@@ -144,12 +153,18 @@ pub fn compile(
     // Read allowlist
     created = add_path_rules(created, &read_paths, read_access(abi))?;
 
-    // Write allowlist
+    // Write allowlist: ensure each writable directory exists before opening
+    // an FD — Landlock can't grant a rule on a non-existent path, and
+    // tools like npm/cargo expect their cache dirs to be writable
+    // even on first invocation. We chmod 0700 so secrets in $HOME stay
+    // private.
     let write_paths: Vec<PathBuf> = profile
         .allow_write
         .iter()
         .map(|sp| sp.path.clone())
+        .chain(BASELINE_WRITE_PATHS.iter().map(PathBuf::from))
         .collect();
+    ensure_writable_dirs(&write_paths);
     created = add_path_rules(created, &write_paths, write_access(abi))?;
 
     // Exec allowlist (read+exec); covers shared libraries too.
@@ -191,6 +206,39 @@ fn add_path_rules(
         created = created.add_rule(PathBeneath::new(fd, access))?;
     }
     Ok(created)
+}
+
+/// Create any missing directories from `allow_write` so Landlock can open
+/// an FD on each one. We mode-0700 directories under $HOME to protect
+/// secrets; paths outside $HOME (e.g. `/tmp`, `/var/tmp`) are left alone.
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
+fn ensure_writable_dirs(paths: &[PathBuf]) {
+    use std::os::unix::fs::PermissionsExt;
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    for p in paths {
+        if p.exists() {
+            continue;
+        }
+        if let Some(parent) = p.parent()
+            && !parent.exists()
+        {
+            // Best-effort recursive create — silently skip on error so we
+            // don't break unrelated paths.
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // If the entry itself looks like a directory (trailing slash or
+        // matches a known cache prefix), create it too.
+        let _ = std::fs::create_dir_all(p);
+        if let Some(h) = home.as_ref()
+            && p.starts_with(h)
+            && p.is_dir()
+            && let Ok(meta) = p.metadata()
+        {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o700);
+            let _ = std::fs::set_permissions(p, perms);
+        }
+    }
 }
 
 fn build_forbidden_reads(profile: &SandboxProfile) -> Result<BTreeSet<PathBuf>, CoreError> {

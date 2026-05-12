@@ -208,19 +208,26 @@ jobs:
       - name: uv pip install under sbe (happy path)
         run: |
           set -euo pipefail
+          UV_BIN=$(command -v uv)
+          UV_DIR=$(dirname "$UV_BIN")
+          echo "uv at $UV_BIN (dir $UV_DIR)"
           mkdir -p "$HOME/sbe-uv" && cd "$HOME/sbe-uv"
           rm -rf happy && mkdir happy && cd happy
           uv venv .venv
-          sbe run --profile python -- uv pip install --python .venv --no-progress requests
+          sbe run --profile python --allow-exec "$UV_DIR/" --allow-write "$UV_DIR/" -- \
+            "$UV_BIN" pip install --python .venv --no-progress requests
           test -d .venv/lib
 
       - name: uv build the hostile fixtures/python — hatch hook must be sandboxed
         run: |
           set -euo pipefail
+          UV_BIN=$(command -v uv)
+          UV_DIR=$(dirname "$UV_BIN")
           cd fixtures/python
           rm -rf dist
           set +e
-          sbe run --profile python -- uv build --no-progress 2>&1 | tee out.log
+          sbe run --profile python --allow-exec "$UV_DIR/" --allow-write "$UV_DIR/" -- \
+            "$UV_BIN" build --no-progress 2>&1 | tee out.log
           rc=$?
           set -e
           if grep -q "shit" out.log; then
@@ -249,6 +256,23 @@ jobs:
           otp-version: '27'
           elixir-version: '1.17'
 
+      - name: Resolve Erlang/Elixir paths
+        id: beam
+        run: |
+          set -euo pipefail
+          MIX_BIN=$(command -v mix)
+          MIX_DIR=$(dirname "$MIX_BIN")
+          # setup-beam installs Erlang to /home/runner/work/_temp/.setup-beam/otp/<rel>/.../bin/erl
+          # and Elixir to ${MIX_DIR}; both directories need allowExec.
+          ERL_BIN=$(command -v erl)
+          ERL_DIR=$(dirname "$ERL_BIN")
+          OTP_ROOT=$(dirname "$ERL_DIR")
+          echo "mix-dir=$MIX_DIR" >> "$GITHUB_OUTPUT"
+          echo "erl-dir=$ERL_DIR" >> "$GITHUB_OUTPUT"
+          echo "otp-root=$OTP_ROOT" >> "$GITHUB_OUTPUT"
+          echo "mix=$MIX_BIN" >> "$GITHUB_OUTPUT"
+          echo "Resolved: mix=$MIX_BIN otp_root=$OTP_ROOT"
+
       - name: mix compile a fresh project under sbe (happy path)
         run: |
           set -euo pipefail
@@ -256,7 +280,12 @@ jobs:
           rm -rf happy
           mix new happy --module Happy
           cd happy
-          sbe run --profile elixir -- mix compile 2>&1 | tee out.log
+          sbe run --profile elixir \
+            --allow-exec '${{ steps.beam.outputs.mix-dir }}/' \
+            --allow-exec '${{ steps.beam.outputs.erl-dir }}/' \
+            --allow-exec '${{ steps.beam.outputs.otp-root }}/' \
+            --allow-write '${{ steps.beam.outputs.otp-root }}/' \
+            -- '${{ steps.beam.outputs.mix }}' compile 2>&1 | tee out.log
           grep -qE "(Compiled|Generated happy)" out.log
 
       - name: mix on the hostile fixtures/elixir — top-level read+curl must be sandboxed
@@ -265,7 +294,12 @@ jobs:
           cd fixtures/elixir
           rm -rf _build deps
           set +e
-          sbe run --profile elixir -- mix compile 2>&1 | tee out.log
+          sbe run --profile elixir \
+            --allow-exec '${{ steps.beam.outputs.mix-dir }}/' \
+            --allow-exec '${{ steps.beam.outputs.erl-dir }}/' \
+            --allow-exec '${{ steps.beam.outputs.otp-root }}/' \
+            --allow-write '${{ steps.beam.outputs.otp-root }}/' \
+            -- '${{ steps.beam.outputs.mix }}' compile 2>&1 | tee out.log
           rc=$?
           set -e
           if grep -q "shit" out.log; then
