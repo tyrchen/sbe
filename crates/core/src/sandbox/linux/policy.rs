@@ -190,7 +190,7 @@ mod tests {
         );
 
         assert!(!out.contains("netConnectTcp:"));
-        assert!(out.contains("connectArgFilter: loopback-only"));
+        assert!(out.contains("netFallback:"));
     }
 
     #[test]
