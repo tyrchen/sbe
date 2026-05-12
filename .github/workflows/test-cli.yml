@@ -125,7 +125,7 @@ jobs:
           rm -rf hello
           cargo init --name hello --bin hello
           cd hello
-          sbe run --profile rust -- cargo build --offline 2>&1 | tee out.log
+          sbe run -- cargo build --offline 2>&1 | tee out.log
           grep -q "Compiling hello" out.log
           ./target/debug/hello | grep -q "Hello, world"
 
@@ -136,7 +136,7 @@ jobs:
           rm -rf target
           # The build script tries to read $HOME/.ssh/id_ed25519 and curl a
           # gist. Under sbe both must print "safe!" warnings, never "shit!".
-          sbe run --profile rust -- cargo build 2>&1 | tee out.log
+          sbe run -- cargo build 2>&1 | tee out.log
           if grep -q "shit" out.log; then
             echo "FAIL: hostile fixture exfiltration succeeded under sbe"
             exit 1
@@ -168,7 +168,7 @@ jobs:
           cat > package.json <<'JSON'
           {"name":"happy","version":"0.0.1","dependencies":{"lodash":"4.17.21"}}
           JSON
-          sbe run --profile node -- npm install --no-audit --no-fund 2>&1 | tee out.log
+          sbe run -- npm install --no-audit --no-fund 2>&1 | tee out.log
           test -d node_modules/lodash
 
       - name: npm install the hostile fixtures/node — preinstall must be sandboxed
@@ -177,7 +177,7 @@ jobs:
           cd fixtures/node
           rm -rf node_modules
           set +e
-          sbe run --profile node -- npm install --no-audit --no-fund 2>&1 | tee out.log
+          sbe run -- npm install --no-audit --no-fund 2>&1 | tee out.log
           rc=$?
           set -e
           if grep -q "shit" out.log; then
@@ -206,28 +206,30 @@ jobs:
           version: latest
 
       - name: uv pip install under sbe (happy path)
+        env:
+          # setup-uv@v3 sets UV_CACHE_DIR to /home/runner/work/_temp/setup-uv-cache,
+          # a CI-specific path not in any default allowlist. Reset to the
+          # standard XDG location that the python profile allows by default.
+          UV_CACHE_DIR: ${{ github.workspace }}/../.uv-cache
         run: |
           set -euo pipefail
-          UV_BIN=$(command -v uv)
-          UV_DIR=$(dirname "$UV_BIN")
-          echo "uv at $UV_BIN (dir $UV_DIR)"
-          mkdir -p "$HOME/sbe-uv" && cd "$HOME/sbe-uv"
+          echo "uv at $(command -v uv)"
+          mkdir -p "$HOME/sbe-uv" "$HOME/.cache/uv" && cd "$HOME/sbe-uv"
+          export UV_CACHE_DIR="$HOME/.cache/uv"
           rm -rf happy && mkdir happy && cd happy
           uv venv .venv
-          sbe run --profile python --allow-exec "$UV_DIR/" --allow-write "$UV_DIR/" -- \
-            "$UV_BIN" pip install --python .venv --no-progress requests
+          sbe run -- uv pip install --python .venv --no-progress requests
           test -d .venv/lib
 
       - name: uv build the hostile fixtures/python — hatch hook must be sandboxed
         run: |
           set -euo pipefail
-          UV_BIN=$(command -v uv)
-          UV_DIR=$(dirname "$UV_BIN")
+          export UV_CACHE_DIR="$HOME/.cache/uv"
+          mkdir -p "$UV_CACHE_DIR"
           cd fixtures/python
           rm -rf dist
           set +e
-          sbe run --profile python --allow-exec "$UV_DIR/" --allow-write "$UV_DIR/" -- \
-            "$UV_BIN" build --no-progress 2>&1 | tee out.log
+          sbe run -- uv build --no-progress 2>&1 | tee out.log
           rc=$?
           set -e
           if grep -q "shit" out.log; then
@@ -250,28 +252,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo install sbe
         run: cargo install --path apps/cli --locked --force
-      - name: Install Erlang/Elixir
-        uses: erlef/setup-beam@v1
-        with:
-          otp-version: '27'
-          elixir-version: '1.17'
-
-      - name: Resolve Erlang/Elixir paths
-        id: beam
+      - name: Install Erlang/Elixir (apt — system paths so default profile applies)
         run: |
           set -euo pipefail
-          MIX_BIN=$(command -v mix)
-          MIX_DIR=$(dirname "$MIX_BIN")
-          # setup-beam installs Erlang to /home/runner/work/_temp/.setup-beam/otp/<rel>/.../bin/erl
-          # and Elixir to ${MIX_DIR}; both directories need allowExec.
-          ERL_BIN=$(command -v erl)
-          ERL_DIR=$(dirname "$ERL_BIN")
-          OTP_ROOT=$(dirname "$ERL_DIR")
-          echo "mix-dir=$MIX_DIR" >> "$GITHUB_OUTPUT"
-          echo "erl-dir=$ERL_DIR" >> "$GITHUB_OUTPUT"
-          echo "otp-root=$OTP_ROOT" >> "$GITHUB_OUTPUT"
-          echo "mix=$MIX_BIN" >> "$GITHUB_OUTPUT"
-          echo "Resolved: mix=$MIX_BIN otp_root=$OTP_ROOT"
+          sudo apt-get update -y
+          sudo apt-get install -y elixir erlang
+          echo "mix at $(command -v mix)"
+          echo "erl at $(command -v erl)"
 
       - name: mix compile a fresh project under sbe (happy path)
         run: |
@@ -280,12 +267,7 @@ jobs:
           rm -rf happy
           mix new happy --module Happy
           cd happy
-          sbe run --profile elixir \
-            --allow-exec '${{ steps.beam.outputs.mix-dir }}/' \
-            --allow-exec '${{ steps.beam.outputs.erl-dir }}/' \
-            --allow-exec '${{ steps.beam.outputs.otp-root }}/' \
-            --allow-write '${{ steps.beam.outputs.otp-root }}/' \
-            -- '${{ steps.beam.outputs.mix }}' compile 2>&1 | tee out.log
+          sbe run -- mix compile 2>&1 | tee out.log
           grep -qE "(Compiled|Generated happy)" out.log
 
       - name: mix on the hostile fixtures/elixir — top-level read+curl must be sandboxed
@@ -294,12 +276,7 @@ jobs:
           cd fixtures/elixir
           rm -rf _build deps
           set +e
-          sbe run --profile elixir \
-            --allow-exec '${{ steps.beam.outputs.mix-dir }}/' \
-            --allow-exec '${{ steps.beam.outputs.erl-dir }}/' \
-            --allow-exec '${{ steps.beam.outputs.otp-root }}/' \
-            --allow-write '${{ steps.beam.outputs.otp-root }}/' \
-            -- '${{ steps.beam.outputs.mix }}' compile 2>&1 | tee out.log
+          sbe run -- mix compile 2>&1 | tee out.log
           rc=$?
           set -e
           if grep -q "shit" out.log; then

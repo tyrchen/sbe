@@ -158,6 +158,11 @@ common:
     # Temp directories — build tools create wrapper scripts here
     - "/tmp/"
     - "/var/tmp/"
+    # /opt — Homebrew on Linux, Snapcraft, language-specific installs,
+    # GitHub Actions hosted-tool cache (/opt/hostedtoolcache/). Subpath
+    # is safe here because the privilege-escalation lint guards
+    # /usr/bin/sudo + /bin/sudo + similar — /opt/ is not on that list.
+    - "/opt/"
 
 profiles:
   node:
@@ -169,6 +174,9 @@ profiles:
       - "~/.local/share/pnpm/"
       - "~/.bun/"
       - "~/.cache/bun/"
+      # GH Actions setup-node caches node here; allow writes to its cache
+      # subtree so `npm install` can populate the local store.
+      - "/opt/hostedtoolcache/node/"
     allowDomains:
       - "registry.npmjs.org"
       - "registry.yarnpkg.com"
@@ -193,6 +201,8 @@ profiles:
       - "~/.local/state/fnm_multishells/"
       # mise (polyglot version manager)
       - "~/.local/share/mise/"
+      # asdf shim layout
+      - "~/.asdf/"
 
   rust:
     allowWrite:
@@ -231,6 +241,9 @@ profiles:
       - "~/.local/share/pdm/"
       # Rye
       - "~/.rye/"
+      # GH Actions setup-uv and setup-python tool cache.
+      - "/opt/hostedtoolcache/uv/"
+      - "/opt/hostedtoolcache/Python/"
     allowDomains:
       - "pypi.org"
       - "files.pythonhosted.org"
@@ -258,6 +271,8 @@ profiles:
       - "$PWD/venv/"
       # mise (polyglot version manager)
       - "~/.local/share/mise/"
+      # asdf
+      - "~/.asdf/"
 
   elixir:
     allowWrite:
