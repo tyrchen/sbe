@@ -69,7 +69,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: tyrchen/sbe@sbexec-v0.2.2   # or @master with `version: latest`
+      - uses: tyrchen/sbe@sbexec-v0.3.0   # or @master with `version: latest`
         with:
           version: latest
       - run: sbe --version
@@ -79,7 +79,7 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: tyrchen/sbe@sbexec-v0.2.2
+      - uses: tyrchen/sbe@sbexec-v0.3.0
         with:
           version: latest
       - run: sbe run -- cargo build
@@ -89,7 +89,7 @@ Inputs:
 
 | Input | Default | Description |
 |---|---|---|
-| `version` | `latest` | Release to install. Accepts `latest`, a semver (`0.2.2`), or a full tag (`sbexec-v0.2.2`). |
+| `version` | `latest` | Release to install. Accepts `latest`, a semver (`0.3.0`), or a full tag (`sbexec-v0.3.0`). |
 | `github-token` | `${{ github.token }}` | Token used for releases API + asset download. |
 
 Outputs: `version` (resolved tag) and `bin-path` (absolute path to the
