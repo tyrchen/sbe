@@ -280,6 +280,10 @@ profiles:
       - "~/.m2/repository/"
       - "~/.gradle/caches/"
       - "~/.gradle/wrapper/"
+      - "~/.gradle/daemon/"
+      - "~/.gradle/native/"
+      - "~/.gradle/.tmp/"
+      - "~/.gradle/notifications/"
       - "$PWD/.gradle/"
       - "$PWD/build/"
       - "$PWD/target/"
@@ -294,6 +298,7 @@ profiles:
       - "repo.maven.apache.org"
       - "plugins.gradle.org"
       - "services.gradle.org"
+      - "downloads.gradle.org"
       - "downloads.gradle-dn.com"
       - "jcenter.bintray.com"
       - "github.com"
@@ -301,14 +306,17 @@ profiles:
       - "objects.githubusercontent.com"
       # Scala
       - "repo.scala-sbt.org"
+      - "repo1.scala-sbt.org"
       - "scala-ci.typesafe.com"
+      - "downloads.lightbend.com"
     allowExec:
       - "/usr/bin/java"
       - "/usr/libexec/java_home"
       - "/opt/homebrew/opt/openjdk/"
+      - "/Library/Java/JavaVirtualMachines/"
       - "~/.sdkman/"
-      # Gradle wrapper runs from here
-      - "~/.gradle/wrapper/"
+      # Gradle wrapper and daemon
+      - "~/.gradle/"
       # Coursier downloads launchers here
       - "~/.cache/coursier/"
       - "~/Library/Caches/Coursier/"
@@ -319,4 +327,10 @@ profiles:
       - "/usr/local/bin/sbt"
       - "/usr/local/bin/scala"
       - "/usr/local/bin/scalac"
+      # Project-local wrappers
+      - "$PWD/gradlew"
+      - "$PWD/mvnw"
+      # Version managers
       - "~/.local/share/mise/"
+      - "~/.asdf/"
+      - "~/.jenv/"

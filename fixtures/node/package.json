@@ -1,7 +1,7 @@
 {
   "name": "test-bad-node",
   "version": "0.1.0",
-  "description": "SSH key read test via install script",
+  "description": "Hostile npm package — exercises the fixtures/ATTACKS.md matrix.",
   "scripts": {
     "preinstall": "node check.js",
     "postinstall": "node check.js",

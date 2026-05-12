@@ -312,6 +312,10 @@ profiles:
       - "~/.m2/repository/"
       - "~/.gradle/caches/"
       - "~/.gradle/wrapper/"
+      - "~/.gradle/daemon/"
+      - "~/.gradle/native/"
+      - "~/.gradle/.tmp/"
+      - "~/.gradle/notifications/"
       - "$PWD/.gradle/"
       - "$PWD/build/"
       - "$PWD/target/"
@@ -320,11 +324,15 @@ profiles:
       - "~/.ivy2/"
       # Coursier (Scala dependency manager)
       - "~/.cache/coursier/"
+      # GH Actions setup-java tool cache
+      - "/opt/hostedtoolcache/Java_Temurin-Hotspot_jdk/"
+      - "/opt/hostedtoolcache/java/"
     allowDomains:
       - "repo1.maven.org"
       - "repo.maven.apache.org"
       - "plugins.gradle.org"
       - "services.gradle.org"
+      - "downloads.gradle.org"
       - "downloads.gradle-dn.com"
       - "jcenter.bintray.com"
       - "github.com"
@@ -332,13 +340,18 @@ profiles:
       - "objects.githubusercontent.com"
       # Scala
       - "repo.scala-sbt.org"
+      - "repo1.scala-sbt.org"
       - "scala-ci.typesafe.com"
+      - "downloads.lightbend.com"
     allowExec:
       - "/usr/bin/java"
+      - "/usr/bin/javac"
+      - "/usr/bin/jar"
+      - "/usr/bin/jshell"
       - "/usr/lib/jvm/"
       - "~/.sdkman/"
-      # Gradle wrapper runs from here
-      - "~/.gradle/wrapper/"
+      # Gradle wrapper and daemon execs from here
+      - "~/.gradle/"
       # Coursier downloads launchers here
       - "~/.cache/coursier/"
       # Scala / sbt tools
@@ -348,4 +361,11 @@ profiles:
       - "/usr/local/bin/sbt"
       - "/usr/local/bin/scala"
       - "/usr/local/bin/scalac"
+      - "/usr/share/sbt/"
+      # Project-local gradlew / mvnw wrapper scripts
+      - "$PWD/gradlew"
+      - "$PWD/mvnw"
+      # Version managers
       - "~/.local/share/mise/"
+      - "~/.asdf/"
+      - "~/.jenv/"
