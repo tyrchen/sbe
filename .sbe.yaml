@@ -1,0 +1,18 @@
+# sbe project config for this repo (the sbe project itself).
+#
+# The proxy integration tests in crates/proxy/tests/proxy_integration.rs spin up
+# the sbe HTTP CONNECT proxy in-process and assert that a permitted domain
+# (registry.npmjs.org) tunnels through to a real upstream. That assertion
+# requires an actual outbound TCP connect to registry.npmjs.org:443 from inside
+# the sandbox.
+#
+# SBPL filters network at the kernel by IP+port, not by domain, so an
+# `allowDomains` entry alone cannot unblock a raw `TcpStream::connect`. We
+# disable the outer proxy here so the rust profile's SBPL falls back to
+# `*:443`-allowed mode (still deny-all otherwise), which is the minimum
+# kernel-level relaxation needed for the proxy tests to exercise real network.
+profiles:
+  rust:
+    enableProxy: false
+    allowDomains:
+      - registry.npmjs.org

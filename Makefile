@@ -2,7 +2,7 @@ build:
 	@cargo build
 
 test:
-	@cargo nextest run --all-features
+	@sbe run -- cargo nextest run --all-features
 
 fmt:
 	@cargo +nightly fmt
