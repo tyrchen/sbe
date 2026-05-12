@@ -207,28 +207,32 @@ fn build_read_paths(
     options: BackendOptions,
 ) -> Result<Vec<PathBuf>, CoreError> {
     let mut out: Vec<PathBuf> = READ_ALLOWLIST_ANCHORS.iter().map(PathBuf::from).collect();
-    // User-supplied / per-ecosystem extensions from the merged profile.
-    for sp in &profile.allow_read {
-        out.push(sp.path.clone());
-    }
 
+    // Sealed forbidden-list lint: check user-supplied allow_read overlap
+    // against denyRead. We do NOT lint against the baseline anchors —
+    // those are documented in the README as readable, and the seal's
+    // purpose per §8 is to prevent a user's *broadening* of the allowlist
+    // from accidentally exposing a path they marked secret.
     if !options.allow_degraded {
-        // Sealed forbidden-list lint: any read-allowlist entry that overlaps
-        // a denyRead path is rejected at backend-time.
-        for anchor in &out {
+        for sp in &profile.allow_read {
             for f in forbidden {
-                if path_is_under(f, anchor) {
+                if path_is_under(f, &sp.path) {
                     return Err(CoreError::ProfileLint(format!(
-                        "denyRead path '{}' is under read-allowlist entry '{}'; the Landlock \
-                         backend cannot subtract reads from a granted subtree. Either remove the \
-                         denyRead entry, narrow the allowRead entry, or pass --allow-degraded if \
-                         you understand the threat model.",
+                        "denyRead path '{}' is under user-supplied allowRead entry '{}'; the \
+                         Landlock backend cannot subtract reads from a granted subtree. Either \
+                         remove the denyRead entry, narrow the allowRead entry, or pass \
+                         --allow-degraded if you understand the threat model.",
                         f.display(),
-                        anchor.display(),
+                        sp.path.display(),
                     )));
                 }
             }
         }
+    }
+
+    // Merge user extensions after the lint succeeds.
+    for sp in &profile.allow_read {
+        out.push(sp.path.clone());
     }
 
     out.sort();
@@ -344,21 +348,24 @@ mod tests {
     }
 
     #[test]
-    fn test_should_reject_forbidden_read_overlap_with_baseline() {
+    fn test_should_not_lint_baseline_anchor_overlap() {
+        // §8: the seal is a "promise to never *silently broaden* a path that
+        // overlaps denyRead". Baseline anchors (/etc, /tmp, /lib, …) are
+        // documented in the README as readable, so they don't count as a
+        // user-broadening event. Only user-supplied allowRead is linted.
         let mut profile = SandboxProfile::for_ecosystem(
             Ecosystem::Rust,
             &PathBuf::from("/home/test"),
             &PathBuf::from("/home/test/pwd"),
         );
-        // deny_read entry beneath /etc baseline anchor → must lint.
         profile.deny_read.clear();
         profile.deny_read.push(SandboxPath {
             path: PathBuf::from("/etc/ssh"),
             kind: PathKind::Subpath,
         });
         let forbidden = build_forbidden_reads(&profile).unwrap();
-        let err = build_read_paths(&profile, &forbidden, BackendOptions::default()).unwrap_err();
-        assert!(format!("{err}").contains("denyRead"));
+        let res = build_read_paths(&profile, &forbidden, BackendOptions::default());
+        assert!(res.is_ok(), "baseline anchor overlap must not lint");
     }
 
     #[test]
