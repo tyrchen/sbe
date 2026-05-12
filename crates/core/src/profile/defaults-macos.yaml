@@ -185,6 +185,26 @@ profiles:
       - "/usr/bin/xcrun"
       - "/usr/bin/xcodebuild"
       - "~/Library/Caches/cargo-zigbuild/"
+      # Homebrew-managed rustup (`brew install rustup` — used by GH
+      # macos-latest runners). ~/.cargo/bin/cargo is a relative symlink
+      # to `rustup` → /opt/homebrew/bin/rustup-init →
+      # /opt/homebrew/Cellar/rustup/<ver>/bin/rustup-init. macOS
+      # sandbox-exec resolves symlinks before matching process-exec, so
+      # the real Cellar path must be covered. resolve_symlinks() in
+      # profile/mod.rs canonicalises each listed binary at runtime and
+      # adds the Cellar package directory automatically.
+      - "/opt/homebrew/bin/rustup"
+      - "/opt/homebrew/bin/rustup-init"
+      - "/opt/homebrew/Cellar/rustup/"
+      - "/opt/homebrew/Cellar/rustup-init/"
+      - "/opt/homebrew/opt/rustup/"
+      - "/opt/homebrew/opt/rustup-init/"
+      - "/usr/local/bin/rustup"
+      - "/usr/local/bin/rustup-init"
+      - "/usr/local/Cellar/rustup/"
+      - "/usr/local/Cellar/rustup-init/"
+      - "/usr/local/opt/rustup/"
+      - "/usr/local/opt/rustup-init/"
 
   python:
     allowWrite:

@@ -1,18 +1,21 @@
 # sbe project config for this repo (the sbe project itself).
 #
-# The proxy integration tests in crates/proxy/tests/proxy_integration.rs spin up
-# the sbe HTTP CONNECT proxy in-process and assert that a permitted domain
-# (registry.npmjs.org) tunnels through to a real upstream. That assertion
-# requires an actual outbound TCP connect to registry.npmjs.org:443 from inside
-# the sandbox.
+# The proxy integration tests in crates/proxy/tests/proxy_integration.rs
+# spin up the sbe HTTP CONNECT proxy in-process. Two of the three tests
+# only need a localhost connect to a kernel-chosen ephemeral port (the
+# in-process proxy server); the third also reaches registry.npmjs.org:443
+# to assert a permitted-domain CONNECT actually tunnels.
 #
-# SBPL filters network at the kernel by IP+port, not by domain, so an
-# `allowDomains` entry alone cannot unblock a raw `TcpStream::connect`. We
-# disable the outer proxy here so the rust profile's SBPL falls back to
-# `*:443`-allowed mode (still deny-all otherwise), which is the minimum
-# kernel-level relaxation needed for the proxy tests to exercise real network.
+# macOS SBPL has a `(remote ip "localhost:*")` baseline so `enableProxy:
+# false` is enough to make all three pass. Linux Landlock v4 only filters
+# TCP by port, with no way to express "any port on 127.0.0.1" — so the
+# kernel falls back to the `:443`-only relaxation and the loopback connect
+# to the ephemeral proxy port gets EACCES.
+#
+# Setting `allowAllNetwork: true` disables the kernel TCP filter for this
+# profile on both platforms. We accept the broader scope only because this
+# repo IS sbe — `make test` is exercising the proxy itself, which is the
+# layer that would normally do the domain filtering.
 profiles:
   rust:
-    enableProxy: false
-    allowDomains:
-      - registry.npmjs.org
+    allowAllNetwork: true
