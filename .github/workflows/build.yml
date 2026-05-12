@@ -16,8 +16,9 @@ permissions:
 jobs:
   build-rust:
     strategy:
+      fail-fast: false
       matrix:
-        platform: [ubuntu-latest]
+        platform: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.platform }}
     # services:
     #   postgres:
