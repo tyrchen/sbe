@@ -58,15 +58,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      - name: Install sbe (dogfood)
-        uses: tyrchen/sbe@sbexec-v0.3.0
-        with:
-          # Pin to the last released tag so we never try to install the
-          # tag that is currently being released (its assets don't exist
-          # yet when this job runs).
-          version: sbexec-v0.3.0
-      - name: Pre-flight cargo check under sbe (host target)
-        run: sbe run -- cargo check --locked --manifest-path apps/cli/Cargo.toml
       - name: Build and upload binary to release
         uses: taiki-e/upload-rust-binary-action@v1
         with:
