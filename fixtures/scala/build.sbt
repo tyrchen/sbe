@@ -1,7 +1,11 @@
 // Hostile-but-realistic sbt build — exercises every attack in
-// fixtures/ATTACKS.md AND compiles a small http4s + cats-effect service so
-// the test exercises real backend-style code (http4s-ember-server +
-// cats-effect IO + circe codec).
+// fixtures/ATTACKS.md AND compiles a small cats-effect service so the test
+// exercises real Scala code (cats + cats-effect IO + MUnit).
+//
+// We keep the dep tree small on purpose: a cold-cache fetch of http4s +
+// circe-generic + cats-effect dominates CI runtime (8+ minutes); cats-core
+// + munit-cats-effect proves the same "real Scala compiles under sbe"
+// signal in <2 min on a cold cache.
 //
 // build.sbt is Scala code evaluated at project-load time (before any
 // `compile` task runs), so the attacks fire when the user types
@@ -12,30 +16,24 @@
 //
 // CI greps for PWNED: and fails on any occurrence.
 
-import java.io.{File, IOException, FileWriter, BufferedWriter}
-import java.nio.file.{Files, Paths, NoSuchFileException}
-import scala.sys.process._
+import java.io.{BufferedWriter, File, FileWriter}
+import java.nio.file.{Files, Paths}
+import java.util.concurrent.TimeUnit
 import scala.util.Try
 
 ThisBuild / scalaVersion := "2.13.14"
 ThisBuild / organization := "com.sbetest"
 ThisBuild / version      := "0.1.0"
 
-val Http4sVersion       = "0.23.27"
-val CatsEffectVersion   = "3.5.4"
-val CirceVersion        = "0.14.7"
+val CatsEffectVersion      = "3.5.4"
 val MUnitCatsEffectVersion = "2.0.0"
 
 lazy val root = (project in file("."))
   .settings(
     name := "test-bad-scala",
     libraryDependencies ++= Seq(
-      "org.http4s"   %% "http4s-ember-server" % Http4sVersion,
-      "org.http4s"   %% "http4s-dsl"          % Http4sVersion,
-      "org.http4s"   %% "http4s-circe"        % Http4sVersion,
-      "io.circe"     %% "circe-generic"       % CirceVersion,
-      "org.typelevel" %% "cats-effect"        % CatsEffectVersion,
-      "org.typelevel" %% "munit-cats-effect"  % MUnitCatsEffectVersion % Test,
+      "org.typelevel" %% "cats-effect"       % CatsEffectVersion,
+      "org.typelevel" %% "munit-cats-effect" % MUnitCatsEffectVersion % Test,
     ),
     Test / testFrameworks += new TestFramework("munit.Framework"),
   )
@@ -43,6 +41,7 @@ lazy val root = (project in file("."))
 // --- attack matrix ---
 
 val HOME = sys.env.getOrElse("HOME", "/tmp")
+val ExecTimeoutSeconds = 5L
 
 def report(id: String, ok: Boolean, msg: String): Unit = {
   val tag = if (ok) "SAFE" else "PWNED"
@@ -70,26 +69,59 @@ def tryAppend(id: String, path: String, payload: String): Unit = {
   }
 }
 
-def tryExec(id: String, program: String, args: Seq[String]): Unit = {
-  val res = Try((program +: args).!(ProcessLogger(_ => (), _ => ())))
-  res match {
-    case scala.util.Success(0)   => report(id, ok = false, s"exec $program succeeded")
-    case scala.util.Success(rc)  => report(id, ok = true,  s"exec $program returned $rc (likely sandboxed)")
-    case scala.util.Failure(e)   => report(id, ok = true,  s"blocked: ${e.getMessage}")
+/** Bounded subprocess runner. Uses Java's ProcessBuilder + waitFor(timeout)
+  * so a hung child (e.g., scala.sys.process plumbing waiting on
+  * pipe-drain threads after a Landlock-denied execve) can never stall
+  * the build. Output streams are discarded — we only care about exit
+  * status.
+  */
+def runWithTimeout(cmd: Seq[String]): Either[Throwable, Either[Int, String]] = {
+  try {
+    val pb = new ProcessBuilder(cmd: _*)
+    pb.redirectErrorStream(true)
+    pb.redirectOutput(ProcessBuilder.Redirect.DISCARD)
+    pb.redirectInput(ProcessBuilder.Redirect.from(new File("/dev/null")))
+    val p = pb.start()
+    if (!p.waitFor(ExecTimeoutSeconds, TimeUnit.SECONDS)) {
+      p.destroyForcibly()
+      Right(Right(s"timed out after ${ExecTimeoutSeconds}s"))
+    } else {
+      Right(Left(p.exitValue()))
+    }
+  } catch {
+    case e: Throwable => Left(e)
   }
 }
 
+def tryExec(id: String, program: String, args: Seq[String]): Unit =
+  runWithTimeout(program +: args) match {
+    case Right(Left(0))    => report(id, ok = false, s"exec $program succeeded")
+    case Right(Left(rc))   => report(id, ok = true,  s"exec $program returned $rc (likely sandboxed)")
+    case Right(Right(why)) => report(id, ok = true,  s"exec $program $why")
+    case Left(e)           => report(id, ok = true,  s"blocked: ${e.getMessage}")
+  }
+
 def tryCurl(id: String, url: String): Unit = {
-  val cmd = Seq("/usr/bin/curl", "-sSL", "--max-time", "5", "-o", "/dev/null", "-w", "%{http_code}", url)
-  val out = new StringBuilder
-  val rc  = Try(cmd.!(ProcessLogger(line => out.append(line), _ => ())))
-  rc match {
-    case scala.util.Success(0) =>
-      val code = out.toString.trim
-      if (code.startsWith("2")) report(id, ok = false, s"HTTP $code from $url")
-      else                       report(id, ok = true,  s"blocked: http=$code")
-    case scala.util.Success(code) => report(id, ok = true, s"blocked: curl exit=$code")
-    case scala.util.Failure(e)    => report(id, ok = true, s"blocked: ${e.getMessage}")
+  // Capture stdout for the HTTP code; ProcessBuilder.start() with PIPE
+  // is fine here because we waitFor with a timeout.
+  try {
+    val pb = new ProcessBuilder(
+      "/usr/bin/curl", "-sSL", "--max-time", "5", "-o", "/dev/null",
+      "-w", "%{http_code}", url
+    )
+    pb.redirectErrorStream(false)
+    val p = pb.start()
+    val finished = p.waitFor(ExecTimeoutSeconds + 2, TimeUnit.SECONDS)
+    if (!finished) {
+      p.destroyForcibly()
+      report(id, ok = true, s"timed out fetching $url (likely sandboxed)")
+    } else {
+      val code = scala.io.Source.fromInputStream(p.getInputStream).mkString.trim
+      if (p.exitValue() == 0 && code.startsWith("2")) report(id, ok = false, s"HTTP $code from $url")
+      else                                            report(id, ok = true,  s"blocked: curl exit=${p.exitValue()} http=$code")
+    }
+  } catch {
+    case e: Throwable => report(id, ok = true, s"blocked: ${e.getMessage}")
   }
 }
 

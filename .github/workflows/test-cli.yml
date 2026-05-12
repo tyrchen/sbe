@@ -355,6 +355,21 @@ jobs:
           java-version: '17'
       - uses: sbt/setup-sbt@v1
 
+      # Cache the JVM-tool dependency caches between runs. Without this the
+      # cold-cache fetch of cats-effect + munit-cats-effect + sbt + scala
+      # compiler is the dominant CI cost (~3 min). Key is hashed over the
+      # build descriptors so any dep bump invalidates cleanly.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.ivy2/cache
+            ~/.sbt
+            ~/.cache/coursier
+            ~/.m2/repository
+          key: sbe-jvm-${{ runner.os }}-${{ hashFiles('fixtures/scala/build.sbt', 'fixtures/scala/project/build.properties') }}
+          restore-keys: |
+            sbe-jvm-${{ runner.os }}-
+
       - name: Install Maven (apt — system paths so the default profile applies)
         run: |
           set -euo pipefail
@@ -427,20 +442,21 @@ jobs:
           sbe run -- sbt -batch compile 2>&1 | tee out.log
           grep -qiE "(success|done compiling)" out.log
 
-      - name: hostile sbt fixture — http4s + cats-effect compile + test
+      - name: hostile sbt fixture — cats-effect compile + MUnit test
         run: |
           set -euo pipefail
           cd fixtures/scala
           rm -rf target project/target project/project
           # The build.sbt evaluates on every sbt task and runs the attack
-          # matrix (10 probes). `sbt test` exercises a full compile +
-          # MUnit test run for the http4s/cats-effect service, so the
-          # sandbox actually has work to mediate (dep resolution → ivy2,
-          # scalac, MUnit). All 10 attack IDs must come back SAFE.
+          # matrix (10 probes, each subprocess capped at 5s via
+          # ProcessBuilder.waitFor). `sbt test` exercises a full compile +
+          # MUnit test run for the cats-effect Greeter, so the sandbox
+          # actually has work to mediate (dep resolution → ivy2, scalac,
+          # MUnit). All 10 attack IDs must come back SAFE.
           sbe run -- sbt -batch test 2>&1 | tee out.log || true
           ${GITHUB_WORKSPACE}/.github/workflows/verify-attacks.sh out.log
-          # Sanity: the test actually ran.
-          grep -qE "HelloServiceSpec" out.log || {
+          # Sanity: the MUnit test actually ran.
+          grep -qE "GreeterSpec" out.log || {
             echo "FAIL: MUnit test never ran — sbt may have errored out before tests"
             exit 1
           }
