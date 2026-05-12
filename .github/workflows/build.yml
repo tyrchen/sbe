@@ -47,14 +47,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # - name: Install Protoc
       #   uses: arduino/setup-protoc@v2
+      - name: Install sbe (dogfood)
+        uses: tyrchen/sbe@sbexec-v0.3.0
+        with:
+          version: latest
       - name: Check code format
         run: cargo fmt --all -- --check
       - name: Check the package for errors
-        run: cargo check --all
+        run: sbe run -- cargo check --all
       - name: Lint rust sources
-        run: cargo clippy --all-targets --all-features --tests --benches -- -D warnings
+        run: sbe run -- cargo clippy --all-targets --all-features --tests --benches -- -D warnings
       - name: Execute rust tests
-        run: cargo nextest run --all-features
+        run: sbe run -- cargo nextest run --all-features
       - name: Generate a changelog
         uses: orhun/git-cliff-action@v4
         id: git-cliff
