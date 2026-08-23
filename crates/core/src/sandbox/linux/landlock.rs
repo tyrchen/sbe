@@ -207,10 +207,10 @@ pub fn compile(
         ruleset
     };
 
-    // `set_no_new_privs(false)` here because the pre_exec closure issues the
+    // `no_new_privs(false)` here because the pre_exec closure issues the
     // prctl explicitly. Calling it twice is harmless but contradicts the §6
     // invariant that the closure performs exactly the documented syscalls.
-    let mut created = ruleset.create()?.set_no_new_privs(false);
+    let mut created = ruleset.create()?.no_new_privs(false);
 
     // Read allowlist. Per-entry symlink policy via `symlink_policy_for`:
     // root-owned system paths can be symlinks (usr-merge), user paths
