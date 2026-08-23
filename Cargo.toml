@@ -38,8 +38,8 @@ tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
 
 # Linux-only deps for the Landlock + seccomp backend.
 libc = "0.2.189"
-landlock = "~0.4.7"
-seccompiler = "~0.5"
+landlock = "0.4.7"
+seccompiler = "0.5"
 
 # workspace crates
 sbe-core = { path = "crates/core", version = "0.3.3" }
