@@ -3,6 +3,18 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [sbexec-v0.3.3](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.2..sbexec-v0.3.3) - 2026-08-23
+
+### Bug Fixes
+
+- **(deps)** update `anyhow` past RUSTSEC-2026-0190 and refresh dependencies - ([1864685](https://github.com/tyrchen/sbe/commit/1864685b995bbfeabeb689fb2fe801f8383cba8f)) - Tyr Chen
+
+### Other
+
+- Update CHANGELOG.md - ([3cc8821](https://github.com/tyrchen/sbe/commit/3cc8821d3545b77f233bcd3d7db8097888759827)) - Tyr Chen
+- dogfood setup-sbe action in build and release workflows - ([f1d2f40](https://github.com/tyrchen/sbe/commit/f1d2f402a920e9cd347aece95b4a28ecfcc26499)) - Tyr Chen
+
+---
 ## [sbexec-v0.3.2](https://github.com/compare/sbexec-v0.3.1..sbexec-v0.3.2) - 2026-05-12
 
 ### Miscellaneous Chores
