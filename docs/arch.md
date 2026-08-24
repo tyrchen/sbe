@@ -98,11 +98,14 @@ that execute target artifacts, including cargo-nextest, use a private
 `CARGO_TARGET_DIR`. Node install commands keep `node_modules` writable and
 non-executable; explicit local-tool execution switches that built-in grant to
 read/execute without write. Yarn linker metadata selects only the required
-lock/PnP output files. Python environment installation and execution apply the
-same invocation-specific write-or-execute split to project `.venv` and `venv`
-roots.
+lock/PnP output files, and Bun mutations select only `bun.lock`. Python
+environment installation and execution apply the same invocation-specific
+write-or-execute split to project `.venv` and `venv` roots.
 All persistent outputs and caches remain tainted untrusted data; the sandbox
 does not certify them for later execution outside the boundary.
+Before launch, inode validation rejects regular files that appear through both
+persistent writable and executable hard-link aliases, even when those paths
+are lexically disjoint.
 
 ## 5. macOS backend
 

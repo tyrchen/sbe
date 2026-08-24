@@ -128,7 +128,10 @@ async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
         origin: GrantOrigin::Runtime,
     });
     profile.ephemeral_write_exec.push(runtime_temp_path.clone());
-    profile.validate_security_invariants()?;
+    // Normal execution performs the filesystem identity scan exactly once in
+    // the platform backend immediately before spawn. Inspection has no spawn,
+    // so its branch below runs the complete validation explicitly.
+    profile.validate_structural_security_invariants()?;
 
     // Construct backend (kernel probe runs once here).
     let backend_options = BackendOptions {
@@ -157,6 +160,7 @@ async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
 
     // Dry run / inspect: print policy and exit
     if args.dry_run {
+        profile.validate_security_invariants()?;
         print_inspect_output(&profile, &backend, proxy_port, &extra_env)?;
         let _ = shutdown_tx.send(true);
         if let Some(runtime) = proxy.take() {
@@ -668,7 +672,7 @@ fn option_is_known_boolean(program: &str, option: &str) -> bool {
                 | "-v"
                 | "-vv"
         ),
-        "npm" | "pnpm" => matches!(
+        "npm" | "pnpm" | "bun" => matches!(
             option,
             "--global"
                 | "--help"
@@ -835,6 +839,9 @@ fn node_command_executes_dependencies(command: &[String]) -> bool {
     if command_is(command, "pnpm") {
         return subcommand.is_command(&["exec", "restart", "run", "start", "stop", "test"]);
     }
+    if command_is(command, "bun") {
+        return subcommand.is_command(&["exec", "restart", "run", "start", "stop", "test", "x"]);
+    }
     command_is(command, "yarn")
         && subcommand.is_command(&["exec", "node", "restart", "run", "start", "stop", "test"])
 }
@@ -905,11 +912,12 @@ fn ensure_literal_write_targets(
     let refuses_lockfile_creation = command_has_flag(
         command,
         &["--frozen", "--frozen-lockfile", "--immutable", "--locked"],
-    );
-    let yarn_is_informational =
-        program == "yarn" && command_has_flag(command, &["--help", "--version", "-h", "-v"]);
+    ) || (program == "bun"
+        && command_has_flag(command, &["--no-save"]));
+    let manager_is_informational = matches!(program, "yarn" | "bun")
+        && command_has_flag(command, &["--help", "--version", "-h", "-v"]);
     let subcommand = top_level_subcommand(command);
-    let built_in_outputs = if refuses_lockfile_creation || yarn_is_informational {
+    let built_in_outputs = if refuses_lockfile_creation || manager_is_informational {
         Vec::new()
     } else {
         match program {
@@ -982,6 +990,19 @@ fn ensure_literal_write_targets(
                 ]) =>
             {
                 vec!["pnpm-lock.yaml"]
+            }
+            "bun"
+                if subcommand.is_command(&[
+                    "add",
+                    "i",
+                    "install",
+                    "remove",
+                    "rm",
+                    "uninstall",
+                    "update",
+                ]) =>
+            {
+                vec!["bun.lock"]
             }
             "uv" if subcommand.is_command(&["add", "lock", "remove", "run", "sync", "tree"]) => {
                 vec!["uv.lock"]
@@ -1542,6 +1563,7 @@ mod tests {
             vec!["npm".to_owned(), "test".to_owned()],
             vec!["npm".to_owned(), "exec".to_owned(), "eslint".to_owned()],
             vec!["npx".to_owned(), "eslint".to_owned()],
+            vec!["bun".to_owned(), "run".to_owned(), "test".to_owned()],
         ] {
             let mut profile = base_profile.clone();
             enable_existing_dependency_execution(&mut profile, &command);
@@ -1811,7 +1833,57 @@ mod tests {
         assert!(project.path().join("package-lock.json").is_file());
         assert!(!project.path().join("yarn.lock").exists());
         assert!(!project.path().join("pnpm-lock.yaml").exists());
+        assert!(!project.path().join("bun.lock").exists());
         assert!(!project.path().join(".pnp.cjs").exists());
+
+        let bun_project = tempfile::tempdir().unwrap();
+        let bun_profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Node,
+            Path::new("/home/test"),
+            bun_project.path(),
+        );
+        ensure_literal_write_targets(
+            &bun_profile,
+            &["bun".to_owned(), "install".to_owned()],
+            bun_project.path(),
+        )
+        .unwrap();
+        assert!(bun_project.path().join("bun.lock").is_file());
+        assert!(!bun_project.path().join("package-lock.json").exists());
+        assert!(!bun_project.path().join("yarn.lock").exists());
+        assert!(!bun_project.path().join("pnpm-lock.yaml").exists());
+
+        let frozen_bun_project = tempfile::tempdir().unwrap();
+        let frozen_bun_profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Node,
+            Path::new("/home/test"),
+            frozen_bun_project.path(),
+        );
+        ensure_literal_write_targets(
+            &frozen_bun_profile,
+            &[
+                "bun".to_owned(),
+                "install".to_owned(),
+                "--frozen-lockfile".to_owned(),
+            ],
+            frozen_bun_project.path(),
+        )
+        .unwrap();
+        assert!(!frozen_bun_project.path().join("bun.lock").exists());
+
+        let informational_bun_project = tempfile::tempdir().unwrap();
+        let informational_bun_profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Node,
+            Path::new("/home/test"),
+            informational_bun_project.path(),
+        );
+        ensure_literal_write_targets(
+            &informational_bun_profile,
+            &["bun".to_owned(), "--help".to_owned(), "install".to_owned()],
+            informational_bun_project.path(),
+        )
+        .unwrap();
+        assert!(!informational_bun_project.path().join("bun.lock").exists());
 
         let read_only_project = tempfile::tempdir().unwrap();
         let profile = SandboxProfile::for_ecosystem(

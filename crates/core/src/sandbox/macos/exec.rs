@@ -16,6 +16,7 @@ pub(super) async fn run_sandboxed(
     extra_env: &HashMap<String, String>,
     pid_tx: Option<tokio::sync::oneshot::Sender<u32>>,
 ) -> Result<ExitStatus, CoreError> {
+    profile.validate_security_invariants()?;
     let sbpl_text = sbpl::generate(profile, proxy_port)?;
     let sbpl_file = write_sbpl_tempfile(&sbpl_text)?;
     let sbpl_path = sbpl_file.path().to_path_buf();

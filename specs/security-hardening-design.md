@@ -405,17 +405,22 @@ values, nested commands, `--` payloads, informational flags, mutually exclusive
 manager outputs, and read-only commands must not acquire empty lockfiles as a
 launcher side effect. Yarn PnP outputs are selected only when bounded,
 no-follow project metadata identifies Berry/PnP, including the optional ESM
-loader flag. Commands that explicitly execute installed Node tools replace the
-built-in `node_modules` write grant with an execute grant for that invocation;
-install commands retain write-without-execute. Python run/test commands apply
-the same transition to built-in project `.venv` and `venv` roots, while
-install/sync commands keep them writable and non-executable. Cargo subcommands
-and plugins that execute target artifacts, including nextest, use the private
-per-run target root. Denied read paths that traverse symlinks fail policy
-compilation. Denied regular files, including descendants of denied directories,
-must have exactly one hard link because Landlock cannot distinguish pathname
-aliases of the same inode. User grants are rejected whether they contain a
-denied path or are nested beneath one.
+loader flag. Mutating Bun commands select `bun.lock` without granting unrelated
+manager outputs. Commands that explicitly execute installed Node tools replace
+the built-in `node_modules` write grant with an execute grant for that
+invocation; install commands retain write-without-execute. Python run/test
+commands apply the same transition to built-in project `.venv` and `venv`
+roots, while install/sync commands keep them writable and non-executable. Cargo
+subcommands and plugins that execute target artifacts, including nextest, use
+the private per-run target root. Denied read paths that traverse symlinks fail
+policy compilation. Denied regular files, including descendants of denied
+directories, must have exactly one hard link because Landlock cannot
+distinguish pathname aliases of the same inode. User grants are rejected
+whether they contain a denied path or are nested beneath one. Persistent W^X
+validation must also compare regular-file identities across writable and
+executable roots and fail closed when disjoint pathnames are hard links to the
+same inode; aliases wholly contained inside non-executable writable roots
+remain permitted.
 
 ### 6.8 macOS SBPL generation and IPC
 

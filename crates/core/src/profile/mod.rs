@@ -6,12 +6,31 @@ use std::{
     str::FromStr,
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::{
-    config::{SandboxPath, expand_path},
+    config::{PathKind, SandboxPath, expand_path},
     detect::Ecosystem,
 };
+
+#[cfg(unix)]
+const MAX_WX_ALIAS_SCAN_ENTRIES: usize = 1_000_000;
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+struct HardLinkObservation {
+    link_count: u64,
+    writable_paths: std::collections::HashSet<PathBuf>,
+}
 
 /// Embedded default profiles YAML, compiled into the binary.
 ///
@@ -344,6 +363,7 @@ impl SandboxProfile {
             allow_write.push(SandboxPath::file(git_root.join("package-lock.json")));
             allow_write.push(SandboxPath::file(git_root.join("yarn.lock")));
             allow_write.push(SandboxPath::file(git_root.join("pnpm-lock.yaml")));
+            allow_write.push(SandboxPath::file(git_root.join("bun.lock")));
             allow_write.push(SandboxPath::dir(git_root.join(".yarn")));
             allow_write.push(SandboxPath::file(git_root.join(".pnp.cjs")));
             allow_write.push(SandboxPath::file(git_root.join(".pnp.loader.mjs")));
@@ -620,9 +640,22 @@ impl SandboxProfile {
         };
     }
 
-    /// Reject persistent write/execute overlap. Mutable executable content is
-    /// a persistence boundary, not merely a filesystem convenience.
+    /// Reject persistent write/execute overlap, including existing hard-link
+    /// aliases that name the same regular-file inode through disjoint paths.
+    /// Mutable executable content is a persistence boundary, not merely a
+    /// filesystem convenience.
     pub fn validate_security_invariants(&self) -> Result<(), crate::error::CoreError> {
+        self.validate_structural_security_invariants()?;
+        #[cfg(unix)]
+        self.reject_hard_linked_write_exec_aliases()?;
+        Ok(())
+    }
+
+    /// Validate invariants that depend only on the resolved profile. The
+    /// Linux launcher repeats this after decoding the already-validated
+    /// parent payload without rescanning the host filesystem.
+    #[doc(hidden)]
+    pub fn validate_structural_security_invariants(&self) -> Result<(), crate::error::CoreError> {
         for write in &self.allow_write {
             for execute in &self.allow_exec {
                 if paths_overlap(&write.path, &execute.path)
@@ -639,6 +672,79 @@ impl SandboxProfile {
                     )));
                 }
             }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn reject_hard_linked_write_exec_aliases(&self) -> Result<(), crate::error::CoreError> {
+        let mut inspected = 0_usize;
+        let mut observations: HashMap<FileIdentity, HardLinkObservation> = HashMap::new();
+        for writable in &self.allow_write {
+            if self
+                .ephemeral_write_exec
+                .iter()
+                .any(|root| writable.path.starts_with(root))
+            {
+                continue;
+            }
+            visit_regular_files(writable, &mut inspected, &mut |path, metadata| {
+                if metadata.nlink() <= 1 {
+                    return Ok(());
+                }
+                let identity = file_identity(metadata);
+                let observation =
+                    observations
+                        .entry(identity)
+                        .or_insert_with(|| HardLinkObservation {
+                            link_count: metadata.nlink(),
+                            writable_paths: std::collections::HashSet::new(),
+                        });
+                observation.link_count = observation.link_count.max(metadata.nlink());
+                observation.writable_paths.insert(path.to_path_buf());
+                Ok(())
+            })?;
+        }
+
+        let candidates: std::collections::HashSet<FileIdentity> = observations
+            .iter()
+            .filter_map(|(identity, observation)| {
+                ((observation.writable_paths.len() as u64) < observation.link_count)
+                    .then_some(*identity)
+            })
+            .collect();
+        if candidates.is_empty() {
+            return Ok(());
+        }
+
+        for executable in &self.allow_exec {
+            if self
+                .ephemeral_write_exec
+                .iter()
+                .any(|root| executable.path.starts_with(root))
+            {
+                continue;
+            }
+            visit_regular_files(executable, &mut inspected, &mut |path, metadata| {
+                let identity = file_identity(metadata);
+                let Some(observation) = observations.get(&identity) else {
+                    return Ok(());
+                };
+                if !candidates.contains(&identity) {
+                    return Ok(());
+                }
+                let writable = observation
+                    .writable_paths
+                    .iter()
+                    .next()
+                    .expect("hard-link observation has a writable path");
+                Err(crate::error::CoreError::ProfileLint(format!(
+                    "persistent writable path '{}' and executable path '{}' are hard links to \
+                     the same file; remove the cross-boundary alias",
+                    writable.display(),
+                    path.display(),
+                )))
+            })?;
         }
         Ok(())
     }
@@ -699,6 +805,106 @@ impl SandboxProfile {
         });
         self.allow_exec.push(path);
     }
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &std::fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(unix)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the pre-launch invariant scan must inspect existing filesystem identities"
+)]
+fn visit_regular_files(
+    root: &SandboxPath,
+    inspected: &mut usize,
+    visitor: &mut dyn FnMut(&Path, &std::fs::Metadata) -> Result<(), crate::error::CoreError>,
+) -> Result<(), crate::error::CoreError> {
+    let metadata = match std::fs::symlink_metadata(&root.path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(crate::error::CoreError::ProfileLint(format!(
+                "cannot inspect sandbox path '{}' for hard-link aliases: {error}",
+                root.path.display()
+            )));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        let resolved = match std::fs::canonicalize(&root.path) {
+            Ok(resolved) => resolved,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(crate::error::CoreError::ProfileLint(format!(
+                    "cannot resolve sandbox path '{}' for hard-link aliases: {error}",
+                    root.path.display()
+                )));
+            }
+        };
+        return visit_regular_files(
+            &SandboxPath {
+                path: resolved,
+                kind: root.kind,
+            },
+            inspected,
+            visitor,
+        );
+    }
+    if metadata.is_file() {
+        return visitor(&root.path, &metadata);
+    }
+    if !metadata.is_dir() || root.kind != PathKind::Subpath {
+        return Ok(());
+    }
+
+    let mut pending = vec![root.path.clone()];
+    while let Some(directory) = pending.pop() {
+        let entries = std::fs::read_dir(&directory).map_err(|error| {
+            crate::error::CoreError::ProfileLint(format!(
+                "cannot inspect sandbox directory '{}' for hard-link aliases: {error}",
+                directory.display()
+            ))
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                crate::error::CoreError::ProfileLint(format!(
+                    "cannot enumerate sandbox directory '{}' for hard-link aliases: {error}",
+                    directory.display()
+                ))
+            })?;
+            *inspected = inspected.saturating_add(1);
+            if *inspected > MAX_WX_ALIAS_SCAN_ENTRIES {
+                return Err(crate::error::CoreError::ProfileLint(format!(
+                    "persistent W^X alias scan exceeds {MAX_WX_ALIAS_SCAN_ENTRIES} entries"
+                )));
+            }
+            let path = entry.path();
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(crate::error::CoreError::ProfileLint(format!(
+                        "cannot inspect sandbox path '{}' for hard-link aliases: {error}",
+                        path.display()
+                    )));
+                }
+            };
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            if metadata.is_dir() {
+                pending.push(path);
+            } else if metadata.is_file() {
+                visitor(&path, &metadata)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn record_paths(
@@ -1039,6 +1245,15 @@ mod tests {
             assert!(macos.profiles.contains_key(name), "macos missing {name}");
             assert!(linux.profiles.contains_key(name), "linux missing {name}");
         }
+        for (platform, defaults) in [("macos", &macos), ("linux", &linux)] {
+            assert!(
+                defaults.profiles["node"]
+                    .allow_write
+                    .iter()
+                    .any(|path| path == "$PWD/bun.lock"),
+                "{platform} Node profile missing bun.lock"
+            );
+        }
     }
 
     #[test]
@@ -1235,5 +1450,38 @@ mod tests {
         profile.allow_write = vec![SandboxPath::dir(mutable)];
         profile.allow_exec = vec![SandboxPath::dir(alias)];
         assert!(profile.validate_security_invariants().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous filesystem setup is isolated to this invariant unit test"
+    )]
+    fn test_should_reject_write_execute_overlap_through_hard_link_alias() {
+        let directory = tempfile::tempdir().unwrap();
+        let writable = directory.path().join("writable");
+        let executable = directory.path().join("executable");
+        std::fs::create_dir(&writable).unwrap();
+        std::fs::create_dir(&executable).unwrap();
+        let tool = executable.join("tool");
+        std::fs::write(&tool, "trusted tool").unwrap();
+        let alias = writable.join("tool-alias");
+        std::fs::hard_link(&tool, &alias).unwrap();
+
+        let mut profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Rust, directory.path(), directory.path());
+        profile.allow_write = vec![SandboxPath::dir(writable.clone())];
+        profile.allow_exec = vec![SandboxPath::dir(executable)];
+        let error = profile.validate_security_invariants().unwrap_err();
+        assert!(format!("{error}").contains("hard links"));
+
+        let internal_alias = writable.join("internal-alias");
+        std::fs::hard_link(&alias, internal_alias).unwrap();
+        profile.allow_exec.clear();
+        assert!(
+            profile.validate_security_invariants().is_ok(),
+            "hard links wholly contained in a non-executable writable tree are safe"
+        );
     }
 }

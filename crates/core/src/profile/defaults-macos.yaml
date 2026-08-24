@@ -139,6 +139,7 @@ profiles:
       - "$PWD/package-lock.json"
       - "$PWD/yarn.lock"
       - "$PWD/pnpm-lock.yaml"
+      - "$PWD/bun.lock"
       - "$PWD/.yarn/"
       - "$PWD/.pnp.cjs"
       - "$PWD/.pnp.loader.mjs"

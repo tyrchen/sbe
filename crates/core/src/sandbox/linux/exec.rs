@@ -249,7 +249,7 @@ fn launcher_main(policy_fd: RawFd) -> Result<ExitCode, CoreError> {
     profile.first_user_allow_exec = payload.first_user_allow_exec;
     profile.first_user_allow_read = payload.first_user_allow_read;
     profile.ephemeral_write_exec = payload.ephemeral_write_exec;
-    profile.validate_security_invariants()?;
+    profile.validate_structural_security_invariants()?;
 
     let live_probe = probe::run()?;
     enforce_network_capability(&profile, &live_probe, payload.options)?;

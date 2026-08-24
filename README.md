@@ -163,11 +163,13 @@ the private executable `CARGO_TARGET_DIR`.
 
 Node dependency installation keeps `node_modules` writable but non-executable.
 Commands that explicitly run already-installed tools, such as `npm test`,
-`npm exec`, and `npx`, switch the built-in dependency-tree grant to
-read/execute and remove its write grant for that invocation. Modern Yarn PnP
-installs pre-create `.pnp.cjs` (and the optional ESM loader when configured)
+`npm exec`, `npx`, and corresponding Yarn/pnpm/Bun forms, switch the built-in
+dependency-tree grant to read/execute and remove its write grant for that
+invocation. Modern Yarn PnP installs pre-create `.pnp.cjs` (and the optional
+ESM loader when configured)
 only when `.yarnrc.yml` or `packageManager` identifies a PnP-capable Yarn;
-Classic Yarn and the `node-modules` linker remain lockfile-only.
+Classic Yarn and the `node-modules` linker remain lockfile-only. Mutating Bun
+commands receive only their own `bun.lock` output.
 
 Python installation and synchronization commands similarly keep project
 `.venv`/`venv` directories writable but non-executable. Run/test commands,
@@ -242,7 +244,10 @@ are not writable; every invocation gets a canonical private root used for
 Persistent write and execute grants may not overlap. The only default W+X
 exception is the private per-run root, which is deleted when the invocation
 finishes. Toolchains such as `~/.rustup` are executable/readable but not
-writable. Mutable caches are readable/writable but not executable.
+writable. Mutable caches are readable/writable but not executable. Before
+launch, SBE also rejects regular files that cross this boundary through
+hard-linked writable and executable pathnames; hard links wholly contained in
+a non-executable writable tree remain valid.
 
 On Linux, paths are opened with descriptor-relative `openat2` resolution using
 `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and
