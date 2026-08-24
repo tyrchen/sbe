@@ -1,10 +1,12 @@
 use std::{
     collections::HashMap,
     fmt,
+    net::IpAddr,
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::{
     config::{SandboxPath, expand_path},
@@ -29,11 +31,47 @@ const DEFAULTS_YAML: &str = include_str!("defaults-macos.yaml");
 ///
 /// Supports exact match (`"registry.npmjs.org"`) and wildcard prefix
 /// (`"*.npmjs.org"` matches any subdomain).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DomainPattern(pub String);
 
 impl DomainPattern {
+    /// Parse and canonicalize an exact or `*.` wildcard DNS pattern.
+    pub fn new(raw: &str) -> Result<Self, String> {
+        let raw = raw.trim().trim_end_matches('.');
+        let (wildcard, name) = match raw.strip_prefix("*.") {
+            Some(name) => (true, name),
+            None => (false, raw),
+        };
+        if name.is_empty() || name.len() > 253 || name.contains(['/', ':', '\0']) {
+            return Err(format!("invalid domain pattern '{raw}'"));
+        }
+
+        let ascii = idna::domain_to_ascii(name)
+            .map_err(|_| format!("invalid IDNA domain pattern '{raw}'"))?
+            .to_ascii_lowercase();
+        if IpAddr::from_str(&ascii).is_ok() {
+            return Err(format!("IP literals are not domain patterns: '{raw}'"));
+        }
+        for label in ascii.split('.') {
+            if label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            {
+                return Err(format!("invalid DNS label in domain pattern '{raw}'"));
+            }
+        }
+
+        Ok(Self(if wildcard {
+            format!("*.{ascii}")
+        } else {
+            ascii
+        }))
+    }
+
     /// Check whether a given hostname matches this pattern.
     pub fn matches(&self, host: &str) -> bool {
         let pattern = &self.0;
@@ -53,7 +91,85 @@ impl fmt::Display for DomainPattern {
 
 impl From<&str> for DomainPattern {
     fn from(s: &str) -> Self {
-        Self(s.to_owned())
+        Self::new(s).expect("invalid built-in domain pattern")
+    }
+}
+
+impl Serialize for DomainPattern {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for DomainPattern {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::new(&raw).map_err(de::Error::custom)
+    }
+}
+
+/// Final, validated network behavior after all configuration is merged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NetworkMode {
+    /// No outbound or inbound network access.
+    DenyAll,
+    /// HTTPS is mediated by SBE's domain-filtering CONNECT proxy.
+    Proxy,
+    /// Compatibility mode: direct outbound TCP is limited to port 443 only.
+    DirectHttps443,
+    /// Network sandboxing is disabled by an explicit trusted choice.
+    AllowAll,
+}
+
+/// Provenance retained for every permission-bearing profile entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GrantOrigin {
+    BuiltIn,
+    Global(PathBuf),
+    Project(PathBuf),
+    Explicit(PathBuf),
+    Cli,
+    ParentEnvironment,
+    Runtime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GrantKind {
+    AllowWrite,
+    DenyRead,
+    AllowRead,
+    AllowDomain,
+    DenyExec,
+    AllowExec,
+    AllowFetch,
+    Environment,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GrantRecord {
+    pub kind: GrantKind,
+    pub value: String,
+    pub origin: GrantOrigin,
+}
+
+impl NetworkMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DenyAll => "denyAll",
+            Self::Proxy => "proxy",
+            Self::DirectHttps443 => "directHttps443Compatibility",
+            Self::AllowAll => "allowAll",
+        }
     }
 }
 
@@ -99,13 +215,21 @@ pub struct SandboxProfile {
     #[serde(default)]
     pub allow_exec: Vec<SandboxPath>,
 
-    /// Whether to enable the domain-filtering proxy.
-    #[serde(default = "default_true")]
+    /// Requested proxy setting retained while configuration is merged.
+    #[serde(skip)]
     pub enable_proxy: bool,
 
-    /// Whether to allow all network (disables proxy, allows all outbound).
-    #[serde(default)]
+    /// Requested allow-all setting retained while configuration is merged.
+    #[serde(skip)]
     pub allow_all_network: bool,
+
+    /// Validated effective network policy. Backends must switch exhaustively
+    /// on this field and must not infer a fallback from the legacy booleans.
+    pub network_mode: NetworkMode,
+
+    /// Highest-precedence source that selected or materially narrowed the
+    /// effective network policy.
+    pub network_origin: GrantOrigin,
 
     /// Domains that build scripts are allowed to fetch from.
     ///
@@ -118,9 +242,8 @@ pub struct SandboxProfile {
     #[serde(default)]
     pub env: HashMap<String, String>,
 
-    /// Proceed under a less-capable kernel even when a requested feature
-    /// (currently: Landlock ABI v4 net filter) is unavailable. See §13 D1
-    /// of the cross-platform backend design.
+    /// Legacy compatibility bit. It maps only to the explicit insecure Linux
+    /// network mode and never bypasses filesystem or policy lints.
     #[serde(default)]
     pub allow_degraded: bool,
 
@@ -136,10 +259,14 @@ pub struct SandboxProfile {
     pub first_user_allow_exec: usize,
     #[serde(skip)]
     pub first_user_allow_read: usize,
-}
 
-fn default_true() -> bool {
-    true
+    /// Per-run roots that may be both writable and executable because they
+    /// are mode-0700 and deleted when the invocation completes.
+    #[serde(skip)]
+    pub ephemeral_write_exec: Vec<PathBuf>,
+
+    /// Audit trail used by `inspect` and policy lints.
+    pub grant_origins: Vec<GrantRecord>,
 }
 
 impl SandboxProfile {
@@ -156,6 +283,7 @@ impl SandboxProfile {
             .unwrap_or_else(|| panic!("missing profile '{profile_name}' in defaults.yaml"));
 
         // Build allow_exec: common + ecosystem-specific
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut allow_exec: Vec<SandboxPath> = common
             .allow_exec
             .iter()
@@ -164,7 +292,7 @@ impl SandboxProfile {
             .collect();
 
         // Build deny_exec: from common (also resolve symlinks for deny rules
-        // on macOS — on Linux denyExec is a no-op so symlinks don't matter).
+        // on macOS, whose kernel evaluates the resolved executable path).
         #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut deny_exec: Vec<SandboxPath> = common
             .deny_exec
@@ -192,7 +320,7 @@ impl SandboxProfile {
         let allow_domains: Vec<DomainPattern> = eco_cfg
             .allow_domains
             .iter()
-            .map(|d| DomainPattern(d.clone()))
+            .map(|d| DomainPattern::new(d).expect("invalid built-in domain pattern"))
             .collect();
 
         // Node-specific: monorepos hoist node_modules and lock files to the
@@ -203,7 +331,6 @@ impl SandboxProfile {
             && let Some(git_root) = find_git_root(pwd)
             && git_root != pwd
         {
-            allow_exec.push(SandboxPath::dir(git_root.join("node_modules")));
             allow_write.push(SandboxPath::dir(git_root.join("node_modules")));
             allow_write.push(SandboxPath::file(git_root.join("package-lock.json")));
             allow_write.push(SandboxPath::file(git_root.join("yarn.lock")));
@@ -213,29 +340,10 @@ impl SandboxProfile {
             allow_write.push(SandboxPath::file(git_root.join(".pnp.loader.mjs")));
         }
 
-        // Rust-specific: resolve cargo target dir for write + exec.
-        // Cargo also creates atomic-rename temp dirs as siblings of target
-        // (e.g., ~/.targetXXXXXX), so we need a regex allow for those.
-        if ecosystem == Ecosystem::Rust {
-            if let Some(target_dir) = resolve_cargo_target_dir(home, pwd) {
-                allow_write.push(SandboxPath::dir(target_dir.clone()));
-                allow_exec.push(SandboxPath::dir(target_dir.clone()));
-                // Allow sibling temp dirs created by cargo for atomic rename
-                if let Some(target_str) = target_dir.to_str() {
-                    let pattern = format!("^{}[A-Za-z0-9]*$", regex_escape(target_str));
-                    allow_write.push(SandboxPath::regex(PathBuf::from(pattern)));
-                }
-            } else {
-                allow_exec.push(SandboxPath::dir(pwd.join("target")));
-            }
-        }
-
-        // Java-specific: allow JAVA_HOME
-        if ecosystem == Ecosystem::Java
-            && let Ok(java_home) = std::env::var("JAVA_HOME")
-        {
-            allow_exec.push(SandboxPath::dir(PathBuf::from(java_home)));
-        }
+        // Build output locations are selected by SBE-owned environment
+        // variables and limited to dedicated profile outputs or the private
+        // per-invocation tree. Project-controlled Cargo config and ambient
+        // JAVA_HOME therefore cannot create implicit grants here.
 
         // Resolve symlinks: SBPL on macOS checks the real path after kernel
         // symlink resolution, so /opt/homebrew/bin/zig (a symlink to
@@ -260,6 +368,56 @@ impl SandboxProfile {
         let first_user_allow_exec = allow_exec.len();
         let first_user_allow_read = allow_read.len();
 
+        let enable_proxy = eco_cfg.enable_proxy.unwrap_or(true);
+        let network_mode = if enable_proxy {
+            if allow_domains.is_empty() {
+                NetworkMode::DenyAll
+            } else {
+                NetworkMode::Proxy
+            }
+        } else {
+            NetworkMode::DirectHttps443
+        };
+
+        let mut grant_origins = Vec::new();
+        record_paths(
+            &mut grant_origins,
+            GrantKind::AllowWrite,
+            &allow_write,
+            GrantOrigin::BuiltIn,
+        );
+        record_paths(
+            &mut grant_origins,
+            GrantKind::DenyRead,
+            &deny_read,
+            GrantOrigin::BuiltIn,
+        );
+        record_paths(
+            &mut grant_origins,
+            GrantKind::AllowRead,
+            &allow_read,
+            GrantOrigin::BuiltIn,
+        );
+        record_paths(
+            &mut grant_origins,
+            GrantKind::DenyExec,
+            &deny_exec,
+            GrantOrigin::BuiltIn,
+        );
+        record_paths(
+            &mut grant_origins,
+            GrantKind::AllowExec,
+            &allow_exec,
+            GrantOrigin::BuiltIn,
+        );
+        for domain in &allow_domains {
+            grant_origins.push(GrantRecord {
+                kind: GrantKind::AllowDomain,
+                value: domain.0.clone(),
+                origin: GrantOrigin::BuiltIn,
+            });
+        }
+
         SandboxProfile {
             name: profile_name,
             allow_write,
@@ -268,31 +426,86 @@ impl SandboxProfile {
             allow_domains,
             deny_exec,
             allow_exec,
-            enable_proxy: eco_cfg.enable_proxy.unwrap_or(true),
+            enable_proxy,
             allow_all_network: false,
+            network_mode,
+            network_origin: GrantOrigin::BuiltIn,
             allow_fetch: vec![],
             env: Default::default(),
             allow_degraded: false,
             first_user_allow_write,
             first_user_allow_exec,
             first_user_allow_read,
+            ephemeral_write_exec: Vec::new(),
+            grant_origins,
         }
     }
 
     /// Merge CLI overrides into this profile.
     pub fn merge_overrides(&mut self, overrides: &ProfileOverrides) {
+        if !overrides.allow_domains.is_empty()
+            || !overrides.deny_domains.is_empty()
+            || !overrides.allow_fetch.is_empty()
+            || overrides.allow_all_network
+            || overrides.no_proxy
+        {
+            self.network_origin = GrantOrigin::Cli;
+        }
+        record_paths(
+            &mut self.grant_origins,
+            GrantKind::AllowWrite,
+            &overrides.allow_write,
+            GrantOrigin::Cli,
+        );
+        record_paths(
+            &mut self.grant_origins,
+            GrantKind::DenyRead,
+            &overrides.deny_read,
+            GrantOrigin::Cli,
+        );
+        record_paths(
+            &mut self.grant_origins,
+            GrantKind::AllowRead,
+            &overrides.allow_read,
+            GrantOrigin::Cli,
+        );
+        for domain in &overrides.allow_domains {
+            self.grant_origins.push(GrantRecord {
+                kind: GrantKind::AllowDomain,
+                value: domain.0.clone(),
+                origin: GrantOrigin::Cli,
+            });
+        }
+        for domain in &overrides.allow_fetch {
+            self.grant_origins.push(GrantRecord {
+                kind: GrantKind::AllowFetch,
+                value: domain.0.clone(),
+                origin: GrantOrigin::Cli,
+            });
+        }
         self.allow_write
             .extend(overrides.allow_write.iter().cloned());
         self.deny_read.extend(overrides.deny_read.iter().cloned());
         self.allow_read.extend(overrides.allow_read.iter().cloned());
         self.allow_domains
             .extend(overrides.allow_domains.iter().cloned());
-        self.deny_exec.extend(overrides.deny_exec.iter().cloned());
-        self.allow_exec.extend(overrides.allow_exec.iter().cloned());
+        for path in &overrides.deny_exec {
+            self.add_deny_exec(path.clone(), GrantOrigin::Cli);
+        }
+        for path in &overrides.allow_exec {
+            self.add_allow_exec(path.clone(), GrantOrigin::Cli);
+        }
 
         if !overrides.deny_domains.is_empty() {
             self.allow_domains
                 .retain(|d| !overrides.deny_domains.iter().any(|denied| denied.0 == d.0));
+            self.grant_origins.retain(|record| {
+                record.kind != GrantKind::AllowDomain
+                    || !overrides
+                        .deny_domains
+                        .iter()
+                        .any(|denied| denied.0 == record.value)
+            });
         }
 
         self.allow_fetch
@@ -300,7 +513,6 @@ impl SandboxProfile {
 
         if overrides.allow_all_network {
             self.allow_all_network = true;
-            self.enable_proxy = false;
         }
         if overrides.no_proxy {
             self.enable_proxy = false;
@@ -311,6 +523,11 @@ impl SandboxProfile {
 
         for (k, v) in &overrides.env {
             self.env.insert(k.clone(), v.clone());
+            self.grant_origins.push(GrantRecord {
+                kind: GrantKind::Environment,
+                value: k.clone(),
+                origin: GrantOrigin::Cli,
+            });
         }
     }
 
@@ -321,19 +538,174 @@ impl SandboxProfile {
         if !self.allow_fetch.is_empty() {
             let curl = SandboxPath::file(PathBuf::from("/usr/bin/curl"));
             let wget = SandboxPath::file(PathBuf::from("/usr/bin/wget"));
+            let fetch_origin = self
+                .grant_origins
+                .iter()
+                .rev()
+                .find(|record| record.kind == GrantKind::AllowFetch)
+                .map(|record| record.origin.clone())
+                .unwrap_or(GrantOrigin::Runtime);
             if !self.allow_exec.iter().any(|p| p.path == curl.path) {
+                self.grant_origins.push(GrantRecord {
+                    kind: GrantKind::AllowExec,
+                    value: curl.path.to_string_lossy().into_owned(),
+                    origin: fetch_origin.clone(),
+                });
                 self.allow_exec.push(curl);
             }
             if !self.allow_exec.iter().any(|p| p.path == wget.path) {
+                self.grant_origins.push(GrantRecord {
+                    kind: GrantKind::AllowExec,
+                    value: wget.path.to_string_lossy().into_owned(),
+                    origin: fetch_origin,
+                });
                 self.allow_exec.push(wget);
             }
 
             for domain in &self.allow_fetch {
                 if !self.allow_domains.iter().any(|d| d.0 == domain.0) {
                     self.allow_domains.push(domain.clone());
+                    let origin = self
+                        .grant_origins
+                        .iter()
+                        .rev()
+                        .find(|record| {
+                            record.kind == GrantKind::AllowFetch && record.value == domain.0
+                        })
+                        .map(|record| record.origin.clone())
+                        .unwrap_or(GrantOrigin::Runtime);
+                    self.grant_origins.push(GrantRecord {
+                        kind: GrantKind::AllowDomain,
+                        value: domain.0.clone(),
+                        origin,
+                    });
                 }
             }
         }
+
+        self.recompute_network_mode();
+    }
+
+    /// Recompute the effective mode without carrying stateful side effects
+    /// across configuration precedence boundaries.
+    pub fn recompute_network_mode(&mut self) {
+        self.network_mode = if self.allow_all_network {
+            NetworkMode::AllowAll
+        } else if self.enable_proxy {
+            if self.allow_domains.is_empty() {
+                NetworkMode::DenyAll
+            } else {
+                NetworkMode::Proxy
+            }
+        } else {
+            NetworkMode::DirectHttps443
+        };
+    }
+
+    /// Reject persistent write/execute overlap. Mutable executable content is
+    /// a persistence boundary, not merely a filesystem convenience.
+    pub fn validate_security_invariants(&self) -> Result<(), crate::error::CoreError> {
+        for write in &self.allow_write {
+            for execute in &self.allow_exec {
+                if paths_overlap(&write.path, &execute.path)
+                    && !self
+                        .ephemeral_write_exec
+                        .iter()
+                        .any(|root| write.path.starts_with(root) && execute.path.starts_with(root))
+                {
+                    return Err(crate::error::CoreError::ProfileLint(format!(
+                        "persistent path is both writable ('{}') and executable ('{}'); use a \
+                         private per-run output or split the grants",
+                        write.path.display(),
+                        execute.path.display()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply an execute denial at the current precedence level. Landlock has
+    /// no subtractive rule, so an overlapping allow entry is removed in full;
+    /// this can be stricter than the requested path but never weaker.
+    pub(crate) fn add_deny_exec(&mut self, path: SandboxPath, origin: GrantOrigin) {
+        let old_boundary = self.first_user_allow_exec;
+        let mut built_in_remaining = 0_usize;
+        let mut removed = Vec::new();
+        self.allow_exec = self
+            .allow_exec
+            .drain(..)
+            .enumerate()
+            .filter_map(|(index, allowed)| {
+                if paths_overlap(&allowed.path, &path.path) {
+                    removed.push(allowed.path.to_string_lossy().into_owned());
+                    None
+                } else {
+                    if index < old_boundary {
+                        built_in_remaining += 1;
+                    }
+                    Some(allowed)
+                }
+            })
+            .collect();
+        self.first_user_allow_exec = built_in_remaining;
+        self.grant_origins.retain(|record| {
+            record.kind != GrantKind::AllowExec || !removed.contains(&record.value)
+        });
+        self.grant_origins.push(GrantRecord {
+            kind: GrantKind::DenyExec,
+            value: path.path.to_string_lossy().into_owned(),
+            origin,
+        });
+        self.deny_exec.push(path);
+    }
+
+    /// Apply an execute grant at the current precedence level, removing an
+    /// earlier overlapping denial so trusted later sources can re-authorize.
+    pub(crate) fn add_allow_exec(&mut self, path: SandboxPath, origin: GrantOrigin) {
+        let mut removed = Vec::new();
+        self.deny_exec.retain(|denied| {
+            let overlaps = paths_overlap(&denied.path, &path.path);
+            if overlaps {
+                removed.push(denied.path.to_string_lossy().into_owned());
+            }
+            !overlaps
+        });
+        self.grant_origins.retain(|record| {
+            record.kind != GrantKind::DenyExec || !removed.contains(&record.value)
+        });
+        self.grant_origins.push(GrantRecord {
+            kind: GrantKind::AllowExec,
+            value: path.path.to_string_lossy().into_owned(),
+            origin,
+        });
+        self.allow_exec.push(path);
+    }
+}
+
+fn record_paths(
+    records: &mut Vec<GrantRecord>,
+    kind: GrantKind,
+    paths: &[SandboxPath],
+    origin: GrantOrigin,
+) {
+    records.extend(paths.iter().map(|path| GrantRecord {
+        kind,
+        value: path.path.to_string_lossy().into_owned(),
+        origin: origin.clone(),
+    }));
+}
+
+#[allow(clippy::disallowed_methods)] // Synchronous invariant used by both backends before spawn.
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    if left == right || left.starts_with(right) || right.starts_with(left) {
+        return true;
+    }
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => {
+            left == right || left.starts_with(&right) || right.starts_with(&left)
+        }
+        _ => false,
     }
 }
 
@@ -382,21 +754,6 @@ fn resolve_symlinks(paths: &mut Vec<SandboxPath>) {
         .filter(|resolved| !paths.iter().any(|p| p.path == resolved.path))
         .collect();
     paths.extend(additional);
-}
-
-/// Escape regex metacharacters in a literal string.
-fn regex_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if matches!(
-            c,
-            '.' | '\\' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$'
-        ) {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
 }
 
 /// Find the git root by walking up from `start`.
@@ -470,48 +827,6 @@ struct EcosystemDefaults {
     enable_proxy: Option<bool>,
 }
 
-// --- Rust-specific cargo target dir resolution ---
-
-/// Resolve the cargo target directory from environment or cargo config.
-fn resolve_cargo_target_dir(home: &Path, pwd: &Path) -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
-        return Some(PathBuf::from(dir));
-    }
-    if let Ok(dir) = std::env::var("CARGO_BUILD_TARGET_DIR") {
-        return Some(PathBuf::from(dir));
-    }
-    if let Some(dir) = read_target_dir_from_cargo_config(&pwd.join(".cargo/config.toml")) {
-        return Some(dir);
-    }
-    if let Some(dir) = read_target_dir_from_cargo_config(&home.join(".cargo/config.toml")) {
-        return Some(dir);
-    }
-    None
-}
-
-#[allow(clippy::disallowed_methods)]
-fn read_target_dir_from_cargo_config(path: &Path) -> Option<PathBuf> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let mut in_build_section = false;
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            in_build_section = trimmed == "[build]";
-            continue;
-        }
-        if in_build_section && let Some(value) = trimmed.strip_prefix("target-dir") {
-            let value = value.trim().strip_prefix('=')?.trim();
-            let value = value
-                .strip_prefix('"')
-                .and_then(|v| v.strip_suffix('"'))
-                .unwrap_or(value);
-            return Some(PathBuf::from(value));
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,6 +849,43 @@ mod tests {
     }
 
     #[test]
+    fn test_should_canonicalize_and_validate_domains() {
+        assert_eq!(
+            DomainPattern::new("BÜCHER.Example.").unwrap().0,
+            "xn--bcher-kva.example"
+        );
+        assert!(DomainPattern::new("127.0.0.1").is_err());
+        assert!(DomainPattern::new("bad..example").is_err());
+        assert!(DomainPattern::new("evil.com:443").is_err());
+    }
+
+    #[test]
+    fn test_should_reject_persistent_write_execute_overlap() {
+        let home = PathBuf::from("/home/test");
+        let pwd = PathBuf::from("/work/project");
+        let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, &home, &pwd);
+        profile
+            .allow_write
+            .push(SandboxPath::dir(home.join("mutable-tool")));
+        profile
+            .allow_exec
+            .push(SandboxPath::dir(home.join("mutable-tool/bin")));
+        assert!(profile.validate_security_invariants().is_err());
+    }
+
+    #[test]
+    fn test_should_allow_ephemeral_write_execute_overlap() {
+        let home = PathBuf::from("/home/test");
+        let pwd = PathBuf::from("/work/project");
+        let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, &home, &pwd);
+        let root = PathBuf::from("/tmp/sbe-test-private");
+        profile.allow_write.push(SandboxPath::dir(root.clone()));
+        profile.allow_exec.push(SandboxPath::dir(root.clone()));
+        profile.ephemeral_write_exec.push(root);
+        assert!(profile.validate_security_invariants().is_ok());
+    }
+
+    #[test]
     fn test_should_load_all_ecosystems_from_yaml() {
         let home = PathBuf::from("/Users/test");
         let pwd = PathBuf::from("/Users/test/project");
@@ -548,10 +900,77 @@ mod tests {
                 "no allow_domains for {eco}"
             );
             assert!(!profile.allow_exec.is_empty(), "no allow_exec for {eco}");
-            // denyExec is macOS-only — Linux Landlock is allowlist-only.
+            // Linux defaults need no subtractive entries because execution is
+            // allowlist-only; macOS keeps explicit defense-in-depth denials.
             #[cfg(target_os = "macos")]
             assert!(!profile.deny_exec.is_empty(), "no deny_exec for {eco}");
         }
+    }
+
+    #[test]
+    fn default_profiles_satisfy_persistent_write_xor_execute() {
+        let home = PathBuf::from("/Users/test");
+        let pwd = PathBuf::from("/Users/test/project");
+
+        for ecosystem in Ecosystem::ALL {
+            let profile = SandboxProfile::for_ecosystem(ecosystem, &home, &pwd);
+            profile
+                .validate_security_invariants()
+                .unwrap_or_else(|error| panic!("invalid default {ecosystem} profile: {error}"));
+        }
+    }
+
+    #[test]
+    fn network_mode_precedence_recomputes_without_stale_fallbacks() {
+        let home = PathBuf::from("/Users/test");
+        let pwd = PathBuf::from("/Users/test/project");
+        let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &pwd);
+
+        assert_eq!(profile.network_mode, NetworkMode::Proxy);
+        profile.allow_all_network = true;
+        profile.network_origin = GrantOrigin::Global(PathBuf::from("global.yaml"));
+        profile.recompute_network_mode();
+        assert_eq!(profile.network_mode, NetworkMode::AllowAll);
+
+        profile.allow_all_network = false;
+        profile.enable_proxy = false;
+        profile.recompute_network_mode();
+        assert_eq!(profile.network_mode, NetworkMode::DirectHttps443);
+
+        profile.enable_proxy = true;
+        profile.allow_domains.clear();
+        profile.recompute_network_mode();
+        assert_eq!(profile.network_mode, NetworkMode::DenyAll);
+
+        profile
+            .allow_domains
+            .push(DomainPattern::from("example.com"));
+        profile.network_origin = GrantOrigin::Cli;
+        profile.recompute_network_mode();
+        assert_eq!(profile.network_mode, NetworkMode::Proxy);
+        assert_eq!(profile.network_origin, GrantOrigin::Cli);
+    }
+
+    #[test]
+    fn later_execute_sources_revoke_and_can_explicitly_reauthorize() {
+        let home = PathBuf::from("/home/test");
+        let pwd = PathBuf::from("/work/project");
+        let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, &home, &pwd);
+        let git = SandboxPath::file(PathBuf::from("/usr/bin/git"));
+        assert!(profile.allow_exec.iter().any(|path| path.path == git.path));
+
+        profile.add_deny_exec(git.clone(), GrantOrigin::Project(pwd.join(".sbe.yaml")));
+        assert!(!profile.allow_exec.iter().any(|path| path.path == git.path));
+        assert!(profile.deny_exec.iter().any(|path| path.path == git.path));
+
+        profile.add_allow_exec(git.clone(), GrantOrigin::Cli);
+        assert!(profile.allow_exec.iter().any(|path| path.path == git.path));
+        assert!(!profile.deny_exec.iter().any(|path| path.path == git.path));
+        assert!(profile.grant_origins.iter().any(|record| {
+            record.kind == GrantKind::AllowExec
+                && record.value == "/usr/bin/git"
+                && record.origin == GrantOrigin::Cli
+        }));
     }
 
     /// Both YAML defaults files must deserialize through [`DefaultsFile`]
@@ -580,7 +999,11 @@ mod tests {
         let profile = SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &pwd);
 
         assert!(has(&profile.deny_read, "/Users/test/.ssh"));
-        assert!(has(&profile.allow_write, "/Users/test/project"));
+        assert!(has(
+            &profile.allow_write,
+            "/Users/test/project/node_modules"
+        ));
+        assert!(!has(&profile.allow_write, "/Users/test/project"));
         assert!(has(&profile.allow_write, "/Users/test/.npm"));
     }
 
@@ -676,5 +1099,20 @@ mod tests {
 
         assert_eq!(profile.allow_domains.len(), original_domain_count);
         assert!(has(&profile.allow_exec, "/usr/bin/curl"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_should_reject_write_execute_overlap_through_symlink_alias() {
+        let directory = tempfile::tempdir().unwrap();
+        let mutable = directory.path().join("mutable");
+        tokio::fs::create_dir(&mutable).await.unwrap();
+        let alias = directory.path().join("alias");
+        std::os::unix::fs::symlink(&mutable, &alias).unwrap();
+        let mut profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Rust, directory.path(), directory.path());
+        profile.allow_write = vec![SandboxPath::dir(mutable)];
+        profile.allow_exec = vec![SandboxPath::dir(alias)];
+        assert!(profile.validate_security_invariants().is_err());
     }
 }

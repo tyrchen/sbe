@@ -1,5 +1,9 @@
 # sbe — Implementation Plan
 
+> **Historical document.** This records the original implementation phases.
+> The current 0.4 security implementation is specified in
+> [Security Hardening Design](security-hardening-design.md).
+
 ## Phase 1: Core Sandbox (MVP)
 
 **Goal:** `sbe run -- npm install` works with filesystem + process sandboxing, no proxy yet.

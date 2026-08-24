@@ -1,9 +1,10 @@
 //! Compile a [`SandboxProfile`] into a Landlock [`Ruleset`].
 //!
-//! All path FDs that the kernel needs are opened in the **parent** here
-//! (§6 D2) and packaged in [`CompiledLandlock`]. The `pre_exec` closure
-//! issues only the `landlock_restrict_self` syscall — no allocation, no FD
-//! opens.
+//! All path FDs that the kernel needs are opened in SBE's single-threaded
+//! internal launcher and packaged in [`CompiledLandlock`]. No complex policy
+//! work occurs in the multithreaded parent's `pre_exec` closure.
+
+#![allow(unsafe_code)] // audited openat2/mkdirat descriptor traversal
 //!
 //! The compiler also enforces two backend-time lints required by §8:
 //! - `allow_exec` subpath entries that overlap privilege-escalation binaries (sudo, su, …) are
@@ -13,18 +14,23 @@
 
 use std::{
     collections::BTreeSet,
+    ffi::CString,
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::{ffi::OsStrExt, fs::MetadataExt},
+    },
     path::{Path, PathBuf},
 };
 
 use landlock::{
     ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath,
-    PathFd, Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr,
+    Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr,
 };
 
 use crate::{
     config::SandboxPath,
     error::CoreError,
-    profile::SandboxProfile,
+    profile::{NetworkMode, SandboxProfile},
     sandbox::{
         BackendOptions,
         linux::probe::{LandlockAbi, ProbeResult},
@@ -46,11 +52,12 @@ pub const READ_ALLOWLIST_ANCHORS: &[&str] = &[
     "/usr",
     "/proc",
     "/sys",
-    // Temp
-    "/tmp",
-    "/var/tmp",
-    // Devices we explicitly allow
-    "/dev",
+    // Named devices only; never expose the complete /dev tree.
+    "/dev/null",
+    "/dev/zero",
+    "/dev/random",
+    "/dev/urandom",
+    "/dev/tty",
     // systemd-resolved stub on Ubuntu/Debian/Fedora: /etc/resolv.conf is a
     // symlink to /run/systemd/resolve/stub-resolv.conf. Landlock follows
     // symlinks to the canonical path, so the resolver can't read the
@@ -70,12 +77,10 @@ pub const READ_ALLOWLIST_ANCHORS: &[&str] = &[
 
 /// Baseline writable paths injected into every Linux ruleset.
 ///
-/// Matches the macOS SBPL writer's `/private/tmp` / `/private/var/folders`
-/// injection: build toolchains (cc, ld, cargo) need to drop temp files in
-/// `/tmp` or `/var/tmp`, and a sandbox that allows execution but not
-/// temp-file creation breaks almost every compiler. `/dev/null` and
-/// `/dev/zero` are routinely targeted by `Stdio::null()` in build scripts.
-const BASELINE_WRITE_PATHS: &[&str] = &["/tmp", "/var/tmp", "/dev/null", "/dev/zero", "/dev/shm"];
+/// Named device files required by ordinary command-line programs. Temporary
+/// storage is supplied by the private per-invocation path in the profile.
+const BASELINE_WRITE_PATHS: &[&str] = &["/dev/null", "/dev/zero"];
+const MAX_CARVED_READ_ENTRIES: usize = 100_000;
 
 /// Privilege-escalation binaries that must never appear under an
 /// `allow_exec` subpath. The lint refuses to build the ruleset if a
@@ -122,27 +127,44 @@ const PRIVILEGE_ESCALATION_BINARIES: &[&str] = &[
     "/usr/bin/fusermount3",
 ];
 
-/// FS read access flags applied to the curated read allowlist.
-fn read_access(abi: ABI) -> BitFlags<AccessFs> {
-    AccessFs::from_read(abi)
+/// Data-only read rights. `AccessFs::from_read()` also contains `Execute`,
+/// which would silently turn broad read anchors such as `/usr` into broad
+/// executable grants and defeat the explicit exec allowlist.
+fn read_access(_abi: ABI) -> BitFlags<AccessFs> {
+    BitFlags::from(AccessFs::ReadFile) | AccessFs::ReadDir
+}
+
+fn read_directory_access(_abi: ABI) -> BitFlags<AccessFs> {
+    BitFlags::from(AccessFs::ReadDir)
 }
 
 /// FS write access flags applied to `allow_write`.
 fn write_access(abi: ABI) -> BitFlags<AccessFs> {
-    // From_all includes read+write+exec+make_*+ioctl_dev+truncate; sufficient
-    // for an unrestricted "this directory tree is owned by the build" rule.
-    AccessFs::from_all(abi)
+    // `from_write()` also includes device ioctl from ABI v5 and Unix-socket
+    // resolution from ABI v9. Neither is ordinary file mutation authority:
+    // ioctl could operate on a granted device and ResolveUnix could connect
+    // to a pre-existing local service in a persistent writable tree.
+    let mut access = AccessFs::from_write(abi);
+    access.remove(AccessFs::IoctlDev | AccessFs::ResolveUnix);
+    access
+}
+
+/// Per-run private roots additionally support Unix-domain sockets used by
+/// compilers and build coordinators. The root is mode 0700 and deleted after
+/// the invocation, so it cannot name an ambient or persistent local service.
+fn ephemeral_write_access(abi: ABI) -> BitFlags<AccessFs> {
+    write_access(abi) | (AccessFs::from_all(abi) & AccessFs::ResolveUnix)
 }
 
 /// FS execute access flags applied to `allow_exec`.
 fn exec_access(abi: ABI) -> BitFlags<AccessFs> {
-    BitFlags::from(AccessFs::Execute) | AccessFs::from_read(abi)
+    BitFlags::from(AccessFs::Execute) | read_access(abi)
 }
 
 fn highest_abi(probe: &ProbeResult) -> ABI {
-    // Land on the highest ABI the running kernel actually supports; the
-    // `landlock` crate uses CompatLevel::BestEffort below to silently elide
-    // bits the kernel doesn't recognise.
+    // Land on the highest ABI the running kernel actually supports. The
+    // ruleset uses HardRequirement below, so promised rights cannot be
+    // silently elided.
     match probe.abi {
         LandlockAbi::Unsupported => ABI::V1,
         LandlockAbi::V1 => ABI::V1,
@@ -151,11 +173,14 @@ fn highest_abi(probe: &ProbeResult) -> ABI {
         LandlockAbi::V4 => ABI::V4,
         LandlockAbi::V5 => ABI::V5,
         LandlockAbi::V6 => ABI::V6,
+        LandlockAbi::V7 => ABI::V7,
+        LandlockAbi::V8 => ABI::V8,
+        LandlockAbi::V9 => ABI::V9,
     }
 }
 
-/// A ready-to-apply Landlock ruleset. Built in the parent; the wrapped
-/// [`RulesetCreated`] holds all preopened path FDs internally.
+/// A ready-to-apply Landlock ruleset. Built in the single-threaded launcher;
+/// the wrapped [`RulesetCreated`] holds all preopened path FDs internally.
 pub struct CompiledLandlock {
     /// `restrict_self` consumes this in the child.
     pub ruleset: RulesetCreated,
@@ -175,23 +200,6 @@ pub fn compile(
     probe: &ProbeResult,
     options: BackendOptions,
 ) -> Result<CompiledLandlock, CoreError> {
-    if options.allow_degraded {
-        // §13 D1: --allow-degraded is a single flag that bypasses
-        // *three* unrelated checks (priv-esc subpath lint, denyRead
-        // forbidden-list seal, ABI-v4 net-filter gate). Surface every
-        // bypass explicitly so users can't accidentally lose unrelated
-        // defenses while reaching for the flag to fix a kernel-version
-        // problem.
-        tracing::warn!(
-            "--allow-degraded ACTIVE: the following Linux sandbox checks are DISABLED for this \
-             run: (1) privilege-escalation subpath lint (allowExec subpaths can include \
-             sudo/su/pkexec/etc.); (2) denyRead forbidden-list seal \
-             (allowRead/allowWrite/allowExec may overlap denyRead paths); (3) \
-             refuse-on-missing-Landlock-ABI-v4 (kernel may run without per-port TCP filter). \
-             Re-run without --allow-degraded for full enforcement."
-        );
-    }
-
     // 1. Lints.
     lint_allow_exec_for_priv_escalation(profile, options)?;
     let forbidden_reads = build_forbidden_reads(profile)?;
@@ -199,65 +207,62 @@ pub fn compile(
 
     let abi = highest_abi(probe);
     let ruleset = Ruleset::default()
-        .set_compatibility(CompatLevel::BestEffort)
+        .set_compatibility(CompatLevel::HardRequirement)
         .handle_access(AccessFs::from_all(abi))?;
-    let ruleset = if probe.abi.supports_net_port_filter() && !profile.allow_all_network {
-        ruleset.handle_access(AccessNet::ConnectTcp)?
-    } else {
-        ruleset
-    };
+    let ruleset =
+        if probe.abi.supports_net_port_filter() && profile.network_mode != NetworkMode::AllowAll {
+            ruleset.handle_access(AccessNet::ConnectTcp | AccessNet::BindTcp)?
+        } else {
+            ruleset
+        };
 
-    // `no_new_privs(false)` here because the pre_exec closure issues the
-    // prctl explicitly. Calling it twice is harmless but contradicts the §6
-    // invariant that the closure performs exactly the documented syscalls.
+    // `no_new_privs(false)` here because the single-threaded launcher issues
+    // the prctl explicitly immediately before installing the compiled rules.
     let mut created = ruleset.create()?.no_new_privs(false);
 
-    // Read allowlist. Per-entry symlink policy via `symlink_policy_for`:
-    // root-owned system paths can be symlinks (usr-merge), user paths
-    // cannot (TOCTOU attack vector).
+    // Every rule is opened atomically without following user-controlled
+    // symlinks. Root-owned distro symlinks are resolved only after verifying
+    // every lexical and canonical ancestor.
     let baseline_reads: Vec<PathBuf> = READ_ALLOWLIST_ANCHORS.iter().map(PathBuf::from).collect();
+    let mut carved_entries = 0_usize;
     for path in &baseline_reads {
-        let policy = symlink_policy_for(path);
-        created = add_path_rules(
+        let sandbox_path = if path.is_dir() {
+            SandboxPath::dir(path.clone())
+        } else {
+            SandboxPath::file(path.clone())
+        };
+        created = add_read_rule(
             created,
-            std::slice::from_ref(path),
-            read_access(abi),
-            policy,
+            &sandbox_path,
+            &forbidden_reads,
+            abi,
+            &mut carved_entries,
         )?;
     }
     for sp in &profile.allow_read {
-        let policy = symlink_policy_for(&sp.path);
-        created = add_path_rules(
-            created,
-            std::slice::from_ref(&sp.path),
-            read_access(abi),
-            policy,
-        )?;
+        created = add_read_rule(created, sp, &forbidden_reads, abi, &mut carved_entries)?;
     }
 
-    // Write allowlist: ensure each writable directory exists before opening
-    // an FD — Landlock can't grant a rule on a non-existent path, and
-    // tools like npm/cargo expect their cache dirs to be writable
-    // even on first invocation. chmod 0700 keeps $HOME caches private.
-    let user_writes: Vec<PathBuf> = profile
-        .allow_write
-        .iter()
-        .map(|sp| sp.path.clone())
-        .collect();
-    let baseline_writes: Vec<PathBuf> = BASELINE_WRITE_PATHS.iter().map(PathBuf::from).collect();
-    let all_writes: Vec<PathBuf> = user_writes
-        .iter()
-        .chain(baseline_writes.iter())
-        .cloned()
-        .collect();
-    ensure_writable_dirs(&all_writes);
-    for path in &all_writes {
-        let policy = symlink_policy_for(path);
-        created = add_path_rules(
+    for sp in &profile.allow_write {
+        let access = if profile
+            .ephemeral_write_exec
+            .iter()
+            .any(|root| sp.path.starts_with(root))
+        {
+            ephemeral_write_access(abi)
+        } else {
+            write_access(abi)
+        };
+        created = add_write_rule(created, sp, access)?;
+        // Mutable caches and outputs must be readable to be useful, but they
+        // remain non-executable. The forbidden-read lint rejects overlaps.
+        created = add_path_rules(created, std::slice::from_ref(&sp.path), read_access(abi))?;
+    }
+    for path in BASELINE_WRITE_PATHS {
+        created = add_write_rule(
             created,
-            std::slice::from_ref(path),
+            &SandboxPath::file(PathBuf::from(path)),
             write_access(abi),
-            policy,
         )?;
     }
 
@@ -268,170 +273,340 @@ pub fn compile(
     // entries like ~/.cargo/bin/, ~/.nvm/) because a hostile earlier
     // build can plant a symlink there.
     for sp in &profile.allow_exec {
-        let policy = symlink_policy_for(&sp.path);
-        created = add_path_rules(
-            created,
-            std::slice::from_ref(&sp.path),
-            exec_access(abi),
-            policy,
-        )?;
+        created = add_path_rules(created, std::slice::from_ref(&sp.path), exec_access(abi))?;
     }
 
     // Net rules — only on v4+. Loopback (proxy) or :443 fallback.
-    if probe.abi.supports_net_port_filter() && !profile.allow_all_network {
-        if let Some(port) = proxy_port {
-            created = created.add_rule(NetPort::new(port, AccessNet::ConnectTcp))?;
-        } else if !profile.enable_proxy {
-            created = created.add_rule(NetPort::new(443, AccessNet::ConnectTcp))?;
+    if probe.abi.supports_net_port_filter() {
+        match profile.network_mode {
+            NetworkMode::Proxy => {
+                let port = proxy_port.ok_or_else(|| {
+                    CoreError::Backend("proxy network mode has no live proxy port".to_owned())
+                })?;
+                created = created.add_rule(NetPort::new(port, AccessNet::ConnectTcp))?;
+            }
+            NetworkMode::DirectHttps443 => {
+                created = created.add_rule(NetPort::new(443, AccessNet::ConnectTcp))?;
+            }
+            NetworkMode::DenyAll | NetworkMode::AllowAll => {}
         }
     }
 
     Ok(CompiledLandlock { ruleset: created })
 }
 
-/// Per-call policy for symlinked allowlist entries. Baseline anchors
-/// (`/lib`, `/usr/bin`, `/tmp`, …) are symlinks on usr-merge distros and
-/// sbe ships the canonical strings — they're trusted to point where
-/// they appear to point. User-derived entries (per-ecosystem additions
-/// plus `.sbe.yaml` overrides plus CLI flags) are untrusted: an earlier
-/// hostile build can plant `~/.npm → ~/.ssh` to redirect the next
-/// Landlock grant.
-#[derive(Debug, Clone, Copy)]
-enum SymlinkPolicy {
-    /// Trust the symlink (used for baseline anchors only).
-    Follow,
-    /// Refuse with a ProfileLint error.
-    Refuse,
+/// Add a read subtree while preserving holes for built-in `denyRead` paths.
+/// Landlock cannot subtract a child rule from a parent grant, so a subtree
+/// containing a denied descendant is represented as ReadDir-only ancestors
+/// plus data-read rules for each safe sibling inode.
+fn add_read_rule(
+    created: RulesetCreated,
+    path: &SandboxPath,
+    forbidden: &BTreeSet<PathBuf>,
+    abi: ABI,
+    visited: &mut usize,
+) -> Result<RulesetCreated, CoreError> {
+    use crate::config::PathKind;
+
+    if forbidden
+        .iter()
+        .any(|denied| path_is_under(&path.path, denied))
+    {
+        return Ok(created);
+    }
+    let has_denied_descendant = forbidden
+        .iter()
+        .any(|denied| denied != &path.path && path_is_under(denied, &path.path));
+    if !has_denied_descendant {
+        return add_path_rules(created, std::slice::from_ref(&path.path), read_access(abi));
+    }
+    if !matches!(path.kind, PathKind::Subpath) {
+        return Err(CoreError::ProfileLint(format!(
+            "literal read grant '{}' contains a denied descendant",
+            path.path.display()
+        )));
+    }
+    let Some(fd) = open_existing_safely(&path.path)? else {
+        return Ok(created);
+    };
+    add_carved_read_directory(created, fd, &path.path, forbidden, abi, visited)
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the policy compiler runs synchronously in the pre-runtime Linux launcher"
+)]
+fn add_carved_read_directory(
+    mut created: RulesetCreated,
+    directory: OwnedFd,
+    logical_path: &Path,
+    forbidden: &BTreeSet<PathBuf>,
+    abi: ABI,
+    visited: &mut usize,
+) -> Result<RulesetCreated, CoreError> {
+    let proc_path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(&proc_path).map_err(CoreError::Io)? {
+        let entry = entry.map_err(CoreError::Io)?;
+        *visited = visited.saturating_add(1);
+        if *visited > MAX_CARVED_READ_ENTRIES {
+            return Err(CoreError::ProfileLint(format!(
+                "read policy under '{}' exceeds {MAX_CARVED_READ_ENTRIES} entries",
+                logical_path.display()
+            )));
+        }
+        entries.push(entry.file_name());
+    }
+
+    // Preserve directory traversal/listing without granting ReadFile to all
+    // descendants. A duplicate keeps the original FD available for openat2.
+    created = created.add_rule(PathBeneath::new(
+        duplicate_fd(directory.as_raw_fd())?,
+        read_directory_access(abi),
+    ))?;
+
+    for name in entries {
+        let child_path = logical_path.join(&name);
+        if forbidden
+            .iter()
+            .any(|denied| path_is_under(&child_path, denied))
+        {
+            continue;
+        }
+        let nested_hole = forbidden
+            .iter()
+            .any(|denied| denied != &child_path && path_is_under(denied, &child_path));
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            CoreError::ProfileLint(format!(
+                "sandbox path contains NUL below '{}'",
+                logical_path.display()
+            ))
+        })?;
+        let child = match openat2_component(directory.as_raw_fd(), &name, nested_hole) {
+            Ok(child) => child,
+            // Symlinks receive no grant of their own. If their target is an
+            // already-authorized safe inode, normal resolution still works;
+            // otherwise access remains denied.
+            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(CoreError::Io(error)),
+        };
+        if nested_hole {
+            created =
+                add_carved_read_directory(created, child, &child_path, forbidden, abi, visited)?;
+        } else {
+            created = created.add_rule(PathBeneath::new(child, read_access(abi)))?;
+        }
+    }
+    Ok(created)
+}
+
+fn duplicate_fd(fd: libc::c_int) -> Result<OwnedFd, CoreError> {
+    let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+    if duplicated < 0 {
+        return Err(CoreError::Io(std::io::Error::last_os_error()));
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
 }
 
 fn add_path_rules(
     mut created: RulesetCreated,
     paths: &[PathBuf],
     access: BitFlags<AccessFs>,
-    policy: SymlinkPolicy,
 ) -> Result<RulesetCreated, CoreError> {
     for path in paths {
-        if matches!(policy, SymlinkPolicy::Refuse) && is_symlink(path) {
-            return Err(CoreError::ProfileLint(format!(
-                "Landlock allowlist entry '{}' is a symlink. Refusing to open it — a symlink lets \
-                 an attacker redirect the grant onto a target of their choosing. Replace the \
-                 entry with the canonical target path or remove the symlink before re-running sbe.",
-                path.display(),
-            )));
+        if let Some(fd) = open_existing_safely(path)? {
+            created = created.add_rule(PathBeneath::new(fd, access))?;
         }
-
-        // Skip paths that don't exist on the host: Landlock requires open()
-        // on the path, and OpenAt failures here would otherwise abort the
-        // whole sandbox. We log via tracing for diagnostics.
-        let fd = match PathFd::new(path) {
-            Ok(fd) => fd,
-            Err(e) => {
-                tracing::debug!(path = %path.display(), error = %e, "skipping missing landlock path");
-                continue;
-            }
-        };
-        created = created.add_rule(PathBeneath::new(fd, access))?;
     }
     Ok(created)
 }
 
-#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
-fn is_symlink(p: &Path) -> bool {
-    std::fs::symlink_metadata(p)
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false)
-}
-
-/// Hardcoded list of root-owned filesystem roots where symlinks are
-/// considered safe — only root can modify these on a stock Linux box, so
-/// a path under here being a symlink reflects distro layout (usr-merge,
-/// /bin → /usr/bin, /lib → /usr/lib, /sbin → /usr/sbin), not an attack.
-///
-/// Any path NOT under one of these prefixes is assumed user-writable
-/// (notably $HOME-relative paths from ecosystem defaults like
-/// ~/.cargo/bin/) and gets [`SymlinkPolicy::Refuse`].
-const ROOT_TRUSTED_PREFIXES: &[&str] = &[
-    "/bin",
-    "/sbin",
-    "/lib",
-    "/lib32",
-    "/lib64",
-    "/usr",
-    "/etc",
-    "/proc",
-    "/sys",
-    "/dev",
-    "/tmp",
-    "/var/tmp",
-    "/var/log",
-    "/var/cache",
-    "/var/lib",
-    "/var/run",
-    "/run",
-    "/opt",
-    "/boot",
-    "/srv",
-];
-
-fn symlink_policy_for(p: &Path) -> SymlinkPolicy {
-    if ROOT_TRUSTED_PREFIXES
-        .iter()
-        .any(|root| p == Path::new(root) || p.starts_with(root))
-    {
-        SymlinkPolicy::Follow
+fn add_write_rule(
+    mut created: RulesetCreated,
+    path: &SandboxPath,
+    access: BitFlags<AccessFs>,
+) -> Result<RulesetCreated, CoreError> {
+    use crate::config::PathKind;
+    let fd = match path.kind {
+        PathKind::Subpath => Some(open_or_create_directory(&path.path)?),
+        PathKind::Literal => open_existing_safely(&path.path)?,
+        PathKind::Regex => {
+            return Err(CoreError::ProfileLint(format!(
+                "regex write grants are not safely enforceable on Linux: '{}'",
+                path.path.display()
+            )));
+        }
+    };
+    if let Some(fd) = fd {
+        created = created.add_rule(PathBeneath::new(fd, access))?;
     } else {
-        SymlinkPolicy::Refuse
+        tracing::debug!(
+            path = %path.path.display(),
+            "literal write target does not exist; refusing to broaden its parent"
+        );
+    }
+    Ok(created)
+}
+
+/// Open an existing path with no symlink or magic-link traversal. A distro
+/// symlink is accepted only if every original and canonical ancestor is
+/// root-owned and not group/world writable.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the policy compiler runs synchronously in the pre-runtime Linux launcher"
+)]
+fn open_existing_safely(path: &Path) -> Result<Option<OwnedFd>, CoreError> {
+    match open_no_symlinks(path, false) {
+        Ok(fd) => Ok(Some(fd)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            if !root_owned_chain(path) {
+                return Err(CoreError::ProfileLint(format!(
+                    "allowlist path '{}' traverses an untrusted symlink",
+                    path.display()
+                )));
+            }
+            let canonical = std::fs::canonicalize(path).map_err(CoreError::Io)?;
+            if !root_owned_chain(&canonical) {
+                return Err(CoreError::ProfileLint(format!(
+                    "allowlist path '{}' resolves outside a root-owned immutable tree",
+                    path.display()
+                )));
+            }
+            open_no_symlinks(&canonical, false)
+                .map(Some)
+                .map_err(CoreError::Io)
+        }
+        Err(error) => Err(CoreError::Io(error)),
     }
 }
 
-/// Create any missing directories from `allow_write` so Landlock can open
-/// an FD on each one. We mode-0700 directories under $HOME to protect
-/// secrets; paths outside $HOME (e.g. `/tmp`, `/var/tmp`) are left alone.
-///
-/// Crucial: we use [`std::fs::symlink_metadata`] (does NOT follow
-/// symlinks) rather than `Path::exists` (DOES follow) so a pre-existing
-/// symlink like `~/.npm → ~/.ssh` doesn't make us conclude "already
-/// there" and silently grant Landlock write on the link target later.
-/// If the entry itself is a symlink, we leave it alone — `add_path_rules`
-/// will refuse to open it and the build aborts.
-#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
-fn ensure_writable_dirs(paths: &[PathBuf]) {
-    use std::os::unix::fs::PermissionsExt;
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    for p in paths {
-        // If a real dir already exists at this path, nothing to do.
-        // If a symlink exists, do NOT mkdir into it — add_path_rules will
-        // reject it.
-        match std::fs::symlink_metadata(p) {
-            Ok(m) if m.file_type().is_symlink() => {
-                tracing::warn!(
-                    path = %p.display(),
-                    "allow_write entry is a symlink; refusing to materialize. add_path_rules \
-                     will reject this entry."
-                );
-                continue;
+/// Atomically walk and create a writable directory using directory FDs. No
+/// component may be a symlink, so a concurrent rename cannot redirect the
+/// grant outside the requested path.
+fn open_or_create_directory(path: &Path) -> Result<OwnedFd, CoreError> {
+    if !path.is_absolute() {
+        return Err(CoreError::ProfileLint(format!(
+            "sandbox path must be absolute: '{}'",
+            path.display()
+        )));
+    }
+    let mut current = open_root().map_err(CoreError::Io)?;
+    for component in path.components() {
+        use std::path::Component;
+        let name = match component {
+            Component::RootDir => continue,
+            Component::Normal(name) => name,
+            _ => {
+                return Err(CoreError::ProfileLint(format!(
+                    "sandbox path contains traversal: '{}'",
+                    path.display()
+                )));
             }
-            Ok(_) => continue, // real file or dir already exists
-            Err(_) => { /* doesn't exist — fall through to mkdir */ }
-        }
+        };
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            CoreError::ProfileLint(format!("sandbox path contains NUL: '{}'", path.display()))
+        })?;
+        let next = match openat2_component(current.as_raw_fd(), &name, true) {
+            Ok(fd) => fd,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let rc = unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), 0o700) };
+                if rc != 0 {
+                    let mkdir_error = std::io::Error::last_os_error();
+                    if mkdir_error.kind() != std::io::ErrorKind::AlreadyExists {
+                        return Err(CoreError::Io(mkdir_error));
+                    }
+                }
+                openat2_component(current.as_raw_fd(), &name, true).map_err(CoreError::Io)?
+            }
+            Err(error) => return Err(CoreError::Io(error)),
+        };
+        current = next;
+    }
+    Ok(current)
+}
 
-        // Best-effort recursive create. If any ancestor is a symlink the
-        // create can land on an attacker-chosen target — we accept that
-        // for the mkdir step but add_path_rules's PathFd::new will still
-        // follow the symlink at open time, so the rule itself is what we
-        // gate via is_symlink() at the entry level.
-        let _ = std::fs::create_dir_all(p);
-        if let Some(h) = home.as_ref()
-            && p.starts_with(h)
-            && let Ok(meta) = std::fs::symlink_metadata(p)
-            && !meta.file_type().is_symlink()
-            && meta.file_type().is_dir()
-        {
-            let mut perms = meta.permissions();
-            perms.set_mode(0o700);
-            let _ = std::fs::set_permissions(p, perms);
+fn open_no_symlinks(path: &Path, directory: bool) -> std::io::Result<OwnedFd> {
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path is not absolute",
+        ));
+    }
+    if path == Path::new("/") {
+        return open_root();
+    }
+    let relative = path.strip_prefix("/").expect("absolute path has root");
+    let relative = CString::new(relative.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let root = open_root()?;
+    openat2_component(root.as_raw_fd(), &relative, directory)
+}
+
+fn open_root() -> std::io::Result<OwnedFd> {
+    let root = c"/";
+    let fd = unsafe { libc::open(root.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+}
+
+fn openat2_component(
+    directory_fd: libc::c_int,
+    path: &CString,
+    directory: bool,
+) -> std::io::Result<OwnedFd> {
+    let mut flags = (libc::O_PATH | libc::O_CLOEXEC) as u64;
+    if directory {
+        flags |= libc::O_DIRECTORY as u64;
+    }
+    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+    how.flags = flags;
+    how.mode = 0;
+    how.resolve = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS;
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            directory_fd,
+            path.as_ptr(),
+            &how,
+            std::mem::size_of::<libc::open_how>(),
+        ) as libc::c_int
+    };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the policy compiler runs synchronously in the pre-runtime Linux launcher"
+)]
+fn root_owned_chain(path: &Path) -> bool {
+    let mut current = PathBuf::from("/");
+    for component in path.components() {
+        use std::path::Component;
+        match component {
+            Component::RootDir => continue,
+            Component::Normal(name) => current.push(name),
+            _ => return false,
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(&current) else {
+            return false;
+        };
+        if metadata.uid() != 0 {
+            return false;
+        }
+        if !metadata.file_type().is_symlink() && metadata.mode() & 0o022 != 0 {
+            return false;
         }
     }
+    true
 }
 
 fn build_forbidden_reads(profile: &SandboxProfile) -> Result<BTreeSet<PathBuf>, CoreError> {
@@ -443,28 +618,22 @@ fn build_forbidden_reads(profile: &SandboxProfile) -> Result<BTreeSet<PathBuf>, 
 }
 
 /// Reject any **user-supplied** `allow_write` / `allow_exec` / `allow_read`
-/// entry that overlaps a `denyRead` path. Landlock grants on write_access
-/// ([`AccessFs::from_all`]) and exec_access
-/// ([`AccessFs::Execute`] | [`AccessFs::from_read`]) **both imply read**,
-/// so without this lint a user who writes
+/// entry that overlaps a `denyRead` path. Mutable paths receive explicit
+/// data-read rights and executable paths receive data-read plus Execute, so
+/// without this lint a user who writes
 ///   profiles.node.allowWrite: ["~/"]
 /// would silently broaden read access onto every denyRead path under `~/`.
 ///
 /// The lint only inspects entries appended *after* the curated defaults
 /// (indices `>= first_user_*`). Built-in defaults intentionally overlap
-/// denyRead in places where Landlock cannot enforce the denial (e.g.
-/// `$PWD/` grants write+read, but `$PWD/.env` is in denyRead so SBPL on
-/// macOS can subtract it). Linting the defaults would block every
-/// project; the documented gap is in README's
-/// "What sbe Does *Not* Protect Against".
+/// denyRead in places such as `$PWD/.env`; those built-in read roots are
+/// compiled as carved descriptor rules instead of a broad parent grant.
 fn lint_forbidden_reads_against_grants(
     profile: &SandboxProfile,
     forbidden: &BTreeSet<PathBuf>,
     options: BackendOptions,
 ) -> Result<(), CoreError> {
-    if options.allow_degraded {
-        return Ok(());
-    }
+    let _ = options;
     let user_slices: [(&str, &[SandboxPath]); 3] = [
         (
             "allowWrite",
@@ -485,9 +654,9 @@ fn lint_forbidden_reads_against_grants(
                 if path_is_under(f, &sp.path) {
                     return Err(CoreError::ProfileLint(format!(
                         "denyRead path '{}' is under user-supplied {} entry '{}'. Landlock grants \
-                         on allowWrite and allowExec also imply read, so this would silently \
+                         on allowWrite and allowExec include data-read, so this would silently \
                          expose the denied path. Either narrow the {} entry, remove the denyRead \
-                         entry, or pass --allow-degraded if you understand the threat model.",
+                         entry.",
                         f.display(),
                         field,
                         sp.path.display(),
@@ -504,9 +673,7 @@ fn lint_allow_exec_for_priv_escalation(
     profile: &SandboxProfile,
     options: BackendOptions,
 ) -> Result<(), CoreError> {
-    if options.allow_degraded {
-        return Ok(());
-    }
+    let _ = options;
 
     for sp in &profile.allow_exec {
         if !is_subpath(sp) {
@@ -517,8 +684,8 @@ fn lint_allow_exec_for_priv_escalation(
             if path_is_under(bin_path, &sp.path) {
                 return Err(CoreError::ProfileLint(format!(
                     "allowExec entry '{}' (directory) covers privilege-escalation binary '{}'. \
-                     This would defeat the threat model. Replace with explicit per-binary entries \
-                     or pass --allow-degraded if you know what you are doing.",
+                     This would defeat the threat model. Replace it with explicit per-binary \
+                     entries.",
                     sp.path.display(),
                     binary,
                 )));
@@ -572,6 +739,26 @@ mod tests {
     };
 
     #[test]
+    fn data_read_grants_never_include_execute() {
+        let access = read_access(ABI::V9);
+        assert!(access.contains(AccessFs::ReadFile));
+        assert!(access.contains(AccessFs::ReadDir));
+        assert!(!access.contains(AccessFs::Execute));
+    }
+
+    #[test]
+    fn persistent_write_grants_exclude_execute_ioctl_and_unix_resolution() {
+        for abi in [ABI::V1, ABI::V4, ABI::V5, ABI::V9] {
+            let access = write_access(abi);
+            assert!(!access.contains(AccessFs::Execute));
+            assert!(!access.contains(AccessFs::IoctlDev));
+            assert!(!access.contains(AccessFs::ResolveUnix));
+        }
+        assert!(ephemeral_write_access(ABI::V9).contains(AccessFs::ResolveUnix));
+        assert!(!ephemeral_write_access(ABI::V9).contains(AccessFs::IoctlDev));
+    }
+
+    #[test]
     fn test_should_reject_priv_escalation_subpath() {
         let mut profile = SandboxProfile::for_ecosystem(
             Ecosystem::Rust,
@@ -588,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    fn test_should_pass_priv_escalation_with_allow_degraded() {
+    fn test_should_not_bypass_priv_escalation_lint_with_allow_degraded() {
         let mut profile = SandboxProfile::for_ecosystem(
             Ecosystem::Rust,
             &PathBuf::from("/home/test"),
@@ -602,9 +789,10 @@ mod tests {
             &profile,
             BackendOptions {
                 allow_degraded: true,
+                ..BackendOptions::default()
             },
         );
-        assert!(res.is_ok());
+        assert!(res.is_err());
     }
 
     #[test]
@@ -709,7 +897,7 @@ mod tests {
     }
 
     #[test]
-    fn test_should_bypass_forbidden_read_overlap_under_allow_degraded() {
+    fn test_should_not_bypass_forbidden_read_overlap_under_allow_degraded() {
         let mut profile = SandboxProfile::for_ecosystem(
             Ecosystem::Rust,
             &PathBuf::from("/home/test"),
@@ -730,8 +918,20 @@ mod tests {
             &forbidden,
             BackendOptions {
                 allow_degraded: true,
+                ..BackendOptions::default()
             },
         );
-        assert!(res.is_ok(), "allow_degraded should bypass the seal lint");
+        assert!(res.is_err(), "allow_degraded must not bypass the seal lint");
+    }
+
+    #[test]
+    fn test_open_or_create_directory_refuses_symlink_ancestor() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), temp.path().join("redirect")).unwrap();
+        let target = temp.path().join("redirect/cache");
+        assert!(open_or_create_directory(&target).is_err());
+        assert!(!outside.path().join("cache").exists());
     }
 }

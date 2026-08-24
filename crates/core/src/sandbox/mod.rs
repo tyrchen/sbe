@@ -17,6 +17,7 @@
 use std::{collections::HashMap, process::ExitStatus};
 
 use crate::{error::CoreError, profile::SandboxProfile};
+use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -29,6 +30,8 @@ pub use macos::sbpl;
 mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::LinuxSandbox as Sandbox;
+#[cfg(target_os = "linux")]
+pub use linux::maybe_run_launcher;
 #[cfg(target_os = "linux")]
 pub use linux::policy;
 
@@ -55,7 +58,11 @@ pub trait SandboxBackend: Send + Sync {
     /// - macOS: canonical SBPL Scheme document.
     /// - Linux: a YAML document listing the Landlock ruleset, the seccomp action table, the proxy
     ///   env, and the resolved [`BackendFeatures`].
-    fn render_policy(&self, profile: &SandboxProfile, proxy_port: Option<u16>) -> String;
+    fn render_policy(
+        &self,
+        profile: &SandboxProfile,
+        proxy_port: Option<u16>,
+    ) -> Result<String, CoreError>;
 
     /// Run the user command under the sandbox and return its exit status.
     ///
@@ -72,6 +79,7 @@ pub trait SandboxBackend: Send + Sync {
         proxy_port: Option<u16>,
         command: &[String],
         extra_env: &HashMap<String, String>,
+        pid_tx: Option<tokio::sync::oneshot::Sender<u32>>,
     ) -> impl std::future::Future<Output = Result<ExitStatus, CoreError>> + Send;
 }
 
@@ -102,10 +110,13 @@ pub struct BackendFeatures {
 }
 
 /// Runtime knobs the CLI feeds into `Sandbox::new_with_options`.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct BackendOptions {
-    /// Proceed even when the backend cannot fully enforce the requested
-    /// profile (e.g., Landlock without ABI v4 net support). The backend
-    /// prints a single warning line naming the missing capability.
+    /// Legacy compatibility bit retained for launcher payload compatibility.
+    /// It maps only to insecure Linux network compatibility.
     pub allow_degraded: bool,
+
+    /// Explicit opt-in to Linux's destination-port-only compatibility mode.
+    /// This never disables filesystem or privilege-escalation lints.
+    pub allow_insecure_network: bool,
 }

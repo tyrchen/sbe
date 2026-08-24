@@ -1,437 +1,331 @@
 # sbe — Sandbox Exec
 
-Run any command in a kernel-enforced sandbox with sensible defaults per language
-ecosystem. Defend your development machine and CI runners against supply chain
-attacks. Supports **macOS** (Seatbelt / SBPL) and **Linux** (Landlock LSM +
-seccomp-bpf).
+Run package managers and build tools with a kernel-enforced filesystem,
+process, and network policy. SBE supports macOS Seatbelt/SBPL and Linux
+Landlock plus seccomp.
 
-```
-sbe run -- npm install
+```bash
+# macOS: strict domain-filtered proxy mode
 sbe run -- cargo build
-sbe run -- pip install -r requirements.txt
-sbe run -- mix deps.get
-sbe run -- ./gradlew build
+
+# Linux: the current kernel can only enforce the proxy destination port.
+# This explicit compatibility option acknowledges that limitation.
+sbe run --allow-insecure-linux-network -- cargo build
 ```
 
-## Why
+SBE is designed for repositories, dependencies, build scripts, compiler
+plugins, and install hooks that may be malicious. The kernel and the installed
+SBE executable remain trusted.
 
-Package managers execute arbitrary code during install and build: npm
-`postinstall` scripts, Rust `build.rs`, Python `setup.py`, Elixir mix compile
-hooks, Gradle plugins. A single compromised dependency can read your SSH keys,
-exfiltrate cloud credentials, install persistent malware, or establish C2
-channels — all silently, in the background.
+## Security boundary
 
-sbe wraps your existing tools in a self-applied kernel sandbox: macOS
-`sandbox-exec` or Linux Landlock + seccomp. No code changes, no new package
-manager. Just prefix your command with `sbe run --`.
+SBE 0.4 fails closed when a requested guarantee cannot be enforced.
 
-## What It Blocks
-
-| Attack Vector | macOS (Seatbelt / SBPL) | Linux (Landlock + seccomp) |
+| Capability | macOS | Linux |
 |---|---|---|
-| Read `~/.ssh`, `~/.aws`, cloud creds | SBPL `file-read*` denylist | `denyRead` forbidden-list (see Caveats) |
-| Write to `/Library/Caches`, LaunchAgents | SBPL `file-write*` allowlist | Landlock write allowlist |
-| Network C2 on non-standard ports | SBPL pins egress to proxy / `:443` | Landlock `NET_CONNECT_TCP` (≥6.7) or `:443` |
-| Second-stage download via `curl`/`wget` | Proxy 403s non-allowlisted domains | Same proxy, identical behaviour |
-| `osascript` / AppleScript abuse | SBPL `process-exec` denylist | n/a (Linux) |
-| `sudo`, `pkexec`, privilege escalation | n/a (macOS) | Lint refuses `allowExec` subpaths covering `sudo`/`pkexec`/etc. |
-| Clipboard / screen exfiltration | SBPL denies `pbcopy`/`screencapture` | Allowlist omits them |
-| Module load / kernel attack surface | n/a | seccomp blocks `bpf`, `init_module`, `kexec_*`, `ptrace`, … |
+| Filesystem writes | SBPL allowlist | Landlock allowlist |
+| Secret-path reads | SBPL deny rules | Descriptor-based read rules with denied descendants carved out |
+| Executable paths | SBPL allow/deny rules | Landlock allowlist; broad privilege-bearing directories are rejected |
+| Ambient environment | Cleared, then rebuilt from a small positive allowlist | Same |
+| Ambient file descriptors | `CLOEXEC` before target exec | `close_range(CLOEXEC)` with bounded fallback |
+| Domain-filtered HTTPS | Enforced through the exact authenticated proxy port | Not currently enforceable; strict mode refuses to run |
+| Restricted TCP/UDP | SBPL network policy | Landlock TCP plus seccomp Internet datagram/raw-socket rules |
+| Persistent W^X | Validated before launch | Validated before launch, including existing symlink aliases |
+| Private temporary storage | Per-run root; other shared temp roots denied | Per-run root; other temp paths omitted from Landlock grants |
+| Violation audit stream | Reported unavailable unless a correlatable source exists | Reported unavailable until kernel-domain correlation is verifiable |
+
+Important Linux distinction: Landlock ABI v4 can authorize a destination
+**port**, not a destination IP address. A malicious process that knows the
+proxy's random port can connect to a different host listening on that port.
+SBE therefore does not call this domain confinement. A proxy profile either:
+
+- refuses by default; or
+- runs only after `--allow-insecure-linux-network`, with a warning explaining
+  the bypass.
+
+`--allow-all-network` remains an explicit request to remove network isolation.
+`--no-proxy` selects direct-TCP-443 compatibility mode and is never described
+as domain-filtered.
+
+See the [security hardening design](specs/security-hardening-design.md) for the
+threat model, findings, and adversarial verification plan.
 
 ## Install
 
 ```bash
-cargo install --path apps/cli
+cargo install sbexec --locked
 ```
 
-Or:
+For development from this repository:
 
 ```bash
-make install
+cargo install --path apps/cli --locked --force
 ```
 
-Supported targets:
-- **macOS** — any release with `/usr/bin/sandbox-exec` (all SIP-compliant builds).
-- **Linux** — kernel **≥5.13** for basic enforcement, **≥6.7** for full
-  per-port TCP filtering (Landlock ABI v4). On 5.13–6.6 a `--allow-degraded`
-  fallback is available; without that flag, sbe refuses to start rather than
-  silently downgrading.
+Requirements:
 
-### CI (GitHub Actions)
+- the current Rust stable toolchain for source builds;
+- macOS with `/usr/bin/sandbox-exec`; or
+- Linux 5.13 or newer for Landlock filesystem enforcement, with Landlock ABI
+  v4 or newer required for TCP destination-port enforcement.
 
-The bundled composite action installs a prebuilt sbe binary for the runner's
-OS and architecture, then adds it to `PATH`. It works on both Linux and macOS
-GitHub-hosted runners:
+No exact Rust patch version is pinned. CI installs `stable`.
+
+### GitHub Actions
+
+Release 0.4.0 and newer publishes SHA-256 checksums, an SPDX SBOM, and GitHub
+build-provenance attestations. The composite action verifies both the checksum
+and the attestation before installing the binary.
 
 ```yaml
-jobs:
-  build-linux:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: tyrchen/sbe@sbexec-v0.3.2   # or @master with `version: latest`
-        with:
-          version: latest
-      - run: sbe --version
-      - run: sbe run -- cargo build
+permissions:
+  contents: read
 
-  build-macos:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: tyrchen/sbe@sbexec-v0.3.2
-        with:
-          version: latest
-      - run: sbe run -- cargo build
+steps:
+  - uses: actions/checkout@<full-commit-sha>
+  - uses: tyrchen/sbe@sbexec-v0.4.0
+    with:
+      version: '0.4.0'
+  - run: sbe --version
+  - run: sbe run --allow-insecure-linux-network -- cargo build
 ```
 
-Inputs:
+For high-assurance workflows, replace the SBE release tag in `uses:` with the
+full commit SHA belonging to that tag. Supported release targets are
+`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, and
+`aarch64-apple-darwin`.
 
-| Input | Default | Description |
-|---|---|---|
-| `version` | `latest` | Release to install. Accepts `latest`, a semver (`0.3.2`), or a full tag (`sbexec-v0.3.2`). |
-| `github-token` | `${{ github.token }}` | Token used for releases API + asset download. |
-
-Outputs: `version` (resolved tag) and `bin-path` (absolute path to the
-installed binary).
-
-Supported runner / architecture matrix (auto-detected via `$RUNNER_OS` and
-`$RUNNER_ARCH`):
-
-| Runner | Arch | Release artifact |
-|---|---|---|
-| `ubuntu-*`  | x86_64 | `x86_64-unknown-linux-musl` |
-| `ubuntu-*`  | arm64  | `aarch64-unknown-linux-musl` |
-| `macos-*`   | arm64  | `aarch64-apple-darwin` |
-
-Linux runners on `ubuntu-latest` / `ubuntu-24.04` (kernel 6.x) get full
-enforcement via Landlock ABI v4 + seccomp-bpf. macOS runners use
-`sandbox-exec` / SBPL.
-
-## Quick Start
+## Quick start
 
 ```bash
-# Auto-detects ecosystem from command name or project files
+# Detect the ecosystem from the command or project files
 sbe run -- npm install
 sbe run -- cargo build
 
-# Specify ecosystem explicitly
-sbe run -p python -- pip install flask
+# Linux proxy compatibility (required for current networked defaults)
+sbe run --allow-insecure-linux-network -- npm install
 
-# See what policy would be installed (does not execute)
-sbe run --dry-run -- npm install
+# Explicit profile
+sbe run --profile python -- uv build
 
-# Print resolved config + generated policy
+# Add or remove domains
+sbe run --allow-domain api.example.com -- npm install
+sbe run --deny-domain github.com -- npm install
+
+# Permit a build-time downloader and its destination
+sbe run --allow-fetch downloads.example.com -- cargo build
+
+# Inspect the effective policy without executing the command
 sbe inspect -- cargo build
 
-# List all default profiles
+# List built-in profiles
 sbe profiles
-
-# Disable network sandboxing for debugging
-sbe run --allow-all-network -- npm install
-
-# Add a custom allowed domain
-sbe run -n "api.mycompany.com" -- npm install
-
-# Allow build-time downloads (enables curl/wget + adds domains to proxy)
-sbe run -f "download.example.com" -- cargo build
-
-# Allow an extra binary
-sbe run -e /usr/bin/curl -- npm install
-
-# Stream sandbox violations in real-time
-sbe run --audit -- npm install
-
-# Linux: proceed under a kernel without ABI v4 net filter (best-effort)
-sbe run --allow-degraded -- cargo build
 ```
 
-## Architecture
+### Environment grants
 
-```
-                          sbe CLI
-                            │
-              ┌─────────────┴─────────────┐
-              │                           │
-       Profile/Config             SandboxBackend          (cfg-selected at
-       Resolver                   trait                    compile time)
-       (sbe-core)                       │
-                            ┌───────────┴───────────┐
-                            │                       │
-                  ┌─────────▼────────┐   ┌──────────▼────────┐
-                  │  MacosSandbox    │   │  LinuxSandbox     │
-                  │  (sandbox-exec)  │   │  (Landlock +      │
-                  │                  │   │   seccomp +       │
-                  │  - SBPL gen      │   │   pre_exec)       │
-                  │  - tempfile      │   │  - Ruleset build  │
-                  │  - spawn -f      │   │  - BPF compile    │
-                  └─────────┬────────┘   └──────────┬────────┘
-                            │                       │
-                            └───────────┬───────────┘
-                                        │
-                                        ▼
-                                  ┌──────────┐
-                                  │  user    │     HTTP_PROXY → sbe-proxy
-                                  │  command │ ──────────────────────────►
-                                  └──────────┘     (same path both platforms)
+The child does not inherit the complete parent environment. SBE keeps only a
+small CLI baseline such as `PATH`, `HOME`, locale, terminal, and selected tool
+home variables. Credential variables and agent sockets are absent unless the
+user grants them explicitly:
+
+```bash
+sbe run --keep-env MY_REQUIRED_TOKEN -- cargo build
+sbe run --env BUILD_MODE=release -- cargo build
 ```
 
-**Two-layer network defense:**
-1. **Kernel layer:** SBPL or Landlock pins outbound traffic to `localhost:PROXY_PORT` (or `:443`).
-2. **Application layer (proxy):** an HTTP CONNECT proxy checks the requested domain against the per-ecosystem allowlist before tunneling.
+Proxy, temporary-directory, and SBE-controlled build-output variables are
+reserved and cannot be replaced through configuration or CLI flags. `inspect`
+prints effective variable names and origins, but all values are redacted.
 
-This combination defeats CDN-backed registries: SBPL and Landlock can't filter
-by hostname, but the proxy does — and the kernel forces every TCP egress
-through it.
+On current stable Cargo, SBE keeps final Rust artifacts in `$PWD/target` while
+placing intermediate artifacts and executable build scripts in the private
+per-run tree through `CARGO_BUILD_BUILD_DIR`. This preserves persistent W^X
+without discarding the final build output.
 
-## What sbe Does *Not* Protect Against
+Persistent outputs and package caches are still attacker-controlled data after
+an untrusted build. W^X prevents direct execution during that invocation; it
+does not make generated binaries, scripts, dynamic libraries, or interpreted
+packages trustworthy. Review or discard them before running them outside SBE.
 
-The README's "What It Blocks" table summarises the wins. These are the
-**known gaps** — places where the marketing implies coverage that the
-implementation can't actually deliver. Don't trust sbe to be the last
-line of defense against any of these.
+Stdin, stdout, and stderr are intentional capabilities. For example,
+`sbe run -- tool < secret.txt` explicitly gives that file's contents to the
+tool even though all other inherited descriptors are closed.
 
-- **`/proc` cross-process snooping (Linux)**. The baseline read anchors
-  include `/proc/`, so a sandboxed build script can list every process
-  the invoking user owns and read its `/proc/<pid>/environ`,
-  `cmdline`, `cwd`, `fd/*`. If your shell exported
-  `AWS_SECRET_ACCESS_KEY`, an attacker-controlled `npm install` sees it.
-  Mitigation: set `kernel.yama.ptrace_scope=2` and avoid putting
-  secrets in env vars of unrelated processes; macOS isn't affected.
-- **DNS-over-UDP is unfiltered (Linux)**. Landlock has no UDP filter at
-  any ABI. With `/etc/resolv.conf` readable, an attacker can encode
-  exfil data in DNS subdomains and the kernel resolver will deliver
-  them. The HTTP CONNECT proxy filters HTTP/HTTPS by hostname but never
-  sees DNS itself.
-- **TLS to port 443 on any host when proxy is disabled**. JVM tools
-  (Maven, sbt's coursier, Gradle's resolver) don't honor `HTTP_PROXY`
-  env, so the java profile ships with `enableProxy: false` and Landlock
-  allows TCP egress on port 443 to anywhere. A compromised Maven plugin
-  can establish a TLS C2 channel to any host. Kernel still blocks every
-  non-443 outbound; filesystem and exec restrictions still apply.
-- **Gradle on Linux disables the kernel net filter entirely**. Gradle's
-  CLI ↔ daemon IPC uses a random localhost TCP port that Landlock v4
-  can't express. Users opting into Gradle via `allowAllNetwork: true`
-  lose all kernel TCP filtering for that profile.
-- **`/dev/tcp`, `/dev/udp` (bash built-ins)**. `bash` is in the default
-  `allowExec`, and bash's `< /dev/tcp/host/port` opens a socket
-  in-process. Same kernel syscalls (`socket`+`connect`); the proxy
-  doesn't see this traffic. On port-443, fully unfiltered (see above).
-- **Audit logging is best-effort on Linux**. The auditor reads
-  `/dev/kmsg`, which requires `CAP_SYSLOG` on most hardened hosts
-  (`kernel.dmesg_restrict=1` is the Ubuntu default). When it can't read
-  kmsg, sbe falls back to "violations surface as `EACCES` exit codes"
-  — silent for any attack that doesn't trip a kernel deny event (DNS
-  exfil, /proc snooping, TLS:443 C2).
+## Configuration trust
 
-## Linux Backend Caveats
+Configuration sources are merged in this order:
 
-These differences from the macOS path are surface-level — the same `sbe run`
-UX still works. Documented here so you know what you're getting:
+1. built-in platform/ecosystem policy;
+2. `~/.config/sbe/config.yaml`;
+3. an auto-discovered project `.sbe.yaml` or `.sbe.yml`;
+4. an explicitly named `--config` file; and
+5. CLI grants.
 
-- **`denyRead` is allowlist-omission, not subtractive deny.** Landlock has no
-  way to subtract from a granted subtree. sbe ships a curated read-allowlist
-  on Linux (`/etc`, `/lib`, `/usr`, `/proc`, `/sys`, `/tmp`, `$HOME` XDG dirs)
-  that intentionally excludes `~/.ssh`, `~/.aws`, etc. Anything you list in
-  `denyRead` becomes a *sealed forbidden-list*: future config changes that try
-  to grant read on a forbidden path are rejected at backend-time.
-- **`denyExec` is a no-op.** Landlock is allowlist-only; `denyExec` entries
-  in a Linux profile emit a warning and are otherwise ignored. The defaults
-  ship a per-binary `allowExec` enumeration that omits `sudo`, `su`, `pkexec`,
-  `doas`, `chsh`, `chfn`, `newgrp`, `sg`, `passwd`, `gpasswd`, `mount`,
-  `umount`. A `.sbe.yaml` that grants `allowExec: ["/usr/bin/"]` is rejected
-  at startup (use `--allow-degraded` to override after considering the
-  threat model).
-- **`PR_SET_NO_NEW_PRIVS` is mandatory.** Linux requires it for unprivileged
-  seccomp; sbe sets it before applying any filter. The flag persists across
-  `execve` and disables `setuid` bits across the descendant tree. Consequence:
-  `sudo` / `su` / `pkexec` cannot escalate — this is desired. The handful of
-  tools that depend on setuid binaries (e.g., legacy `ping`) will fail; the
-  vast majority of build scripts are unaffected.
-- **UDP is unfiltered.** Landlock filters only TCP. DNS over UDP, NTP, QUIC
-  egress are not subject to per-port enforcement. The seccomp baseline blocks
-  `AF_PACKET` raw sockets but not `SOCK_DGRAM` on `AF_INET`. The HTTP CONNECT
-  proxy is TCP-only by design.
-- **JVM tools don't get domain filtering.** The java profile ships with
-  `enableProxy: false` on both macOS and Linux, because JVM HTTP clients
-  (Maven, Gradle's resolver, sbt's coursier) do not honour the standard
-  `HTTP_PROXY` / `HTTPS_PROXY` env vars — they require
-  `-Dhttps.proxyHost` system properties which sbe cannot inject
-  dynamically (the proxy port is allocated at runtime). The kernel filter
-  still pins TCP egress to port 443 (no random ports, no port-80 sneaking),
-  but per-domain filtering is delegated to whatever network controls you
-  run outside sbe.
-- **Gradle on Linux requires opt-in.** Gradle's CLI talks to a separate
-  daemon over TCP on a kernel-chosen *random* localhost port. Landlock
-  ABI v4 filters TCP by port only — there's no way to express "any port
-  on 127.0.0.1" the way macOS SBPL can. Gradle does not accept a fixed
-  daemon port via any CLI flag. To run Gradle under sbe on Linux, set
-  `allowAllNetwork: true` for the `java` profile in your `.sbe.yaml` —
-  this disables kernel TCP filtering entirely for that profile. sbt
-  (default UDS IPC) and Maven (single-JVM) work without this opt-in.
-  macOS users are unaffected (SBPL has `(remote ip "localhost:*")`).
-- **DBus-resolved DNS may fail.** Tools that resolve via systemd-resolved's
-  DBus path (some Python/Node DNS libraries through `nss-systemd`) will hit
-  `EACCES` on `/run/dbus/system_bus_socket`. The fallback through glibc's
-  `getaddrinfo` over UDP (`/etc/resolv.conf`) works. Workaround for affected
-  tools: use `--allow-fetch` or add the DBus socket to a custom profile.
-- **Kernel <6.7 needs `--allow-degraded`.** Without Landlock ABI v4, sbe
-  cannot pin TCP egress to a specific port. With the flag, a best-effort
-  seccomp `connect()` arg filter is used and a warning is printed. We refuse
-  to silently downgrade.
+An automatically discovered project file is untrusted. By default it may add
+`denyRead`, `denyExec`, or `denyDomains`, and may turn off a previously granted
+allow-all/degradation setting. It may not add read, write, execute, network,
+environment, fetch, or degradation authority.
 
-## Supported Ecosystems
+Review a repository before granting expansion for one invocation:
 
-| Ecosystem | Auto-detected commands | Auto-detected files |
-|---|---|---|
-| **Node.js** | `node`, `npm`, `npx`, `yarn`, `pnpm`, `bun` | `package.json` |
-| **Rust** | `cargo`, `rustc`, `rustup` | `Cargo.toml` |
-| **Python** | `python`, `python3`, `pip`, `pip3`, `uv`, `poetry`, `pdm`, `rye` | `pyproject.toml`, `setup.py`, `requirements.txt`, `Pipfile` |
-| **Elixir** | `mix`, `elixir`, `iex` | `mix.exs` |
-| **Java** | `java`, `javac`, `mvn`, `mvnw`, `gradle`, `gradlew`, `sbt`, `scala`, `scalac`, `kotlinc` | `pom.xml`, `build.gradle`, `build.gradle.kts`, `build.sbt` |
+```bash
+sbe inspect --trust-project-config -- npm install
+sbe run --trust-project-config -- npm install
+```
 
-`sbe profiles` prints the full per-OS defaults.
+Global, explicitly named, and CLI policy are trusted user choices. All schemas
+reject unknown fields, oversized input, invalid environment names, malformed
+IDNA domains, unsafe paths, missing bases, and cyclic `extends` chains.
 
-## Configuration
-
-Create a `.sbe.yaml` (or `.sbe.yml`) in your project root, or
-`~/.config/sbe/config.yaml` for global defaults:
+Example trusted configuration:
 
 ```yaml
 profiles:
   node:
     allowWrite:
-      - "./dist"
+      - "$PWD/dist/"
     allowDomains:
-      - "api.mycompany.com"
+      - "api.example.com"
+    denyDomains:
+      - "github.com"
     allowFetch:
-      - "download.example.com"  # enables curl/wget + adds to proxy allowlist
+      - "downloads.example.com"
     env:
       NODE_ENV: production
-
-  # Custom profile extending an existing one
-  my-app:
-    extends: node
-    allowDomains:
-      - "internal-registry.mycompany.com"
-    enableProxy: true
-    allowAllNetwork: false
-    allowDegraded: false        # Linux only; default false
 ```
 
-**Config resolution order** (last wins):
-1. Built-in ecosystem defaults (per-OS YAML embedded at compile time)
-2. Global config: `~/.config/sbe/config.yaml`
-3. Project config: `.sbe.yaml` or `.sbe.yml` (walks up to git root)
-4. CLI flags
+Every permission-bearing resolved entry retains its built-in, global,
+project, explicit-file, CLI, parent-environment, or runtime origin.
 
-### Crate Structure
+## Filesystem and process policy
 
+Built-in profiles grant specific outputs and lockfiles rather than the entire
+working tree. Source, `.git`, workflow definitions, manifests, and SBE policy
+remain non-writable unless explicitly granted. Shared system temporary roots
+are not writable; every invocation gets a canonical private root used for
+`TMPDIR`, `TMP`, `TEMP`, and `XDG_RUNTIME_DIR`.
+
+Persistent write and execute grants may not overlap. The only default W+X
+exception is the private per-run root, which is deleted when the invocation
+finishes. Toolchains such as `~/.rustup` are executable/readable but not
+writable. Mutable caches are readable/writable but not executable.
+
+On Linux, paths are opened with descriptor-relative `openat2` resolution using
+`RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and
+`RESOLVE_NO_MAGICLINKS`. Writable directories are created component by
+component with directory FDs. Root-owned immutable distribution symlinks are
+the only symlink exception.
+
+## Network proxy
+
+The local CONNECT proxy:
+
+- requires a random 256-bit per-run Basic-authentication token;
+- accepts only CONNECT over HTTP/1.0 or HTTP/1.1;
+- bounds request lines, individual and total headers, header count, concurrent
+  connections, resolved addresses, and task lifetime;
+- enforces total header, DNS, connect, idle, and maximum tunnel timeouts;
+- canonicalizes lowercase IDNA names and matches wildcards on label boundaries;
+- permits port 443 by default;
+- rejects IP literals and any resolution containing loopback, private,
+  link-local, unspecified, multicast, documentation, or other selected
+  special-use addresses; and
+- resolves once and connects only to a validated returned address.
+
+If the proxy exits while the sandboxed command is alive, SBE terminates the
+command instead of silently leaving it without the requested mediator.
+
+JVM profiles receive SBE-owned proxy system properties, including the per-run
+authentication credentials. Maven and sbt therefore use the same domain
+allowlist as the other ecosystems. Gradle daemon IPC may require additional
+local-service authority and is not enabled broadly by default.
+
+## Linux launcher
+
+Linux policy installation does not run complex Rust code in a multithreaded
+`pre_exec` closure. The parent serializes a bounded policy into an anonymous
+descriptor and starts an internal single-threaded launcher before constructing
+any runtime in that process. The launcher:
+
+1. parses and revalidates the policy;
+2. safely opens Landlock rule paths;
+3. applies `PR_SET_NO_NEW_PRIVS`, Landlock, and seccomp;
+4. marks ambient descriptors close-on-exec; and
+5. executes the target.
+
+A dedicated status descriptor distinguishes launcher setup failure from the
+target itself returning exit code 126.
+
+## Limitations
+
+- Linux has no strict domain-egress backend yet. The explicit port-only mode is
+  bypassable and should be combined with a network namespace, firewall, or
+  trusted CI egress controls when the repository may be malicious.
+- On Linux kernels before Landlock ABI v4, restricted TCP modes refuse unless
+  the same insecure compatibility option is supplied; in that case TCP
+  confinement is unavailable and SBE says so.
+- Path-based Unix-socket mediation depends on newer Landlock ABIs. Local IPC is
+  a separate capability from Internet egress.
+- macOS retains an allow-most/read-deny model for compatibility. The curated
+  secret paths, Keychain service, shared temp roots, environment, and inherited
+  descriptors are protected, but this is not a complete home-directory read
+  allowlist.
+- Correlated kernel violation streaming is currently reported as unavailable.
+  Ordinary denials still surface as `EACCES`, `EPERM`, or command failure.
+- SBE does not defend against kernel vulnerabilities, a compromised SBE
+  binary, CPU/memory exhaustion by the target, timing/cache side channels, or
+  explicit capabilities supplied through stdio.
+
+## Supported ecosystems
+
+| Ecosystem | Commands | Project files |
+|---|---|---|
+| Node.js | `node`, `npm`, `npx`, `yarn`, `pnpm`, `bun` | `package.json` |
+| Rust | `cargo`, `rustc`, `rustup` | `Cargo.toml` |
+| Python | `python`, `pip`, `uv`, `poetry`, `pdm`, `rye` | `pyproject.toml`, `requirements.txt`, and related files |
+| Elixir | `mix`, `elixir`, `iex` | `mix.exs` |
+| Java/Scala | `java`, `javac`, `mvn`, `gradle`, `sbt`, `scala` | Maven, Gradle, and sbt descriptors |
+
+## CLI
+
+Run `sbe run --help` and `sbe inspect --help` for the complete current
+reference. Security-relevant options include:
+
+```text
+--allow-insecure-linux-network  Explicit port-only Linux compatibility
+--allow-all-network             Remove network confinement
+--no-proxy                      Direct-TCP-443 compatibility
+--trust-project-config          Let auto-discovered project policy add grants
+--keep-env NAME                 Preserve one parent variable
+--env NAME=VALUE                Add one explicit variable
+--allow-write PATH              Add a writable path
+--deny-read PATH                Add a protected read path
+--allow-exec PATH               Add an executable path
+--allow-fetch DOMAIN            Add downloader execution and proxy destination
+--dry-run                       Render policy without target execution
 ```
-sbe/
-├── crates/
-│   ├── core/                       # sbe-core: profile + backends
-│   │   └── src/
-│   │       ├── profile/            # Per-ecosystem defaults (per-OS YAML)
-│   │       │   ├── defaults-macos.yaml
-│   │       │   └── defaults-linux.yaml
-│   │       ├── sandbox/            # SandboxBackend trait + impls
-│   │       │   ├── mod.rs          # Trait + cfg-selected Sandbox re-export
-│   │       │   ├── macos/          # sandbox-exec backend
-│   │       │   │   ├── mod.rs
-│   │       │   │   ├── sbpl.rs
-│   │       │   │   └── exec.rs
-│   │       │   └── linux/          # Landlock + seccomp backend
-│   │       │       ├── mod.rs
-│   │       │       ├── probe.rs    # Kernel/ABI probe
-│   │       │       ├── policy.rs   # YAML render for --dry-run
-│   │       │       ├── landlock.rs # Ruleset builder
-│   │       │       ├── seccomp.rs  # BpfProgram builder
-│   │       │       └── exec.rs     # pre_exec wiring
-│   │       ├── config.rs
-│   │       ├── detect.rs
-│   │       └── error.rs
-│   └── proxy/                      # sbe-proxy: domain-filtering CONNECT proxy
-├── apps/
-│   └── cli/                        # sbe binary
-└── specs/                          # Design documents
-```
 
-## CLI Reference
-
-```
-sbe run [OPTIONS] -- <COMMAND>...
-
-Options:
-  -p, --profile <NAME>           Use a specific profile (overrides auto-detect)
-  -n, --allow-domain <DOMAIN>    Add domain to network allowlist (repeatable)
-  -N, --deny-domain <DOMAIN>     Remove domain from allowlist (repeatable)
-  -w, --allow-write <PATH>       Add writable path (repeatable)
-  -r, --deny-read <PATH>         Add read-denied path (repeatable)
-  -e, --allow-exec <PATH>        Allow execution of binary (repeatable)
-  -E, --deny-exec <PATH>         Deny execution of binary (repeatable; macOS only)
-  -f, --allow-fetch <DOMAIN>     Allow build-time downloads (enables curl/wget + adds to proxy)
-      --allow-all-network        Disable network sandboxing entirely
-      --no-proxy                 Disable proxy (kernel port-443 mode)
-      --allow-degraded           Proceed under a degraded kernel (Linux <ABI v4)
-      --audit                    Stream sandbox violations to stderr
-      --audit-log <PATH>         Write violations to file
-      --dry-run                  Print policy to stdout, do not execute
-  -c, --config <PATH>            Use specific config file
-  -v, --verbose                  Verbose output
-```
-
-```
-sbe inspect [OPTIONS] -- <COMMAND>...
-
-  Print resolved config + generated policy without executing.
-  macOS: SBPL Scheme document.
-  Linux: YAML policy showing Landlock ruleset + seccomp action table.
-```
-
-```
-sbe profiles
-
-  List all built-in ecosystem profiles and their defaults.
-```
-
-**Exit codes:** sbe passes through the child process exit code. sbe's own
-errors use 125 (internal error) and 126 (sandbox setup failed).
-
-## How It Works
-
-1. **Detect ecosystem** from command name (`npm` → Node) or project files (`Cargo.toml` → Rust).
-2. **Load profile** — built-in per-OS defaults merged with global/project `.sbe.yaml` and CLI flags.
-3. **Probe backend** — `sandbox-exec` on macOS, Landlock ABI level on Linux. Refuse on missing capability unless `--allow-degraded`.
-4. **Start proxy** — bind HTTP CONNECT proxy on `127.0.0.1:0`, get ephemeral port.
-5. **Compile policy** — SBPL string + tempfile on macOS; Landlock `Ruleset` + `BpfProgram` in-memory on Linux.
-6. **Execute** —
-    - macOS: `sandbox-exec -f /tmp/sbe-XXXX.sb <command>` with `HTTP_PROXY` env injected.
-    - Linux: `Command::pre_exec` issues `prctl(PR_SET_NO_NEW_PRIVS) → landlock_restrict_self → seccomp(TSYNC)`, then `execve`. No tempfile on disk.
-7. **Monitor** — optionally stream violations (macOS `sandboxd`; Linux `/dev/kmsg` audit).
-8. **Cleanup** — stop proxy, propagate exit code.
+SBE passes through normal target exit codes. Its own errors use 125; sandbox
+setup/exec failure uses 126.
 
 ## Development
 
 ```bash
-make build
-make test          # uses cargo-nextest under sbe
-make fmt
-make lint
-make check         # fmt + lint + test
-make install
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+cargo audit
+cargo deny check advisories bans licenses sources
+cargo machete
 ```
 
-### Requirements
-
-- Rust 2024 edition (stable)
-- macOS, or Linux ≥5.13 (≥6.7 for full network parity)
-- `cargo-nextest` for `make test` (optional)
+The release workflow uses the Rust `stable` channel, pinned third-party action
+SHAs, least-privilege job permissions, draft-first publication, SHA-256
+checksums, SPDX SBOMs, and GitHub artifact attestations.
 
 ## License
 
-This project is distributed under the terms of MIT.
+MIT. See [LICENSE.md](LICENSE.md).
 
-See [LICENSE](LICENSE.md) for details.
-
-Copyright 2025-2026 Tyr Chen
+Copyright 2025–2026 Tyr Chen

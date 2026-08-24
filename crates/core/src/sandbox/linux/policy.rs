@@ -6,7 +6,7 @@
 use std::fmt::Write;
 
 use crate::{
-    profile::SandboxProfile,
+    profile::{NetworkMode, SandboxProfile},
     sandbox::{BackendOptions, linux::probe::ProbeResult},
 };
 
@@ -21,10 +21,22 @@ pub fn render(
 
     let _ = writeln!(out, "# sbe linux backend inspection");
     let _ = writeln!(out, "backend: landlock+seccomp");
-    let _ = writeln!(out, "kernel: \"{}\"", probe.kernel);
+    let _ = writeln!(out, "kernel: {}", yaml_string(&probe.kernel));
     let _ = writeln!(out, "landlockAbi: {}", probe.abi.as_str());
-    let _ = writeln!(out, "allowDegraded: {}", options.allow_degraded);
-    let _ = writeln!(out, "profile: {}", profile.name);
+    let _ = writeln!(out, "legacyAllowDegraded: {}", options.allow_degraded);
+    let _ = writeln!(
+        out,
+        "allowInsecureNetwork: {}",
+        options.allow_insecure_network
+    );
+    let _ = writeln!(out, "profile: {}", yaml_string(&profile.name));
+    let _ = writeln!(out, "networkMode: {}", profile.network_mode.as_str());
+    let _ = writeln!(
+        out,
+        "strictDomainEgressRequested: {}",
+        profile.network_mode == NetworkMode::Proxy
+    );
+    let _ = writeln!(out, "strictDomainEgressEnforced: false");
 
     // Resolved features
     let features = probe.features();
@@ -57,44 +69,54 @@ pub fn render(
     if probe.abi.supports_ioctl_dev() {
         let _ = writeln!(out, "      - ioctlDev");
     }
+    if probe.abi.supports_unix_path_filter() {
+        let _ = writeln!(out, "      - resolveUnix");
+    }
     if features.net_port_filter {
         let _ = writeln!(out, "    net:");
         let _ = writeln!(out, "      - connectTcp");
+        let _ = writeln!(out, "      - bindTcp");
     }
 
     let _ = writeln!(out, "  pathBeneath:");
     for sp in &profile.allow_write {
         let _ = writeln!(
             out,
-            "    - path: \"{}\"\n      access: writeAllowlist",
-            sp.path.display()
+            "    - path: {}\n      access: writeAllowlist",
+            yaml_string(&sp.path.to_string_lossy())
         );
     }
     for sp in &profile.allow_exec {
         let _ = writeln!(
             out,
-            "    - path: \"{}\"\n      access: execAllowlist",
-            sp.path.display()
+            "    - path: {}\n      access: execAllowlist",
+            yaml_string(&sp.path.to_string_lossy())
         );
     }
     // The curated read allowlist is materialized by the landlock builder at
     // run time; we list its anchors here for transparency.
     let _ = writeln!(out, "  readAllowlistAnchors:");
     for anchor in super::landlock::READ_ALLOWLIST_ANCHORS {
-        let _ = writeln!(out, "    - \"{anchor}\"");
+        let _ = writeln!(out, "    - {}", yaml_string(anchor));
     }
 
     let _ = writeln!(out, "  forbiddenReads:");
     for sp in &profile.deny_read {
-        let _ = writeln!(out, "    - \"{}\"", sp.path.display());
+        let _ = writeln!(out, "    - {}", yaml_string(&sp.path.to_string_lossy()));
     }
 
-    if features.net_port_filter && !profile.allow_all_network {
+    if features.net_port_filter && profile.network_mode != NetworkMode::AllowAll {
         let _ = writeln!(out, "  netConnectTcp:");
-        if let Some(port) = proxy_port {
-            let _ = writeln!(out, "    - {port}");
-        } else if !profile.enable_proxy {
-            let _ = writeln!(out, "    - 443");
+        match profile.network_mode {
+            NetworkMode::Proxy => {
+                if let Some(port) = proxy_port {
+                    let _ = writeln!(out, "    - {port}");
+                }
+            }
+            NetworkMode::DirectHttps443 => {
+                let _ = writeln!(out, "    - 443");
+            }
+            NetworkMode::DenyAll | NetworkMode::AllowAll => {}
         }
     }
 
@@ -114,11 +136,23 @@ pub fn render(
     for syscall in super::seccomp::ERRNO_LIST {
         let _ = writeln!(out, "        - {syscall}");
     }
-    if !features.net_port_filter && !profile.allow_all_network && proxy_port.is_some() {
+    if profile.network_mode != NetworkMode::AllowAll {
+        match profile.network_mode {
+            NetworkMode::DenyAll => {
+                let _ = writeln!(out, "        - socket(all families)");
+            }
+            NetworkMode::Proxy | NetworkMode::DirectHttps443 => {
+                let _ = writeln!(out, "        - socket(AF_PACKET)");
+                let _ = writeln!(out, "        - socket(AF_INET|AF_INET6, datagram|raw)");
+            }
+            NetworkMode::AllowAll => {}
+        }
+    }
+    if !features.net_port_filter && profile.network_mode != NetworkMode::AllowAll {
         let _ = writeln!(
             out,
-            "  netFallback: seccomp connect()-arg filtering is intentionally not enforced — \
-             relies on Landlock path filter and proxy loopback bind"
+            "  netFallback: unavailable — strict execution refuses unless explicitly opted into \
+             --allow-insecure-linux-network"
         );
     }
 
@@ -126,21 +160,19 @@ pub fn render(
     if let Some(port) = proxy_port {
         let _ = writeln!(out, "  port: {port}");
         let _ = writeln!(out, "  env:");
-        let _ = writeln!(out, "    HTTP_PROXY: http://127.0.0.1:{port}");
-        let _ = writeln!(out, "    HTTPS_PROXY: http://127.0.0.1:{port}");
+        let _ = writeln!(out, "    HTTP_PROXY: <authenticated-url-redacted>");
+        let _ = writeln!(out, "    HTTPS_PROXY: <authenticated-url-redacted>");
     } else {
         let _ = writeln!(out, "  port: null");
     }
 
-    let _ = writeln!(out, "ignoredFields:");
-    if !profile.deny_exec.is_empty() {
-        let _ = writeln!(
-            out,
-            "  - denyExec  # Landlock is allowlist-only; ignored on Linux"
-        );
-    }
-
     out
+}
+
+fn yaml_string(value: &str) -> String {
+    // JSON quoted strings are valid YAML scalars and provide deterministic
+    // escaping for quotes, newlines, and terminal control characters.
+    serde_json::to_string(value).expect("string serialization cannot fail")
 }
 
 #[cfg(test)]

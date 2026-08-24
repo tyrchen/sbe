@@ -1,5 +1,10 @@
 # sbe — Architecture and Technical Design
 
+> **Historical document.** This predates the macOS/Linux 0.4 architecture and
+> must not be used as a current security guarantee. See
+> [Security Hardening Design](security-hardening-design.md) and
+> [Architecture](../docs/arch.md).
+
 ## System Overview
 
 ```

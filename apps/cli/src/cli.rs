@@ -67,21 +67,37 @@ pub struct RunArgs {
     #[arg(long)]
     pub allow_all_network: bool,
 
-    /// Disable proxy (use SBPL-only network rules).
+    /// Disable the proxy and allow direct TCP only on port 443.
     #[arg(long)]
     pub no_proxy: bool,
 
-    /// Proceed even when the kernel cannot fully enforce the requested
-    /// profile (e.g., Landlock ABI <v4 — net pinning falls back to a
-    /// seccomp arg filter). Prints a warning naming the missing capability.
-    #[arg(long)]
+    /// Legacy alias for --allow-insecure-linux-network.
+    #[arg(long, hide = true)]
     pub allow_degraded: bool,
 
-    /// Stream sandbox violations to stderr.
+    /// Opt in to Linux's destination-port-only network compatibility mode.
+    /// This does not provide strict domain confinement against malicious code.
+    #[arg(long)]
+    pub allow_insecure_linux_network: bool,
+
+    /// Trust an automatically discovered project `.sbe.yaml` to expand the
+    /// sandbox. Without this flag project config may only restrict policy.
+    #[arg(long)]
+    pub trust_project_config: bool,
+
+    /// Preserve one variable from the parent environment (repeatable).
+    #[arg(long = "keep-env", action = clap::ArgAction::Append)]
+    pub keep_env: Vec<String>,
+
+    /// Set one child environment variable as NAME=VALUE (repeatable).
+    #[arg(long = "env", action = clap::ArgAction::Append)]
+    pub env: Vec<String>,
+
+    /// Request correlated violation streaming; fails when the backend reports it unavailable.
     #[arg(long)]
     pub audit: bool,
 
-    /// Write violations to file.
+    /// Request a private violation log; fails when correlated auditing is unavailable.
     #[arg(long)]
     pub audit_log: Option<PathBuf>,
 
@@ -140,13 +156,29 @@ pub struct InspectArgs {
     #[arg(long)]
     pub allow_all_network: bool,
 
-    /// Disable proxy (use SBPL-only network rules).
+    /// Disable the proxy and allow direct TCP only on port 443.
     #[arg(long)]
     pub no_proxy: bool,
 
-    /// Proceed under a degraded kernel (see RunArgs).
-    #[arg(long)]
+    /// Legacy alias for --allow-insecure-linux-network.
+    #[arg(long, hide = true)]
     pub allow_degraded: bool,
+
+    /// Opt in to Linux's destination-port-only network compatibility mode.
+    #[arg(long)]
+    pub allow_insecure_linux_network: bool,
+
+    /// Trust an automatically discovered project `.sbe.yaml` to expand policy.
+    #[arg(long)]
+    pub trust_project_config: bool,
+
+    /// Preserve one variable from the parent environment (repeatable).
+    #[arg(long = "keep-env", action = clap::ArgAction::Append)]
+    pub keep_env: Vec<String>,
+
+    /// Set one child environment variable as NAME=VALUE (repeatable).
+    #[arg(long = "env", action = clap::ArgAction::Append)]
+    pub env: Vec<String>,
 
     /// Use specific config file.
     #[arg(short = 'c', long)]
@@ -172,6 +204,10 @@ impl InspectArgs {
             allow_all_network: self.allow_all_network,
             no_proxy: self.no_proxy,
             allow_degraded: self.allow_degraded,
+            allow_insecure_linux_network: self.allow_insecure_linux_network,
+            trust_project_config: self.trust_project_config,
+            keep_env: self.keep_env.clone(),
+            env: self.env.clone(),
             audit: false,
             audit_log: None,
             dry_run: true,

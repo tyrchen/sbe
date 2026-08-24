@@ -1,5 +1,9 @@
 # sbe — Sandbox Exec CLI: Product Requirements
 
+> **Historical document.** This predates the 0.4 security boundary. For
+> current security behavior and requirements, see
+> [Security Hardening Design](security-hardening-design.md).
+
 ## Problem Statement
 
 Modern software development relies heavily on open-source package ecosystems (npm, cargo, pip, hex, maven/gradle). These ecosystems execute arbitrary code during dependency installation and build steps — `postinstall` scripts in npm, `build.rs` in Rust, `setup.py` in Python, `mix compile` hooks in Elixir, and Gradle/Maven plugins in Java. Supply chain attacks (e.g., the 2026-03 Axios NPM attack) exploit this trust to:

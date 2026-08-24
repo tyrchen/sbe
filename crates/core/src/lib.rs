@@ -12,4 +12,6 @@ pub mod error;
 pub mod profile;
 pub mod sandbox;
 
+#[cfg(target_os = "linux")]
+pub use sandbox::maybe_run_launcher;
 pub use sandbox::{BackendFeatures, BackendInfo, BackendOptions, Sandbox, SandboxBackend};

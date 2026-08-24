@@ -16,3 +16,6 @@ readme.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+base64.workspace = true
+getrandom.workspace = true
+idna.workspace = true

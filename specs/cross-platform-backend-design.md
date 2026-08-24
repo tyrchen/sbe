@@ -1,5 +1,10 @@
 # Cross-Platform Sandbox Backend — Design
 
+> **Superseded for security behavior.** This proposal contains obsolete
+> `pre_exec`, degradation, audit, and Linux network assumptions. The current
+> 0.4 boundary is defined by [Security Hardening Design](security-hardening-design.md)
+> and [Architecture](../docs/arch.md).
+
 Status: proposed
 Target audience: implementers extending sbe to Linux without disturbing the existing macOS path
 

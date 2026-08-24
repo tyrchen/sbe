@@ -5,7 +5,7 @@
 //! - [`policy`]  — deterministic YAML rendering for `--dry-run` / inspect.
 //! - [`landlock`] — `SandboxProfile` → Landlock [`Ruleset`] with pre-opened FDs.
 //! - [`seccomp`] — `SandboxProfile` → seccomp `BpfProgram` bytes.
-//! - [`exec`]    — `Command::pre_exec` wiring (alloc-free closure).
+//! - [`exec`]    — single-threaded launcher and target exec lifecycle.
 //!
 //! [`Ruleset`]: ::landlock::Ruleset
 
@@ -17,6 +17,7 @@ mod seccomp;
 
 use std::{collections::HashMap, process::ExitStatus};
 
+pub use exec::maybe_run_launcher;
 pub use probe::ProbeResult;
 
 use crate::{
@@ -40,8 +41,7 @@ impl LinuxSandbox {
         Self::new_with_options(BackendOptions::default())
     }
 
-    /// Constructor with runtime options ([`BackendOptions::allow_degraded`]
-    /// surfaces here).
+    /// Constructor with capability-specific runtime options.
     pub fn new_with_options(options: BackendOptions) -> Result<Self, CoreError> {
         let probe = probe::run()?;
         let features = probe.features();
@@ -72,8 +72,17 @@ impl SandboxBackend for LinuxSandbox {
         &self.info
     }
 
-    fn render_policy(&self, profile: &SandboxProfile, proxy_port: Option<u16>) -> String {
-        policy::render(profile, proxy_port, &self.probe, self.options)
+    fn render_policy(
+        &self,
+        profile: &SandboxProfile,
+        proxy_port: Option<u16>,
+    ) -> Result<String, CoreError> {
+        Ok(policy::render(
+            profile,
+            proxy_port,
+            &self.probe,
+            self.options,
+        ))
     }
 
     fn run(
@@ -82,6 +91,7 @@ impl SandboxBackend for LinuxSandbox {
         proxy_port: Option<u16>,
         command: &[String],
         extra_env: &HashMap<String, String>,
+        pid_tx: Option<tokio::sync::oneshot::Sender<u32>>,
     ) -> impl std::future::Future<Output = Result<ExitStatus, CoreError>> + Send {
         let probe = self.probe.clone();
         let options = self.options;
@@ -89,7 +99,10 @@ impl SandboxBackend for LinuxSandbox {
         let command = command.to_vec();
         let extra_env = extra_env.clone();
         async move {
-            exec::run_sandboxed(&profile, proxy_port, &command, &extra_env, &probe, options).await
+            exec::run_sandboxed(
+                &profile, proxy_port, &command, &extra_env, &probe, options, pid_tx,
+            )
+            .await
         }
     }
 }

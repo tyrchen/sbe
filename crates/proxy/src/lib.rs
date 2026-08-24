@@ -8,4 +8,4 @@ pub mod allowlist;
 pub mod error;
 pub mod server;
 
-pub use server::ProxyServer;
+pub use server::{ProxyConfig, ProxyEndpoint, ProxyServer};

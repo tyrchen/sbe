@@ -3,23 +3,21 @@ name: test-cli
 # Full-fledged sbe end-to-end test suite. Three layers:
 #
 #  1. install + smoke (Linux + macOS): cargo install + sbe --version /
-#     profiles / inspect / --dry-run / minimal `run` / --allow-all-network /
-#     --allow-degraded.
+#     profiles / inspect / --dry-run / minimal `run` / capability hygiene.
 #
 #  2. ecosystem (Linux): for each language ecosystem, run a representative
-#     real-world build under `sbe run` against (a) a fresh "happy path"
+#     real-world build under `sbe run --allow-insecure-linux-network` against (a) a fresh "happy path"
 #     project that depends on a real upstream package, and (b) the hostile
 #     fixture in /fixtures/<eco>/ that exercises every attack in
 #     fixtures/ATTACKS.md. The fixture output must contain zero `PWNED:`
 #     lines and at least one `SAFE:` line for every attack ID.
 #
-#  3. network-filter (Linux): explicit proxy-allowlist tests — `curl` to
+#  3. network-filter (Linux compatibility mode): explicit proxy-allowlist tests — `curl` to
 #     an allowed domain (registry) succeeds; `curl` to an evil domain
 #     gets a non-2xx response. Verifies the two-layer defense.
 #
-# Java/Scala uses the gradle fixture (Kotlin DSL) and the sbt fixture
-# (Scala) since the team builds Scala backends. Maven coverage is implicit
-# via the same java profile and the gradle fixture's mavenCentral repo.
+# Java/Scala uses Maven and sbt because both can run as a single JVM and use
+# SBE's authenticated per-run proxy properties.
 
 on:
   push:
@@ -47,12 +45,12 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: cargo install --path apps/cli
         run: cargo install --path apps/cli --locked --force
@@ -94,36 +92,203 @@ jobs:
               || { echo "inspect $eco failed"; exit 1; }
           done
 
-      - name: sbe run --dry-run prints policy without spawning the child
+      - name: Direct Security.framework keychain access is denied
+        if: runner.os == 'macOS'
         run: |
           set -euo pipefail
-          sbe run --dry-run -- echo hello >/tmp/sbe-dry.out 2>&1 || true
+          probe="$RUNNER_TEMP/sbe-keychain-probe"
+          clang fixtures/macos/keychain_probe.c -framework Security -framework CoreFoundation -o "$probe"
+          security add-generic-password -U -a sbe-test -s sbe-security-test -w sbe-sentinel
+          trap 'security delete-generic-password -a sbe-test -s sbe-security-test >/dev/null 2>&1 || true' EXIT
+          if sbe run --profile rust --allow-exec "$probe" -- "$probe"; then
+            echo "::error::sandboxed process accessed a test Keychain item"
+            exit 1
+          fi
+
+      - name: dry-run prints policy without spawning the child
+        run: |
+          set -euo pipefail
+          sbe run --allow-insecure-linux-network --dry-run -- echo hello >/tmp/sbe-dry.out 2>&1 || true
           test -s /tmp/sbe-dry.out
           head -20 /tmp/sbe-dry.out
 
-      - name: sbe run -- /bin/echo hello (real sandbox)
+      - name: real sandbox executes an allowed binary
         run: |
           set -euo pipefail
-          out=$(sbe run --profile rust -- /bin/echo "hello from sbe")
+          out=$(sbe run --allow-insecure-linux-network --profile rust -- /bin/echo "hello from sbe")
           echo "got: $out"
           test "$out" = "hello from sbe"
 
-      - name: sbe run --allow-all-network -- /bin/echo (bypass proxy)
+      - name: explicit allow-all-network permits real sockets
         run: |
           set -euo pipefail
-          sbe run --allow-all-network -- /bin/echo "bypass-ok"
+          port_file="$RUNNER_TEMP/sbe-allow-all-port"
+          python3 - <<'PY' >"$port_file" &
+          import socket
+          listener = socket.socket()
+          listener.bind(("127.0.0.1", 0))
+          listener.listen()
+          listener.settimeout(10)
+          print(listener.getsockname()[1], flush=True)
+          connection, _ = listener.accept()
+          connection.recv(4096)
+          connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+          connection.close()
+          PY
+          listener_pid=$!
+          trap 'kill "$listener_pid" >/dev/null 2>&1 || true' EXIT
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            test -s "$port_file" && break
+            sleep 0.2
+          done
+          port=$(head -1 "$port_file")
+          test -n "$port"
+          out=$(sbe run --allow-all-network --profile rust --allow-exec /usr/bin/curl -- \
+            /usr/bin/curl --noproxy '*' -fsS "http://127.0.0.1:$port/")
+          test "$out" = ok
+          wait "$listener_pid"
 
-      - name: sbe run --allow-degraded smoke (Linux only)
+      - name: Linux strict domain mode refuses port-only confinement
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
-          sbe run --allow-degraded --profile python -- /bin/echo "degraded-ok"
+          if sbe run --profile rust -- /bin/echo should-not-run >strict.out 2>&1; then
+            echo "::error::strict Linux proxy mode unexpectedly ran"
+            exit 1
+          fi
+          grep -q "strict-domain-egress" strict.out
+          sbe run --allow-insecure-linux-network --profile rust -- /bin/echo compatibility-ok \
+            2>compatibility.err
+          grep -q "WARNING: insecure Linux network compatibility" compatibility.err
 
-      - name: sbe run twice in a row (warm-cache behaviour)
+      - name: environment is allowlisted and inspect always redacts values
         run: |
           set -euo pipefail
-          sbe run --profile node -- /bin/echo run-1
-          sbe run --profile node -- /bin/echo run-2
+          inherited=$(SBE_SENTINEL_SECRET=ambient-secret \
+            sbe run --allow-all-network --profile rust -- /usr/bin/env)
+          if grep -q 'ambient-secret' <<<"$inherited"; then
+            echo "::error::ambient secret reached sandbox"
+            exit 1
+          fi
+          kept=$(SBE_SENTINEL_SECRET=explicit-secret \
+            sbe run --allow-all-network --profile rust \
+              --keep-env SBE_SENTINEL_SECRET -- /bin/sh -c 'printf %s "$SBE_SENTINEL_SECRET"')
+          test "$kept" = explicit-secret
+          inspected=$(SBE_SENTINEL_SECRET=explicit-secret \
+            sbe inspect --profile rust --keep-env SBE_SENTINEL_SECRET -- /bin/echo hi 2>&1)
+          grep -q 'SBE_SENTINEL_SECRET' <<<"$inspected"
+          grep -q '<redacted>' <<<"$inspected"
+          if grep -q 'explicit-secret' <<<"$inspected"; then
+            echo "::error::inspect exposed environment value"
+            exit 1
+          fi
+
+      - name: inherited file descriptors are closed before target exec
+        run: |
+          set -euo pipefail
+          printf sentinel >"$RUNNER_TEMP/sbe-open-fd-secret"
+          exec 9<"$RUNNER_TEMP/sbe-open-fd-secret"
+          if sbe run --allow-all-network --profile rust -- /bin/sh -c '/bin/cat <&9' \
+              >/dev/null 2>&1; then
+            echo "::error::sandbox inherited ambient fd 9"
+            exit 1
+          fi
+          exec 9<&-
+
+      - name: source is protected while dedicated output remains writable
+        run: |
+          set -euo pipefail
+          project="$RUNNER_TEMP/sbe-protected-workspace"
+          rm -rf "$project"
+          mkdir -p "$project"
+          printf original >"$project/source.txt"
+          cd "$project"
+          sbe run --allow-all-network --profile rust -- /bin/sh -c \
+            'printf pwned > source.txt' >/dev/null 2>&1 || true
+          test "$(cat source.txt)" = original
+          sbe run --allow-all-network --profile rust -- /bin/sh -c \
+            'mkdir -p target && printf output > target/artifact'
+          test "$(cat target/artifact)" = output
+
+      - name: Cargo build scripts execute only from the private build directory
+        run: |
+          set -euo pipefail
+          project="$RUNNER_TEMP/sbe-cargo-build-script"
+          mkdir -p "$project/src"
+          cat >"$project/Cargo.toml" <<'TOML'
+          [package]
+          name = "sbe-build-script-smoke"
+          version = "0.1.0"
+          edition = "2024"
+          TOML
+          cat >"$project/build.rs" <<'RS'
+          fn main() {
+              println!("cargo:rustc-env=SBE_BUILD_SCRIPT_RAN=yes");
+          }
+          RS
+          cat >"$project/src/main.rs" <<'RS'
+          fn main() {
+              assert_eq!(env!("SBE_BUILD_SCRIPT_RAN"), "yes");
+          }
+          RS
+          cd "$project"
+          sbe run --allow-insecure-linux-network --profile rust \
+            --env RUSTC_WRAPPER= -- cargo build --offline
+          test -x target/debug/sbe-build-script-smoke
+
+      - name: concurrent runs cannot access each other's private temp roots
+        run: |
+          set -euo pipefail
+          first_out="$RUNNER_TEMP/sbe-first-temp.out"
+          sbe run --allow-all-network --profile rust -- /bin/sh -c \
+            'printf sentinel > "$TMPDIR/secret"; printf "%s\n" "$TMPDIR"; /bin/sleep 5' \
+            >"$first_out" &
+          first_pid=$!
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            test -s "$first_out" && break
+            sleep 0.2
+          done
+          first_temp=$(head -1 "$first_out")
+          test -n "$first_temp"
+          sbe run --allow-all-network --profile rust --env OTHER_TMP="$first_temp" -- \
+            /bin/sh -c \
+              'test ! -r "$OTHER_TMP/secret"; test ! -w "$OTHER_TMP"; ! /usr/bin/touch "$OTHER_TMP/pwn"'
+          wait "$first_pid"
+
+      - name: macOS proxy mode cannot reach unrelated localhost services
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >"$RUNNER_TEMP/sbe-local-port" &
+          import socket
+          listener = socket.socket()
+          listener.bind(("127.0.0.1", 0))
+          listener.listen()
+          listener.settimeout(10)
+          print(listener.getsockname()[1], flush=True)
+          try:
+              listener.accept()
+          except TimeoutError:
+              pass
+          PY
+          listener_pid=$!
+          trap 'kill "$listener_pid" >/dev/null 2>&1 || true' EXIT
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            test -s "$RUNNER_TEMP/sbe-local-port" && break
+            sleep 0.2
+          done
+          port=$(head -1 "$RUNNER_TEMP/sbe-local-port")
+          if sbe run --profile rust --allow-exec /usr/bin/curl -- \
+              /usr/bin/curl --noproxy '*' --max-time 2 "http://127.0.0.1:$port/"; then
+            echo "::error::proxy-only policy reached unrelated localhost service"
+            exit 1
+          fi
+
+      - name: two ordinary invocations succeed in a row
+        run: |
+          set -euo pipefail
+          sbe run --allow-insecure-linux-network --profile node -- /bin/echo run-1
+          sbe run --allow-insecure-linux-network --profile node -- /bin/echo run-2
 
   # Shared verifier shell. Saved here so all ecosystem jobs use the same logic.
   # Asserts: zero "PWNED:" lines AND a "SAFE:" line for every attack ID.
@@ -135,12 +300,12 @@ jobs:
     needs: install
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: cargo install sbe
         run: cargo install --path apps/cli --locked --force
 
@@ -169,7 +334,7 @@ jobs:
               println!("{s}");
           }
           RS
-          sbe run -- cargo build --release 2>&1 | tee out.log
+          sbe run --allow-insecure-linux-network -- cargo build --release 2>&1 | tee out.log
           grep -q "Compiling serde" out.log
           ./target/release/real | grep -q '"name":"sbe"'
 
@@ -178,7 +343,7 @@ jobs:
           set -euo pipefail
           cd fixtures/rust
           rm -rf target
-          sbe run -- cargo build 2>&1 | tee out.log
+          sbe run --allow-insecure-linux-network -- cargo build 2>&1 | tee out.log
           ${GITHUB_WORKSPACE}/.github/workflows/verify-attacks.sh out.log
 
   ecosystem-node:
@@ -186,15 +351,15 @@ jobs:
     needs: install
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: cargo install sbe
         run: cargo install --path apps/cli --locked --force
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20'
 
@@ -202,7 +367,7 @@ jobs:
       # warm on subsequent runs. The cache lives at ~/.npm; the node
       # profile's allowWrite already includes it, so sbe can write to
       # it inside the sandbox.
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.npm
@@ -222,7 +387,7 @@ jobs:
             "dependencies": { "lodash": "4.17.21", "chalk": "4.1.2" }
           }
           JSON
-          sbe run -- npm install --no-audit --no-fund 2>&1 | tee out.log
+          sbe run --allow-insecure-linux-network -- npm install --no-audit --no-fund 2>&1 | tee out.log
           test -d node_modules/lodash
           test -d node_modules/chalk
 
@@ -231,7 +396,7 @@ jobs:
           set -euo pipefail
           cd fixtures/node
           rm -rf node_modules
-          sbe run -- npm install --no-audit --no-fund 2>&1 | tee out.log || true
+          sbe run --allow-insecure-linux-network -- npm install --no-audit --no-fund 2>&1 | tee out.log || true
           ${GITHUB_WORKSPACE}/.github/workflows/verify-attacks.sh out.log
 
   ecosystem-python:
@@ -239,23 +404,23 @@ jobs:
     needs: install
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: cargo install sbe
         run: cargo install --path apps/cli --locked --force
       - name: Install uv
-        uses: astral-sh/setup-uv@v3
+        uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3
         with:
           version: latest
 
       # Persist uv's user-level cache (~/.cache/uv) and pip's so the
       # requests+httpx wheels are warm next time. The python profile's
       # allowWrite already covers both.
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cache/uv
@@ -274,7 +439,7 @@ jobs:
           cd "$HOME/sbe-uv"
           rm -rf real && mkdir real && cd real
           uv venv .venv
-          sbe run -- uv pip install --python .venv --no-progress requests httpx
+          sbe run --allow-insecure-linux-network -- uv pip install --python .venv --no-progress requests httpx
           test -d .venv/lib
 
       - name: hostile fixture — every attack must be SAFE (10/10)
@@ -284,7 +449,7 @@ jobs:
           mkdir -p "$UV_CACHE_DIR"
           cd fixtures/python
           rm -rf dist
-          sbe run -- uv build --no-progress 2>&1 | tee out.log || true
+          sbe run --allow-insecure-linux-network -- uv build --no-progress 2>&1 | tee out.log || true
           ${GITHUB_WORKSPACE}/.github/workflows/verify-attacks.sh out.log
 
   ecosystem-elixir:
@@ -292,12 +457,12 @@ jobs:
     needs: install
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: cargo install sbe
         run: cargo install --path apps/cli --locked --force
       - name: Install Erlang/Elixir
@@ -311,7 +476,7 @@ jobs:
       # tightly enough for hashFiles to be a useful invalidation signal —
       # any change to the workflow drops the cache. The elixir profile's
       # allowWrite already covers all three paths.
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.hex
@@ -346,9 +511,9 @@ jobs:
             def hello, do: Jason.encode!(%{name: "sbe", age: 1})
           end
           EX
-          sbe run -- mix deps.get 2>&1 | tee deps.log
+          sbe run --allow-insecure-linux-network -- mix deps.get 2>&1 | tee deps.log
           grep -qi "jason" deps.log
-          sbe run -- mix compile 2>&1 | tee compile.log
+          sbe run --allow-insecure-linux-network -- mix compile 2>&1 | tee compile.log
           grep -qE "(Compiled|Generated real)" compile.log
 
       - name: hostile fixture — every attack must be SAFE (10/10)
@@ -356,48 +521,36 @@ jobs:
           set -euo pipefail
           cd fixtures/elixir
           rm -rf _build deps
-          sbe run -- mix compile 2>&1 | tee out.log || true
+          sbe run --allow-insecure-linux-network -- mix compile 2>&1 | tee out.log || true
           ${GITHUB_WORKSPACE}/.github/workflows/verify-attacks.sh out.log
 
-  # Java/Scala coverage uses sbt and Maven — both single-JVM tools.
-  #
-  # Gradle is INTENTIONALLY NOT in this job. Gradle's CLI talks to a daemon
-  # process over a kernel-chosen random localhost TCP port, and Landlock
-  # ABI v4 can only filter TCP by port number, not by destination IP. There
-  # is no way to express "allow any port on 127.0.0.1" the way macOS SBPL's
-  # `(remote ip "localhost:*")` does. Users who insist on Gradle on Linux
-  # must opt into `allowAllNetwork: true` in their .sbe.yaml for the java
-  # profile — fully aware that this disables both kernel TCP filtering AND
-  # the proxy. README documents this trade-off.
-  #
-  # sbt 1.x defaults to Unix-domain-socket IPC (since 1.1) so it isn't
-  # subject to NET_CONNECT_TCP at all. Maven runs in a single JVM with no
-  # IPC. Both work cleanly under the default java profile.
+  # Java/Scala coverage uses sbt and Maven. Gradle daemon IPC needs separate
+  # local-service capabilities and remains outside this strict profile test.
   ecosystem-java:
     name: ecosystem / java (sbt + mvn)
     needs: install
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: cargo install sbe
         run: cargo install --path apps/cli --locked --force
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with:
           distribution: 'temurin'
           java-version: '17'
-      - uses: sbt/setup-sbt@v1
+      - uses: sbt/setup-sbt@c7d2d6258b4bd0d3ec5129e6b3453199d3c79729 # v1
 
       # Cache the JVM-tool dependency caches between runs. Without this the
       # cold-cache fetch of cats-effect + munit-cats-effect + sbt + scala
       # compiler is the dominant CI cost (~3 min). Key is hashed over the
       # build descriptors so any dep bump invalidates cleanly.
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.ivy2/cache
@@ -449,7 +602,7 @@ jobs:
               }
           }
           JAVA
-          sbe run -- mvn -q -B compile 2>&1 | tee out.log
+          sbe run --allow-insecure-linux-network -- mvn -q -B compile 2>&1 | tee out.log
           test -f target/classes/com/sbetest/App.class
 
       - name: real-dep happy path — sbt compile a fresh Scala project with cats
@@ -477,7 +630,7 @@ jobs:
               def main(args: Array[String]): Unit = println((1, 2).bimap(_ + 1, _ * 2))
           }
           SCALA
-          sbe run -- sbt -batch compile 2>&1 | tee out.log
+          sbe run --allow-insecure-linux-network -- sbt -batch compile 2>&1 | tee out.log
           grep -qiE "(success|done compiling)" out.log
 
       - name: hostile sbt fixture — cats-effect compile + MUnit test
@@ -491,7 +644,7 @@ jobs:
           # MUnit test run for the cats-effect Greeter, so the sandbox
           # actually has work to mediate (dep resolution → ivy2, scalac,
           # MUnit). All 10 attack IDs must come back SAFE.
-          sbe run -- sbt -batch test 2>&1 | tee out.log || true
+          sbe run --allow-insecure-linux-network -- sbt -batch test 2>&1 | tee out.log || true
           ${GITHUB_WORKSPACE}/.github/workflows/verify-attacks.sh out.log
           # Sanity: the MUnit test actually ran.
           grep -qE "GreeterSpec" out.log || {
@@ -504,24 +657,22 @@ jobs:
     needs: install
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: cargo install sbe
         run: cargo install --path apps/cli --locked --force
 
-      # The repo's project-local .sbe.yaml forces enableProxy: false for the
-      # rust profile (so the in-tree proxy integration tests can do real
-      # TCP). For an honest network-filter test we cd out of the repo so
-      # that override does NOT apply.
+      # Run outside the repository so no project policy participates in the
+      # proxy behavior under test.
       - name: curl to an ALLOWLISTED domain succeeds (registry.npmjs.org)
         run: |
           set -euo pipefail
           mkdir -p "$HOME/sbe-netfilter" && cd "$HOME/sbe-netfilter"
-          out=$(sbe run --profile rust --allow-fetch registry.npmjs.org -- \
+          out=$(sbe run --allow-insecure-linux-network --profile rust --allow-fetch registry.npmjs.org -- \
                 /usr/bin/curl -sSL --max-time 10 -o /dev/null \
                 -w "%{http_code}" https://registry.npmjs.org/)
           echo "code=$out"
@@ -531,7 +682,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "$HOME/sbe-netfilter"
-          out=$(sbe run --profile rust --allow-fetch registry.npmjs.org -- \
+          out=$(sbe run --allow-insecure-linux-network --profile rust --allow-fetch registry.npmjs.org -- \
                 /usr/bin/curl -sSL --max-time 10 -o /dev/null \
                 -w "%{http_code}" https://evil.example.invalid/ || true)
           echo "code=$out"
