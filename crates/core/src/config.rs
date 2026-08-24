@@ -105,6 +105,7 @@ const RESERVED_ENV: &[&str] = &[
     "REBAR_CACHE_DIR",
     "GRADLE_USER_HOME",
     "COURSIER_CACHE",
+    "SBT_OPTS",
     "JAVA_TOOL_OPTIONS",
 ];
 

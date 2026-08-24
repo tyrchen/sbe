@@ -394,6 +394,18 @@ fn build_extra_env(
                     .to_string_lossy()
                     .into_owned(),
             );
+            let sbt_root = runtime_temp.join("sbt");
+            insert_runtime_environment(
+                profile,
+                &mut env,
+                "SBT_OPTS",
+                format!(
+                    "-Dsbt.global.base={} -Dsbt.boot.directory={} -Dsbt.ivy.home={}",
+                    sbt_root.join("global").display(),
+                    sbt_root.join("boot").display(),
+                    sbt_root.join("ivy2").display(),
+                ),
+            );
         }
         _ => {}
     }
@@ -685,6 +697,7 @@ fn resolve_cli_environment(args: &RunArgs) -> anyhow::Result<HashMap<String, Str
         "REBAR_CACHE_DIR",
         "GRADLE_USER_HOME",
         "COURSIER_CACHE",
+        "SBT_OPTS",
         "JAVA_TOOL_OPTIONS",
     ];
     let mut env = HashMap::new();

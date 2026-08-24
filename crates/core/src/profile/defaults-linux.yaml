@@ -331,6 +331,8 @@ profiles:
       - "$PWD/.gradle/"
       - "$PWD/build/"
       - "$PWD/target/"
+      - "$PWD/project/target/"
+      - "$PWD/project/project/"
       # Scala / sbt
       # sbt's XDG runtime socket and tool caches are redirected to SBE's
       # private per-run directory by the launcher environment.
@@ -373,6 +375,8 @@ profiles:
       - "/usr/local/bin/scala"
       - "/usr/local/bin/scalac"
       - "/usr/share/sbt/"
+      # GitHub Actions setup-sbt versioned runner distribution.
+      - "/opt/hostedtoolcache/sbt/"
       # Project-local gradlew / mvnw wrapper scripts
       - "$PWD/gradlew"
       - "$PWD/mvnw"
