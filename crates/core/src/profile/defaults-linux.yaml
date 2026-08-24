@@ -258,6 +258,8 @@ profiles:
       - "/usr/local/bin/pip3"
       - "/usr/local/bin/uv"
       - "/usr/bin/uv"
+      # GitHub Actions setup-uv installs versioned binaries here.
+      - "/opt/hostedtoolcache/uv/"
       - "/usr/local/bin/poetry"
       - "/usr/local/bin/pdm"
       # Version managers
@@ -299,6 +301,9 @@ profiles:
       - "/usr/local/bin/iex"
       - "/usr/local/bin/erl"
       - "/usr/local/bin/epmd"
+      # erl is a launcher; the versioned ERTS VM and helpers (erlexec,
+      # inet_gethost, beam.smp) live below this immutable runtime tree.
+      - "/usr/lib/erlang/"
       # Version managers
       - "~/.asdf/"
       - "~/.kiex/"
@@ -347,6 +352,9 @@ profiles:
       - "/usr/bin/jar"
       - "/usr/bin/jshell"
       - "/usr/lib/jvm/"
+      - "/usr/bin/mvn"
+      # GitHub Actions setup-java Temurin installations.
+      - "/opt/hostedtoolcache/Java_Temurin-Hotspot_jdk/"
       - "~/.sdkman/"
       # Gradle wrapper and daemon execs from here
       - "~/.gradle/"
