@@ -91,7 +91,9 @@ impl ProxyEndpoint {
     pub fn java_tool_options(&self) -> String {
         format!(
             "-Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort={} \
+             -Dhttp.proxyProtocol=http \
              -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort={} \
+             -Dhttps.proxyProtocol=http \
              -Dhttp.proxyUser=sbe -Dhttp.proxyPassword={} \
              -Dhttps.proxyUser=sbe -Dhttps.proxyPassword={} -Dhttp.nonProxyHosts= \
              -Djdk.http.auth.tunneling.disabledSchemes=",
@@ -574,6 +576,19 @@ mod tests {
         let output = format!("{endpoint:?}");
         assert!(output.contains("<redacted>"));
         assert!(!output.contains("sentinel-token"));
+    }
+
+    #[test]
+    fn java_options_identify_connect_proxy_as_http() {
+        let endpoint = ProxyEndpoint {
+            port: 12345,
+            token: "sentinel-token".to_owned(),
+        };
+        let options = endpoint.java_tool_options();
+
+        assert!(options.contains("-Dhttp.proxyProtocol=http"));
+        assert!(options.contains("-Dhttps.proxyProtocol=http"));
+        assert!(options.contains("-Djdk.http.auth.tunneling.disabledSchemes="));
     }
 
     #[test]
