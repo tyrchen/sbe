@@ -92,7 +92,7 @@ async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
         });
     }
     profile.finalize();
-    enable_existing_node_dependency_execution(&mut profile, &args.command);
+    enable_existing_dependency_execution(&mut profile, &args.command);
 
     if !args.dry_run {
         if cargo_uses_persistent_target(&args.command) {
@@ -711,14 +711,23 @@ fn cargo_uses_persistent_target(command: &[String]) -> bool {
             .is_command(&["build", "check", "doc", "install", "rustc", "b", "c", "d"])
 }
 
-/// Installed Node dependencies are mutable during package-manager operations,
+/// Installed dependency trees are mutable during package-manager operations,
 /// but commands that explicitly run project tools need the opposite side of
-/// the W^X boundary. For those commands, replace only the built-in
-/// `node_modules` write grants with read/execute grants. User-supplied write
-/// grants remain intact and will still trip the persistent W^X lint instead
-/// of being silently weakened.
-fn enable_existing_node_dependency_execution(profile: &mut SandboxProfile, command: &[String]) {
-    if profile.name != "node" || !node_command_executes_dependencies(command) {
+/// the W^X boundary. Replace only matching built-in write grants with
+/// read/execute grants. User-supplied write grants remain intact and will
+/// still trip the persistent W^X lint instead of being silently weakened.
+fn enable_existing_dependency_execution(profile: &mut SandboxProfile, command: &[String]) {
+    let root_names: &[&str] = match profile.name.as_str() {
+        "node" if node_command_executes_dependencies(command) => &["node_modules"],
+        "python" if python_command_executes_environment(command) => &[".venv", "venv"],
+        _ => return,
+    };
+
+    replace_builtin_write_roots_with_execute(profile, root_names);
+}
+
+fn replace_builtin_write_roots_with_execute(profile: &mut SandboxProfile, root_names: &[&str]) {
+    if root_names.is_empty() {
         return;
     }
 
@@ -732,7 +741,8 @@ fn enable_existing_node_dependency_execution(profile: &mut SandboxProfile, comma
             && grant
                 .path
                 .file_name()
-                .is_some_and(|name| name == "node_modules")
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| root_names.contains(&name))
         {
             dependency_roots.push(grant.path);
         } else {
@@ -771,6 +781,31 @@ fn enable_existing_node_dependency_execution(profile: &mut SandboxProfile, comma
             value: root.to_string_lossy().into_owned(),
             origin: GrantOrigin::Runtime,
         });
+    }
+}
+
+fn python_command_executes_environment(command: &[String]) -> bool {
+    let program = Path::new(command.first().map_or("", String::as_str))
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let subcommand = top_level_subcommand(command);
+    match program {
+        "pip" | "pip3" | "virtualenv" => false,
+        "uv" => subcommand.is_command(&["run"]),
+        "poetry" => subcommand.is_command(&["run", "shell"]),
+        "pdm" | "rye" => subcommand.is_command(&["run"]),
+        "python" | "python3"
+            if command.windows(2).any(|arguments| {
+                arguments[0] == "-m" && matches!(arguments[1].as_str(), "pip" | "venv")
+            }) =>
+        {
+            false
+        }
+        // Direct virtualenv entry points such as `.venv/bin/pytest`, an
+        // activated `pytest` found through PATH, and ordinary Python scripts
+        // all execute an already-installed environment rather than mutate it.
+        _ => true,
     }
 }
 
@@ -1509,7 +1544,7 @@ mod tests {
             vec!["npx".to_owned(), "eslint".to_owned()],
         ] {
             let mut profile = base_profile.clone();
-            enable_existing_node_dependency_execution(&mut profile, &command);
+            enable_existing_dependency_execution(&mut profile, &command);
 
             let dependencies = project.join("node_modules");
             assert!(
@@ -1530,7 +1565,7 @@ mod tests {
         }
 
         let mut install_profile = base_profile.clone();
-        enable_existing_node_dependency_execution(
+        enable_existing_dependency_execution(
             &mut install_profile,
             &["npm".to_owned(), "install".to_owned()],
         );
@@ -1551,7 +1586,7 @@ mod tests {
         denied_profile.deny_exec.push(SandboxPath::file(
             project.join("node_modules/eslint/bin/eslint.js"),
         ));
-        enable_existing_node_dependency_execution(
+        enable_existing_dependency_execution(
             &mut denied_profile,
             &["npm".to_owned(), "test".to_owned()],
         );
@@ -1561,6 +1596,109 @@ mod tests {
                 .iter()
                 .any(|grant| grant.path == project.join("node_modules")),
             "a higher-precedence executable denial must not be re-authorized"
+        );
+    }
+
+    #[test]
+    fn python_run_commands_switch_builtin_virtualenvs_from_write_to_execute() {
+        let project_directory = tempfile::tempdir().unwrap();
+        let project = project_directory.path();
+        let base_profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Python, Path::new("/Users/test"), project);
+        for command in [
+            vec!["uv".to_owned(), "run".to_owned(), "pytest".to_owned()],
+            vec!["poetry".to_owned(), "run".to_owned(), "pytest".to_owned()],
+            vec![
+                project
+                    .join(".venv/bin/pytest")
+                    .to_string_lossy()
+                    .into_owned(),
+            ],
+            vec!["pytest".to_owned()],
+        ] {
+            let mut profile = base_profile.clone();
+            enable_existing_dependency_execution(&mut profile, &command);
+
+            for environment in [project.join(".venv"), project.join("venv")] {
+                assert!(
+                    !profile
+                        .allow_write
+                        .iter()
+                        .any(|grant| grant.path == environment),
+                    "{command:?} retained a writable virtualenv"
+                );
+                assert!(
+                    profile
+                        .allow_exec
+                        .iter()
+                        .any(|grant| grant.path == environment),
+                    "{command:?} did not authorize the existing virtualenv"
+                );
+            }
+            profile.validate_security_invariants().unwrap();
+        }
+
+        for command in [
+            vec!["uv".to_owned(), "sync".to_owned()],
+            vec!["pip".to_owned(), "install".to_owned(), "pytest".to_owned()],
+            vec!["poetry".to_owned(), "install".to_owned()],
+            vec![
+                "python".to_owned(),
+                "-m".to_owned(),
+                "venv".to_owned(),
+                ".venv".to_owned(),
+            ],
+        ] {
+            let mut profile = base_profile.clone();
+            enable_existing_dependency_execution(&mut profile, &command);
+            assert!(
+                profile
+                    .allow_write
+                    .iter()
+                    .any(|grant| grant.path == project.join(".venv")),
+                "{command:?} lost the writable virtualenv required for installation"
+            );
+            assert!(
+                !profile
+                    .allow_exec
+                    .iter()
+                    .any(|grant| grant.path == project.join(".venv"))
+            );
+        }
+
+        let mut explicitly_writable_profile = base_profile.clone();
+        explicitly_writable_profile
+            .allow_write
+            .push(SandboxPath::dir(project.join(".venv")));
+        enable_existing_dependency_execution(
+            &mut explicitly_writable_profile,
+            &["pytest".to_owned()],
+        );
+        assert!(
+            explicitly_writable_profile
+                .allow_write
+                .iter()
+                .any(|grant| grant.path == project.join(".venv")),
+            "a user-supplied write grant must not be silently removed"
+        );
+        assert!(
+            explicitly_writable_profile
+                .validate_security_invariants()
+                .is_err(),
+            "a user-supplied write grant must still conflict with runtime execution"
+        );
+
+        let mut denied_profile = base_profile;
+        denied_profile
+            .deny_exec
+            .push(SandboxPath::file(project.join(".venv/bin/pytest")));
+        enable_existing_dependency_execution(&mut denied_profile, &["pytest".to_owned()]);
+        assert!(
+            !denied_profile
+                .allow_exec
+                .iter()
+                .any(|grant| grant.path == project.join(".venv")),
+            "a higher-precedence virtualenv executable denial must not be re-authorized"
         );
     }
 

@@ -169,6 +169,13 @@ installs pre-create `.pnp.cjs` (and the optional ESM loader when configured)
 only when `.yarnrc.yml` or `packageManager` identifies a PnP-capable Yarn;
 Classic Yarn and the `node-modules` linker remain lockfile-only.
 
+Python installation and synchronization commands similarly keep project
+`.venv`/`venv` directories writable but non-executable. Run/test commands,
+including `uv run`, `poetry run`, activated entry points, and direct
+`.venv/bin/...` paths, switch those built-in grants to read/execute without
+write. This mode is for an already-installed environment; synchronize it in a
+separate invocation before running tools.
+
 Persistent outputs and package caches are still attacker-controlled data after
 an untrusted build. W^X prevents direct execution during that invocation; it
 does not make generated binaries, scripts, dynamic libraries, or interpreted

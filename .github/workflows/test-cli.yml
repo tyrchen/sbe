@@ -537,6 +537,7 @@ jobs:
           uv venv .venv
           sbe run --allow-insecure-linux-network -- uv pip install --python .venv --no-progress requests httpx
           test -d .venv/lib
+          sbe run --allow-insecure-linux-network -- .venv/bin/python -c 'import requests; print(requests.__name__)' | grep -Fx requests
 
       - name: hostile fixture — every attack must be SAFE (10/10)
         run: |
