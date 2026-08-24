@@ -920,6 +920,30 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn project_cargo_target_dir_never_creates_a_write_grant() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let cargo = project.path().join(".cargo");
+        let sensitive = home.path().join("sensitive");
+        tokio::fs::create_dir(&cargo).await.unwrap();
+        tokio::fs::write(
+            cargo.join("config.toml"),
+            format!("[build]\ntarget-dir = {:?}\n", sensitive),
+        )
+        .await
+        .unwrap();
+
+        let profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, home.path(), project.path());
+        assert!(
+            profile
+                .allow_write
+                .iter()
+                .all(|grant| !paths_overlap(&grant.path, &sensitive)),
+            "project-controlled Cargo target-dir created write authority"
+        );
+    }
+
     #[test]
     fn network_mode_precedence_recomputes_without_stale_fallbacks() {
         let home = PathBuf::from("/Users/test");

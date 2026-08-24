@@ -48,14 +48,12 @@ jobs:
       # - name: Install Protoc
       #   uses: arduino/setup-protoc@a8b67ba40b37d35169e222f3bb352603327985b6 # v2.1.0
 
-      # Dogfood the published action: install sbe and run the build/lint
-      # steps inside the sandbox. nextest stays outside because the proxy
-      # integration tests bind to random localhost TCP ports, which the
-      # rust profile's port-based TCP filter (Landlock ABI v4) would block.
-      - name: Install sbe (dogfood)
-        uses: tyrchen/sbe@99731b260b6f4a231c4e490a000d17a71054ce23 # sbexec-v0.3.2
-        with:
-          version: '0.3.2'
+      # Build the exact checked-out source with the locked dependency graph,
+      # then dogfood that binary. This avoids trusting an older downloaded SBE
+      # release that predates checksum and attestation verification. nextest
+      # stays outside because its proxy tests bind random localhost TCP ports.
+      - name: Build current sbe (dogfood)
+        run: cargo install --path apps/cli --locked --force
       - name: sbe smoke
         run: |
           sbe --version

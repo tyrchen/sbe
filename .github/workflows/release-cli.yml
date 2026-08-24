@@ -81,16 +81,12 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # Dogfood the published action before the real release build. On
-      # native targets (host arch + std-libc) the cargo build inside sbe
-      # warms taiki-e/upload-rust-binary-action's cache for the upload
-      # step that follows. On cross-musl targets we skip the build (no
-      # cross toolchain configured here) and fall back to `cargo check`
-      # against the host, which still exercises the sandbox end-to-end.
-      - name: Install sbe (dogfood)
-        uses: tyrchen/sbe@99731b260b6f4a231c4e490a000d17a71054ce23 # sbexec-v0.3.2
-        with:
-          version: '0.3.2'
+      # Build SBE from the exact tagged checkout and locked dependency graph
+      # before the real release build. No older, unattested SBE binary enters
+      # the release job. On native targets the sandboxed build warms the upload
+      # action's cache; cross-musl targets use a host-native sandboxed check.
+      - name: Build tagged sbe (dogfood)
+        run: cargo install --path apps/cli --locked --force
       - name: Pre-build under sbe (dogfood)
         shell: bash
         env:

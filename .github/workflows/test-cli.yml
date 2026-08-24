@@ -195,6 +195,32 @@ jobs:
           fi
           exec 9<&-
 
+      - name: inherited connected sockets are closed before target exec
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import socket
+          import subprocess
+
+          inherited, observer = socket.socketpair()
+          descriptor = inherited.fileno()
+          result = subprocess.run(
+              [
+                  "sbe", "run", "--allow-all-network", "--profile", "rust", "--",
+                  "/bin/sh", "-c", f"printf pwned >&{descriptor}",
+              ],
+              pass_fds=(descriptor,),
+              check=False,
+          )
+          observer.settimeout(0.2)
+          try:
+              leaked = observer.recv(16)
+          except socket.timeout:
+              leaked = b""
+          if result.returncode == 0 or leaked:
+              raise SystemExit("sandbox target reused an inherited connected socket")
+          PY
+
       - name: source is protected while dedicated output remains writable
         run: |
           set -euo pipefail
