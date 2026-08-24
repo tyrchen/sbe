@@ -243,10 +243,14 @@ The local CONNECT proxy:
 If the proxy exits while the sandboxed command is alive, SBE terminates the
 command instead of silently leaving it without the requested mediator.
 
-JVM profiles receive SBE-owned proxy system properties, including the per-run
-authentication credentials. Maven and sbt therefore use the same domain
-allowlist as the other ecosystems. Gradle daemon IPC may require additional
-local-service authority and is not enabled broadly by default.
+JVM profiles receive SBE-owned proxy system properties and a private per-run
+authentication agent. The agent reads the one-time token from a reserved
+environment variable and answers authentication challenges only for SBE's
+exact loopback proxy endpoint. The token is deliberately excluded from
+`JAVA_TOOL_OPTIONS`, which the JVM prints at startup. Maven and sbt therefore
+use the same domain allowlist as the other ecosystems. Gradle daemon IPC may
+require additional local-service authority and is not enabled broadly by
+default.
 
 ## Linux launcher
 

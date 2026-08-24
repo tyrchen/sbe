@@ -595,6 +595,7 @@ name = "sbexec"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "dirs",
  "libc",

@@ -107,6 +107,7 @@ const RESERVED_ENV: &[&str] = &[
     "COURSIER_CACHE",
     "SBT_OPTS",
     "JAVA_TOOL_OPTIONS",
+    "SBE_PROXY_TOKEN",
 ];
 
 /// Trust provenance of a loaded configuration file.

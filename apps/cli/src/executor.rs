@@ -10,6 +10,7 @@ use std::{
 };
 
 use anyhow::Context;
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use sbe_core::{
     BackendOptions, Sandbox, SandboxBackend,
     config::{SandboxPath, expand_path, load_configs, resolve_profile},
@@ -21,6 +22,7 @@ use sbe_core::{
     },
 };
 use sbe_proxy::{ProxyEndpoint, ProxyServer, allowlist::DomainAllowlist};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
@@ -151,7 +153,8 @@ async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
         proxy.as_ref().map(|runtime| &runtime.endpoint),
         &runtime_temp_path,
         &pwd,
-    );
+    )
+    .await?;
 
     // Dry run / inspect: print policy and exit
     if args.dry_run {
@@ -299,12 +302,12 @@ async fn await_proxy_shutdown(runtime: ProxyRuntime) -> anyhow::Result<()> {
     }
 }
 
-fn build_extra_env(
+async fn build_extra_env(
     profile: &mut SandboxProfile,
     proxy_endpoint: Option<&ProxyEndpoint>,
     runtime_temp: &Path,
     project_dir: &Path,
-) -> HashMap<String, String> {
+) -> anyhow::Result<HashMap<String, String>> {
     let mut env = filter_parent_environment(std::env::vars());
     let mut inherited: Vec<String> = env.keys().cloned().collect();
     inherited.sort();
@@ -395,15 +398,12 @@ fn build_extra_env(
                     .into_owned(),
             );
             let sbt_root = runtime_temp.join("sbt");
-            // SBT launcher 1.4.x does not initialize proxy authentication for its embedded
-            // Coursier resolver. Its Ivy bootstrap path honors the authenticated JVM proxy.
             insert_runtime_environment(
                 profile,
                 &mut env,
                 "SBT_OPTS",
                 format!(
-                    "-Dsbt.global.base={} -Dsbt.boot.directory={} -Dsbt.ivy.home={} \
-                     -Dsbt.launcher.coursier=false",
+                    "-Dsbt.global.base={} -Dsbt.boot.directory={} -Dsbt.ivy.home={}",
                     sbt_root.join("global").display(),
                     sbt_root.join("boot").display(),
                     sbt_root.join("ivy2").display(),
@@ -421,12 +421,10 @@ fn build_extra_env(
         insert_runtime_environment(profile, &mut env, "NO_PROXY", String::new());
         insert_runtime_environment(profile, &mut env, "no_proxy", String::new());
         if profile.name == "java" {
-            insert_runtime_environment(
-                profile,
-                &mut env,
-                "JAVA_TOOL_OPTIONS",
-                endpoint.java_tool_options(),
-            );
+            let agent_path = install_java_proxy_agent(runtime_temp).await?;
+            for (name, value) in endpoint.java_environment(&agent_path) {
+                insert_runtime_environment(profile, &mut env, name, value);
+            }
         }
     }
     let profile_environment: Vec<(String, String)> = profile
@@ -452,7 +450,40 @@ fn build_extra_env(
             .unwrap_or(GrantOrigin::Runtime);
         record_effective_environment(profile, &name, origin);
     }
-    env
+    Ok(env)
+}
+
+async fn install_java_proxy_agent(runtime_temp: &Path) -> anyhow::Result<String> {
+    const AGENT_B64: &str =
+        include_str!("../assets/java-proxy-agent/java-proxy-auth-agent.jar.b64");
+
+    let path = runtime_temp.join("java-proxy-auth-agent.jar");
+    let path_text = path
+        .to_str()
+        .context("private Java proxy agent path is not valid UTF-8")?;
+    if path_text.chars().any(|character| {
+        character.is_control() || character.is_ascii_whitespace() || "'\"\\".contains(character)
+    }) {
+        anyhow::bail!("private Java proxy agent path contains unsupported option characters");
+    }
+
+    let jar = BASE64_STANDARD
+        .decode(AGENT_B64.trim())
+        .context("embedded Java proxy authentication agent is corrupt")?;
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o400)
+        .open(&path)
+        .await
+        .context("failed to create private Java proxy authentication agent")?;
+    file.write_all(&jar)
+        .await
+        .context("failed to write private Java proxy authentication agent")?;
+    file.sync_all()
+        .await
+        .context("failed to persist private Java proxy authentication agent")?;
+    Ok(path_text.to_owned())
 }
 
 fn insert_runtime_environment(
@@ -702,6 +733,7 @@ fn resolve_cli_environment(args: &RunArgs) -> anyhow::Result<HashMap<String, Str
         "COURSIER_CACHE",
         "SBT_OPTS",
         "JAVA_TOOL_OPTIONS",
+        "SBE_PROXY_TOKEN",
     ];
     let mut env = HashMap::new();
     for name in &args.keep_env {
@@ -851,18 +883,34 @@ mod tests {
         assert!(!inherited.values().any(|value| value == "sentinel"));
     }
 
-    #[test]
-    fn java_runtime_uses_authenticated_sbt_launcher_path() {
+    #[tokio::test]
+    async fn java_runtime_isolates_sbt_state() {
         let project = tempfile::tempdir().unwrap();
         let runtime = tempfile::tempdir().unwrap();
         let mut profile =
             SandboxProfile::for_ecosystem(Ecosystem::Java, Path::new("/home/test"), project.path());
 
-        let environment = build_extra_env(&mut profile, None, runtime.path(), project.path());
+        let environment = build_extra_env(&mut profile, None, runtime.path(), project.path())
+            .await
+            .unwrap();
         let sbt_options = environment.get("SBT_OPTS").unwrap();
 
-        assert!(sbt_options.contains("-Dsbt.launcher.coursier=false"));
         assert!(sbt_options.contains("-Dsbt.boot.directory="));
+        assert!(sbt_options.contains("-Dsbt.ivy.home="));
+    }
+
+    #[tokio::test]
+    async fn java_proxy_agent_is_private_and_refuses_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let runtime = tempfile::tempdir().unwrap();
+        let path = install_java_proxy_agent(runtime.path()).await.unwrap();
+        let metadata = tokio::fs::metadata(&path).await.unwrap();
+        let bytes = tokio::fs::read(&path).await.unwrap();
+
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o400);
+        assert!(bytes.starts_with(b"PK\x03\x04"));
+        assert!(install_java_proxy_agent(runtime.path()).await.is_err());
     }
 
     #[test]

@@ -88,17 +88,26 @@ impl ProxyEndpoint {
         )
     }
 
-    pub fn java_tool_options(&self) -> String {
+    fn java_tool_options(&self, agent_path: &str) -> String {
         format!(
-            "-Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort={} \
+            "-javaagent:{agent_path} \
+             -Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort={} \
              -Dhttp.proxyProtocol=http \
              -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort={} \
              -Dhttps.proxyProtocol=http \
-             -Dhttp.proxyUser=sbe -Dhttp.proxyPassword={} \
-             -Dhttps.proxyUser=sbe -Dhttps.proxyPassword={} -Dhttp.nonProxyHosts= \
+             -Dhttp.nonProxyHosts= \
              -Djdk.http.auth.tunneling.disabledSchemes=",
-            self.port, self.port, self.token, self.token
+            self.port, self.port
         )
+    }
+
+    /// Runtime variables for JVM clients. The one-time token stays outside
+    /// `JAVA_TOOL_OPTIONS`, which the JVM prints to stderr on every launch.
+    pub fn java_environment(&self, agent_path: &str) -> [(&'static str, String); 2] {
+        [
+            ("JAVA_TOOL_OPTIONS", self.java_tool_options(agent_path)),
+            ("SBE_PROXY_TOKEN", self.token.clone()),
+        ]
     }
 }
 
@@ -579,16 +588,23 @@ mod tests {
     }
 
     #[test]
-    fn java_options_identify_connect_proxy_as_http() {
+    fn java_environment_uses_agent_without_logging_token() {
         let endpoint = ProxyEndpoint {
             port: 12345,
             token: "sentinel-token".to_owned(),
         };
-        let options = endpoint.java_tool_options();
+        let environment = endpoint.java_environment("/private/sbe/proxy-agent.jar");
+        let options = &environment[0].1;
 
+        assert!(options.contains("-javaagent:/private/sbe/proxy-agent.jar"));
         assert!(options.contains("-Dhttp.proxyProtocol=http"));
         assert!(options.contains("-Dhttps.proxyProtocol=http"));
         assert!(options.contains("-Djdk.http.auth.tunneling.disabledSchemes="));
+        assert!(!options.contains("sentinel-token"));
+        assert_eq!(
+            environment[1],
+            ("SBE_PROXY_TOKEN", "sentinel-token".to_owned())
+        );
     }
 
     #[test]

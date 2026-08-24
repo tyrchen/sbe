@@ -418,6 +418,14 @@ A random per-run proxy authentication token can prevent unrelated local
 processes from casually using the proxy. It is defense in depth and does not
 fix SEC-001 by itself because the sandboxed child also knows the token and port.
 
+JVM clients use a private per-run Java agent to install an `Authenticator` for
+the exact SBE loopback proxy host and port. The agent reads the token from the
+reserved `SBE_PROXY_TOKEN` environment variable and responds only to proxy
+authentication challenges for that endpoint. The token must not be embedded in
+`JAVA_TOOL_OPTIONS`, because the JVM prints that variable at startup. The agent
+JAR is embedded in the CLI, created with exclusive-create semantics and mode
+0400 inside the private runtime directory, and never loaded from the project.
+
 ### 6.10 Audit correctness
 
 The backend launch result must expose the child PID and, where possible, a
