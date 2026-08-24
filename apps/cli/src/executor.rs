@@ -395,12 +395,15 @@ fn build_extra_env(
                     .into_owned(),
             );
             let sbt_root = runtime_temp.join("sbt");
+            // SBT launcher 1.4.x does not initialize proxy authentication for its embedded
+            // Coursier resolver. Its Ivy bootstrap path honors the authenticated JVM proxy.
             insert_runtime_environment(
                 profile,
                 &mut env,
                 "SBT_OPTS",
                 format!(
-                    "-Dsbt.global.base={} -Dsbt.boot.directory={} -Dsbt.ivy.home={}",
+                    "-Dsbt.global.base={} -Dsbt.boot.directory={} -Dsbt.ivy.home={} \
+                     -Dsbt.launcher.coursier=false",
                     sbt_root.join("global").display(),
                     sbt_root.join("boot").display(),
                     sbt_root.join("ivy2").display(),
@@ -846,6 +849,20 @@ mod tests {
         assert_eq!(inherited.len(), 2);
         assert_eq!(inherited.get("PATH").map(String::as_str), Some("/usr/bin"));
         assert!(!inherited.values().any(|value| value == "sentinel"));
+    }
+
+    #[test]
+    fn java_runtime_uses_authenticated_sbt_launcher_path() {
+        let project = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let mut profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Java, Path::new("/home/test"), project.path());
+
+        let environment = build_extra_env(&mut profile, None, runtime.path(), project.path());
+        let sbt_options = environment.get("SBT_OPTS").unwrap();
+
+        assert!(sbt_options.contains("-Dsbt.launcher.coursier=false"));
+        assert!(sbt_options.contains("-Dsbt.boot.directory="));
     }
 
     #[test]
