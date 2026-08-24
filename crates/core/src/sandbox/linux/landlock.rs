@@ -253,16 +253,22 @@ pub fn compile(
         } else {
             write_access(abi)
         };
-        created = add_write_rule(created, sp, access)?;
+        created = add_write_rule(created, sp, access, abi)?;
         // Mutable caches and outputs must be readable to be useful, but they
         // remain non-executable. The forbidden-read lint rejects overlaps.
-        created = add_path_rules(created, std::slice::from_ref(&sp.path), read_access(abi))?;
+        created = add_path_rules(
+            created,
+            std::slice::from_ref(&sp.path),
+            read_access(abi),
+            abi,
+        )?;
     }
     for path in BASELINE_WRITE_PATHS {
         created = add_write_rule(
             created,
             &SandboxPath::file(PathBuf::from(path)),
             write_access(abi),
+            abi,
         )?;
     }
 
@@ -273,7 +279,12 @@ pub fn compile(
     // entries like ~/.cargo/bin/, ~/.nvm/) because a hostile earlier
     // build can plant a symlink there.
     for sp in &profile.allow_exec {
-        created = add_path_rules(created, std::slice::from_ref(&sp.path), exec_access(abi))?;
+        created = add_path_rules(
+            created,
+            std::slice::from_ref(&sp.path),
+            exec_access(abi),
+            abi,
+        )?;
     }
 
     // Net rules — only on v4+. Loopback (proxy) or :443 fallback.
@@ -318,7 +329,12 @@ fn add_read_rule(
         .iter()
         .any(|denied| denied != &path.path && path_is_under(denied, &path.path));
     if !has_denied_descendant {
-        return add_path_rules(created, std::slice::from_ref(&path.path), read_access(abi));
+        return add_path_rules(
+            created,
+            std::slice::from_ref(&path.path),
+            read_access(abi),
+            abi,
+        );
     }
     if !matches!(path.kind, PathKind::Subpath) {
         return Err(CoreError::ProfileLint(format!(
@@ -395,7 +411,8 @@ fn add_carved_read_directory(
             created =
                 add_carved_read_directory(created, child, &child_path, forbidden, abi, visited)?;
         } else {
-            created = created.add_rule(PathBeneath::new(child, read_access(abi)))?;
+            let compatible = access_for_fd(&child, read_access(abi), abi)?;
+            created = created.add_rule(PathBeneath::new(child, compatible))?;
         }
     }
     Ok(created)
@@ -413,10 +430,12 @@ fn add_path_rules(
     mut created: RulesetCreated,
     paths: &[PathBuf],
     access: BitFlags<AccessFs>,
+    abi: ABI,
 ) -> Result<RulesetCreated, CoreError> {
     for path in paths {
         if let Some(fd) = open_existing_safely(path)? {
-            created = created.add_rule(PathBeneath::new(fd, access))?;
+            let compatible = access_for_fd(&fd, access, abi)?;
+            created = created.add_rule(PathBeneath::new(fd, compatible))?;
         }
     }
     Ok(created)
@@ -426,6 +445,7 @@ fn add_write_rule(
     mut created: RulesetCreated,
     path: &SandboxPath,
     access: BitFlags<AccessFs>,
+    abi: ABI,
 ) -> Result<RulesetCreated, CoreError> {
     use crate::config::PathKind;
     let fd = match path.kind {
@@ -439,7 +459,8 @@ fn add_write_rule(
         }
     };
     if let Some(fd) = fd {
-        created = created.add_rule(PathBeneath::new(fd, access))?;
+        let compatible = access_for_fd(&fd, access, abi)?;
+        created = created.add_rule(PathBeneath::new(fd, compatible))?;
     } else {
         tracing::debug!(
             path = %path.path.display(),
@@ -447,6 +468,26 @@ fn add_write_rule(
         );
     }
     Ok(created)
+}
+
+/// Landlock rejects directory-only rights (for example `ReadDir`, `MakeReg`,
+/// or `RemoveFile`) when a rule targets a regular file or device node. Keep
+/// the requested subtree rights for directories, but narrow literal file
+/// rules to the ABI's file-compatible access set.
+fn access_for_fd(
+    fd: &OwnedFd,
+    access: BitFlags<AccessFs>,
+    abi: ABI,
+) -> Result<BitFlags<AccessFs>, CoreError> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) } != 0 {
+        return Err(CoreError::Io(std::io::Error::last_os_error()));
+    }
+    if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+        Ok(access)
+    } else {
+        Ok(access & AccessFs::from_file(abi))
+    }
 }
 
 /// Open an existing path with no symlink or magic-link traversal. A distro
@@ -756,6 +797,27 @@ mod tests {
         }
         assert!(ephemeral_write_access(ABI::V9).contains(AccessFs::ResolveUnix));
         assert!(!ephemeral_write_access(ABI::V9).contains(AccessFs::IoctlDev));
+    }
+
+    #[test]
+    fn literal_file_rules_drop_directory_only_rights() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = tempfile::NamedTempFile::new_in(temp.path()).unwrap();
+
+        let directory = open_no_symlinks(temp.path(), true).unwrap();
+        let file = open_no_symlinks(file.path(), false).unwrap();
+        let requested = read_access(ABI::V9) | write_access(ABI::V9);
+
+        assert_eq!(
+            access_for_fd(&directory, requested, ABI::V9).unwrap(),
+            requested
+        );
+        let file_access = access_for_fd(&file, requested, ABI::V9).unwrap();
+        assert_eq!(file_access, requested & AccessFs::from_file(ABI::V9));
+        assert!(file_access.contains(AccessFs::ReadFile));
+        assert!(file_access.contains(AccessFs::WriteFile));
+        assert!(!file_access.contains(AccessFs::ReadDir));
+        assert!(!file_access.contains(AccessFs::MakeReg));
     }
 
     #[test]

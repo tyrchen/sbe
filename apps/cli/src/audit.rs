@@ -439,8 +439,6 @@ mod linux {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt as _;
-
     use tokio::io::AsyncWriteExt as _;
 
     use super::*;
