@@ -169,7 +169,13 @@ invocation. Modern Yarn PnP installs pre-create `.pnp.cjs` (and the optional
 ESM loader when configured)
 only when `.yarnrc.yml` or `packageManager` identifies a PnP-capable Yarn;
 Classic Yarn and the `node-modules` linker remain lockfile-only. Mutating Bun
-commands receive only their own `bun.lock` output.
+commands receive only their own `bun.lock` output, plus `yarn.lock` when Bun's
+`--yarn` compatibility output is requested. In nested Git worktrees, SBE reads
+bounded, no-follow workspace metadata and pre-creates lockfiles at exactly one
+active Node workspace root. Package-manager options that relocate the project
+(`--prefix`, `--cwd`, `--dir`, `--directory`, `--project`, and equivalent short
+forms) are rejected before policy preparation; change directory before running
+SBE instead.
 
 Python installation and synchronization commands similarly keep project
 `.venv`/`venv` directories writable but non-executable. Run/test commands,
@@ -245,9 +251,10 @@ Persistent write and execute grants may not overlap. The only default W+X
 exception is the private per-run root, which is deleted when the invocation
 finishes. Toolchains such as `~/.rustup` are executable/readable but not
 writable. Mutable caches are readable/writable but not executable. Before
-launch, SBE also rejects regular files that cross this boundary through
-hard-linked writable and executable pathnames; hard links wholly contained in
-a non-executable writable tree remain valid.
+launch, SBE also rejects a writable regular file unless all of its hard-link
+pathnames are contained in writable roots. This prevents a writable cache
+alias from mutating executable tools, source, workflows, or any other protected
+path. Hard links wholly contained in writable roots remain valid.
 
 On Linux, paths are opened with descriptor-relative `openat2` resolution using
 `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and

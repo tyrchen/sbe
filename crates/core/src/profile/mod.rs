@@ -17,7 +17,7 @@ use crate::{
 };
 
 #[cfg(unix)]
-const MAX_WX_ALIAS_SCAN_ENTRIES: usize = 1_000_000;
+const MAX_WRITABLE_ALIAS_SCAN_ENTRIES: usize = 1_000_000;
 
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -640,14 +640,13 @@ impl SandboxProfile {
         };
     }
 
-    /// Reject persistent write/execute overlap, including existing hard-link
-    /// aliases that name the same regular-file inode through disjoint paths.
-    /// Mutable executable content is a persistence boundary, not merely a
-    /// filesystem convenience.
+    /// Reject persistent write/execute overlap and writable hard-link aliases
+    /// that escape the writable roots. Mutable executable or protected source
+    /// content is a persistence boundary, not merely a filesystem convenience.
     pub fn validate_security_invariants(&self) -> Result<(), crate::error::CoreError> {
         self.validate_structural_security_invariants()?;
         #[cfg(unix)]
-        self.reject_hard_linked_write_exec_aliases()?;
+        self.reject_hard_linked_write_aliases()?;
         Ok(())
     }
 
@@ -677,7 +676,7 @@ impl SandboxProfile {
     }
 
     #[cfg(unix)]
-    fn reject_hard_linked_write_exec_aliases(&self) -> Result<(), crate::error::CoreError> {
+    fn reject_hard_linked_write_aliases(&self) -> Result<(), crate::error::CoreError> {
         let mut inspected = 0_usize;
         let mut observations: HashMap<FileIdentity, HardLinkObservation> = HashMap::new();
         for writable in &self.allow_write {
@@ -706,45 +705,22 @@ impl SandboxProfile {
             })?;
         }
 
-        let candidates: std::collections::HashSet<FileIdentity> = observations
-            .iter()
-            .filter_map(|(identity, observation)| {
-                ((observation.writable_paths.len() as u64) < observation.link_count)
-                    .then_some(*identity)
-            })
-            .collect();
-        if candidates.is_empty() {
-            return Ok(());
-        }
-
-        for executable in &self.allow_exec {
-            if self
-                .ephemeral_write_exec
-                .iter()
-                .any(|root| executable.path.starts_with(root))
-            {
+        for observation in observations.values() {
+            if (observation.writable_paths.len() as u64) >= observation.link_count {
                 continue;
             }
-            visit_regular_files(executable, &mut inspected, &mut |path, metadata| {
-                let identity = file_identity(metadata);
-                let Some(observation) = observations.get(&identity) else {
-                    return Ok(());
-                };
-                if !candidates.contains(&identity) {
-                    return Ok(());
-                }
-                let writable = observation
-                    .writable_paths
-                    .iter()
-                    .next()
-                    .expect("hard-link observation has a writable path");
-                Err(crate::error::CoreError::ProfileLint(format!(
-                    "persistent writable path '{}' and executable path '{}' are hard links to \
-                     the same file; remove the cross-boundary alias",
-                    writable.display(),
-                    path.display(),
-                )))
-            })?;
+            let writable = observation
+                .writable_paths
+                .iter()
+                .next()
+                .expect("hard-link observation has a writable path");
+            return Err(crate::error::CoreError::ProfileLint(format!(
+                "persistent writable path '{}' has {} hard links but only {} are contained in \
+                 writable roots; remove every cross-boundary alias",
+                writable.display(),
+                observation.link_count,
+                observation.writable_paths.len(),
+            )));
         }
         Ok(())
     }
@@ -878,9 +854,9 @@ fn visit_regular_files(
                 ))
             })?;
             *inspected = inspected.saturating_add(1);
-            if *inspected > MAX_WX_ALIAS_SCAN_ENTRIES {
+            if *inspected > MAX_WRITABLE_ALIAS_SCAN_ENTRIES {
                 return Err(crate::error::CoreError::ProfileLint(format!(
-                    "persistent W^X alias scan exceeds {MAX_WX_ALIAS_SCAN_ENTRIES} entries"
+                    "persistent writable-alias scan exceeds {MAX_WRITABLE_ALIAS_SCAN_ENTRIES} entries"
                 )));
             }
             let path = entry.path();
@@ -1458,30 +1434,32 @@ mod tests {
         clippy::disallowed_methods,
         reason = "synchronous filesystem setup is isolated to this invariant unit test"
     )]
-    fn test_should_reject_write_execute_overlap_through_hard_link_alias() {
+    fn test_should_reject_hard_link_alias_outside_writable_roots() {
         let directory = tempfile::tempdir().unwrap();
         let writable = directory.path().join("writable");
-        let executable = directory.path().join("executable");
+        let protected = directory.path().join("protected");
         std::fs::create_dir(&writable).unwrap();
-        std::fs::create_dir(&executable).unwrap();
-        let tool = executable.join("tool");
-        std::fs::write(&tool, "trusted tool").unwrap();
-        let alias = writable.join("tool-alias");
-        std::fs::hard_link(&tool, &alias).unwrap();
+        std::fs::create_dir(&protected).unwrap();
+        let workflow = protected.join("ci.yml");
+        std::fs::write(&workflow, "protected workflow").unwrap();
+        let alias = writable.join("workflow-alias");
+        std::fs::hard_link(&workflow, &alias).unwrap();
 
         let mut profile =
             SandboxProfile::for_ecosystem(Ecosystem::Rust, directory.path(), directory.path());
         profile.allow_write = vec![SandboxPath::dir(writable.clone())];
-        profile.allow_exec = vec![SandboxPath::dir(executable)];
+        profile.allow_exec.clear();
         let error = profile.validate_security_invariants().unwrap_err();
         assert!(format!("{error}").contains("hard links"));
 
+        let internal = writable.join("internal");
+        std::fs::write(&internal, "cache entry").unwrap();
         let internal_alias = writable.join("internal-alias");
-        std::fs::hard_link(&alias, internal_alias).unwrap();
-        profile.allow_exec.clear();
+        std::fs::hard_link(&internal, internal_alias).unwrap();
+        std::fs::remove_file(alias).unwrap();
         assert!(
             profile.validate_security_invariants().is_ok(),
-            "hard links wholly contained in a non-executable writable tree are safe"
+            "hard links wholly contained in writable roots are safe"
         );
     }
 }

@@ -405,8 +405,12 @@ values, nested commands, `--` payloads, informational flags, mutually exclusive
 manager outputs, and read-only commands must not acquire empty lockfiles as a
 launcher side effect. Yarn PnP outputs are selected only when bounded,
 no-follow project metadata identifies Berry/PnP, including the optional ESM
-loader flag. Mutating Bun commands select `bun.lock` without granting unrelated
-manager outputs. Commands that explicitly execute installed Node tools replace
+loader flag. Nested projects use that same bounded metadata to select exactly
+one active Node workspace lockfile root. Project-relocation options are rejected
+before profile preparation so the launcher cannot create outputs relative to a
+different directory. Mutating Bun commands select `bun.lock`, adding
+`yarn.lock` only when `--yarn` requests it, without granting unrelated manager
+outputs. Commands that explicitly execute installed Node tools replace
 the built-in `node_modules` write grant with an execute grant for that
 invocation; install commands retain write-without-execute. Python run/test
 commands apply the same transition to built-in project `.venv` and `venv`
@@ -416,11 +420,12 @@ the private per-run target root. Denied read paths that traverse symlinks fail
 policy compilation. Denied regular files, including descendants of denied
 directories, must have exactly one hard link because Landlock cannot
 distinguish pathname aliases of the same inode. User grants are rejected
-whether they contain a denied path or are nested beneath one. Persistent W^X
-validation must also compare regular-file identities across writable and
-executable roots and fail closed when disjoint pathnames are hard links to the
-same inode; aliases wholly contained inside non-executable writable roots
-remain permitted.
+whether they contain a denied path or are nested beneath one. Persistent
+writable-alias validation must count each regular file's link count and fail
+closed unless every hard-link pathname is accounted for within writable roots.
+This protects executable paths as well as source, workflow, policy, and other
+non-writable content; aliases wholly contained inside writable roots remain
+permitted.
 
 ### 6.8 macOS SBPL generation and IPC
 

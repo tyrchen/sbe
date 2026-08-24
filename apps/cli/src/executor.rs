@@ -9,6 +9,9 @@ use std::{
     process::ExitCode,
 };
 
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
+
 use anyhow::Context;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use sbe_core::{
@@ -68,6 +71,7 @@ pub async fn execute(args: &RunArgs) -> ExitCode {
 async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
     let pwd = std::env::current_dir().context("failed to get current directory")?;
     let home = dirs::home_dir().context("could not determine home directory")?;
+    reject_project_relocation(&args.command)?;
 
     // Determine ecosystem
     let command_name = &args.command[0];
@@ -529,6 +533,43 @@ fn command_is(command: &[String], expected: &str) -> bool {
         .is_some_and(|name| name == expected)
 }
 
+fn reject_project_relocation(command: &[String]) -> anyhow::Result<()> {
+    let Some(option) = project_relocation_option(command) else {
+        return Ok(());
+    };
+    anyhow::bail!(
+        "project relocation option '{option}' is unsupported because sandbox grants are anchored \
+         to the current directory; change directory before invoking sbe"
+    )
+}
+
+fn project_relocation_option(command: &[String]) -> Option<&str> {
+    let program = Path::new(command.first()?.as_str())
+        .file_name()
+        .and_then(|name| name.to_str())?;
+    let options: &[&str] = match program {
+        "cargo" => &["-C"],
+        "npm" => &["--prefix"],
+        "yarn" | "bun" => &["--cwd"],
+        "pnpm" => &["--dir", "-C"],
+        "uv" => &["--directory", "--project"],
+        "poetry" | "pdm" => &["--directory", "--project", "-C", "-P", "-p"],
+        _ => return None,
+    };
+    command
+        .iter()
+        .skip(1)
+        .take_while(|argument| argument.as_str() != "--")
+        .find_map(|argument| {
+            options.iter().copied().find(|option| {
+                argument == *option
+                    || argument.strip_prefix(*option).is_some_and(|suffix| {
+                        suffix.starts_with('=') || (!option.starts_with("--") && !suffix.is_empty())
+                    })
+            })
+        })
+}
+
 #[cfg(target_os = "linux")]
 fn command_has_flag(command: &[String], flags: &[&str]) -> bool {
     command
@@ -904,6 +945,7 @@ fn ensure_literal_write_targets(
     use sbe_core::config::PathKind;
     use std::os::fd::OwnedFd;
 
+    reject_project_relocation(command)?;
     let program = command
         .first()
         .and_then(|program| Path::new(program).file_name())
@@ -941,7 +983,7 @@ fn ensure_literal_write_targets(
                     "t",
                 ]) =>
             {
-                vec!["Cargo.lock"]
+                vec![project_dir.join("Cargo.lock")]
             }
             "npm"
                 if subcommand.is_command(&[
@@ -959,19 +1001,24 @@ fn ensure_literal_write_targets(
                     "update",
                 ]) =>
             {
-                vec!["package-lock.json"]
+                vec![
+                    selected_node_output_root(profile, project_dir, program, "package-lock.json")?
+                        .join("package-lock.json"),
+                ]
             }
             "yarn"
                 if subcommand == ParsedTopLevel::NoCommand
                     || subcommand.is_command(&["add", "dedupe", "install", "remove", "up"]) =>
             {
-                let (uses_pnp, uses_esm_loader) = yarn_pnp_configuration(project_dir)?;
-                let mut outputs = vec!["yarn.lock"];
+                let output_root =
+                    selected_node_output_root(profile, project_dir, program, "yarn.lock")?;
+                let (uses_pnp, uses_esm_loader) = yarn_pnp_configuration(&output_root)?;
+                let mut outputs = vec![output_root.join("yarn.lock")];
                 if uses_pnp {
-                    outputs.push(".pnp.cjs");
+                    outputs.push(output_root.join(".pnp.cjs"));
                 }
                 if uses_esm_loader {
-                    outputs.push(".pnp.loader.mjs");
+                    outputs.push(output_root.join(".pnp.loader.mjs"));
                 }
                 outputs
             }
@@ -989,7 +1036,10 @@ fn ensure_literal_write_targets(
                     "update",
                 ]) =>
             {
-                vec!["pnpm-lock.yaml"]
+                vec![
+                    selected_node_output_root(profile, project_dir, program, "pnpm-lock.yaml")?
+                        .join("pnpm-lock.yaml"),
+                ]
             }
             "bun"
                 if subcommand.is_command(&[
@@ -1002,19 +1052,25 @@ fn ensure_literal_write_targets(
                     "update",
                 ]) =>
             {
-                vec!["bun.lock"]
+                let output_root =
+                    selected_node_output_root(profile, project_dir, program, "bun.lock")?;
+                let mut outputs = vec![output_root.join("bun.lock")];
+                if command_has_flag(command, &["--yarn"]) {
+                    outputs.push(output_root.join("yarn.lock"));
+                }
+                outputs
             }
             "uv" if subcommand.is_command(&["add", "lock", "remove", "run", "sync", "tree"]) => {
-                vec!["uv.lock"]
+                vec![project_dir.join("uv.lock")]
             }
             "poetry" if subcommand.is_command(&["add", "install", "lock", "remove", "update"]) => {
-                vec!["poetry.lock"]
+                vec![project_dir.join("poetry.lock")]
             }
             "pdm"
                 if subcommand
                     .is_command(&["add", "install", "lock", "remove", "run", "sync", "update"]) =>
             {
-                vec!["pdm.lock"]
+                vec![project_dir.join("pdm.lock")]
             }
             "mix"
                 if subcommand.is_command(&[
@@ -1024,7 +1080,7 @@ fn ensure_literal_write_targets(
                     "local.rebar",
                 ]) =>
             {
-                vec!["mix.lock"]
+                vec![project_dir.join("mix.lock")]
             }
             _ => Vec::new(),
         }
@@ -1034,13 +1090,7 @@ fn ensure_literal_write_targets(
         if target.kind != PathKind::Literal {
             continue;
         }
-        if index < profile.first_user_allow_write
-            && !target
-                .path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| built_in_outputs.contains(&name))
-        {
+        if index < profile.first_user_allow_write && !built_in_outputs.contains(&target.path) {
             continue;
         }
         let parent = target
@@ -1101,6 +1151,155 @@ fn ensure_literal_write_targets(
         }
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn selected_node_output_root(
+    profile: &SandboxProfile,
+    project_dir: &Path,
+    program: &str,
+    lockfile: &str,
+) -> anyhow::Result<PathBuf> {
+    let mut candidates: Vec<PathBuf> = profile.allow_write[..profile
+        .first_user_allow_write
+        .min(profile.allow_write.len())]
+        .iter()
+        .filter(|target| target.kind == sbe_core::config::PathKind::Literal)
+        .filter(|target| target.path.file_name().is_some_and(|name| name == lockfile))
+        .filter_map(|target| target.path.parent().map(Path::to_path_buf))
+        .filter(|root| project_dir.starts_with(root))
+        .collect();
+    candidates.sort_by_key(|root| std::cmp::Reverse(root.components().count()));
+    candidates.dedup();
+
+    for root in candidates {
+        if root != project_dir && node_workspace_contains(&root, project_dir, program)? {
+            return Ok(root);
+        }
+    }
+    Ok(project_dir.to_path_buf())
+}
+
+#[cfg(target_os = "linux")]
+fn node_workspace_contains(root: &Path, project_dir: &Path, program: &str) -> anyhow::Result<bool> {
+    let relative = project_dir
+        .strip_prefix(root)
+        .context("Node workspace candidate is not an ancestor of the project")?;
+    if relative.as_os_str().is_empty() {
+        return Ok(true);
+    }
+
+    let mut patterns = Vec::new();
+    if let Some(contents) = read_bounded_project_file(&root.join("package.json"))? {
+        let package: serde_json::Value = serde_json::from_slice(&contents).with_context(|| {
+            format!("parse workspace metadata: {}/package.json", root.display())
+        })?;
+        if let Some(workspaces) = package.get("workspaces") {
+            let values = match workspaces {
+                serde_json::Value::Array(values) => values,
+                serde_json::Value::Object(mapping) => mapping
+                    .get("packages")
+                    .and_then(serde_json::Value::as_array)
+                    .context("package.json workspaces.packages must be an array")?,
+                _ => anyhow::bail!("package.json workspaces must be an array or mapping"),
+            };
+            for value in values {
+                patterns.push(
+                    value
+                        .as_str()
+                        .context("package.json workspace pattern must be a string")?
+                        .to_owned(),
+                );
+            }
+        }
+    }
+
+    if program == "pnpm"
+        && let Some(contents) = read_bounded_project_file(&root.join("pnpm-workspace.yaml"))?
+    {
+        let workspace: serde_yaml::Value = serde_yaml::from_slice(&contents)
+            .context("parse pnpm-workspace.yaml for output policy")?;
+        let values = workspace
+            .as_mapping()
+            .and_then(|mapping| mapping.get(serde_yaml::Value::String("packages".to_owned())))
+            .and_then(serde_yaml::Value::as_sequence)
+            .context("pnpm-workspace.yaml packages must be an array")?;
+        for value in values {
+            patterns.push(
+                value
+                    .as_str()
+                    .context("pnpm workspace pattern must be a string")?
+                    .to_owned(),
+            );
+        }
+    }
+
+    let relative = relative
+        .to_str()
+        .context("Node workspace path is not valid UTF-8")?;
+    let mut included = false;
+    for pattern in patterns {
+        let (exclude, pattern) = pattern
+            .strip_prefix('!')
+            .map_or((false, pattern.as_str()), |pattern| (true, pattern));
+        if workspace_glob_matches_prefix(pattern.trim_matches('/'), relative) {
+            included = !exclude;
+        }
+    }
+    Ok(included)
+}
+
+#[cfg(target_os = "linux")]
+fn workspace_glob_matches_prefix(pattern: &str, path: &str) -> bool {
+    fn matches(pattern: &[&str], path: &[&str]) -> bool {
+        let Some((component, remaining_pattern)) = pattern.split_first() else {
+            return true;
+        };
+        if *component == "**" {
+            return matches(remaining_pattern, path)
+                || path
+                    .split_first()
+                    .is_some_and(|(_, remaining_path)| matches(pattern, remaining_path));
+        }
+        path.split_first()
+            .is_some_and(|(path_component, remaining_path)| {
+                workspace_component_matches(component, path_component)
+                    && matches(remaining_pattern, remaining_path)
+            })
+    }
+
+    let pattern: Vec<&str> = pattern.split('/').filter(|part| !part.is_empty()).collect();
+    let path: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    !pattern.is_empty() && matches(&pattern, &path)
+}
+
+#[cfg(target_os = "linux")]
+fn workspace_component_matches(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let value = value.as_bytes();
+    let mut matched = vec![false; value.len() + 1];
+    matched[0] = true;
+    for token in pattern {
+        let mut next = vec![false; value.len() + 1];
+        match token {
+            b'*' => {
+                next[0] = matched[0];
+                for index in 1..=value.len() {
+                    next[index] = matched[index] || next[index - 1];
+                }
+            }
+            b'?' => {
+                next[1..].copy_from_slice(&matched[..value.len()]);
+            }
+            literal => {
+                for index in 1..=value.len() {
+                    next[index] = matched[index - 1] && value[index - 1] == *literal;
+                }
+            }
+        }
+        matched = next;
+    }
+    matched[value.len()]
 }
 
 /// Determine which Yarn linker outputs are required without executing Yarn or
@@ -1770,6 +1969,36 @@ mod tests {
     }
 
     #[test]
+    fn project_relocation_options_are_rejected_before_policy_preparation() {
+        for command in [
+            vec!["npm", "--prefix", "subproject", "install"],
+            vec!["npm", "install", "--prefix=subproject"],
+            vec!["yarn", "--cwd", "subproject", "install"],
+            vec!["pnpm", "-Csubproject", "install"],
+            vec!["bun", "--cwd=subproject", "install"],
+            vec!["uv", "--project", "subproject", "sync"],
+            vec!["poetry", "-P", "subproject", "install"],
+            vec!["cargo", "-Csubproject", "build"],
+        ] {
+            let command: Vec<String> = command.into_iter().map(str::to_owned).collect();
+            assert!(
+                reject_project_relocation(&command).is_err(),
+                "relocating command was accepted: {command:?}"
+            );
+        }
+        assert!(
+            reject_project_relocation(&[
+                "npm".to_owned(),
+                "install".to_owned(),
+                "--".to_owned(),
+                "--prefix".to_owned(),
+                "payload".to_owned(),
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn cli_paths_reject_parent_traversal() {
         assert!(
             expand_cli_path(
@@ -1853,6 +2082,23 @@ mod tests {
         assert!(!bun_project.path().join("yarn.lock").exists());
         assert!(!bun_project.path().join("pnpm-lock.yaml").exists());
 
+        let bun_yarn_project = tempfile::tempdir().unwrap();
+        let bun_yarn_profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Node,
+            Path::new("/home/test"),
+            bun_yarn_project.path(),
+        );
+        ensure_literal_write_targets(
+            &bun_yarn_profile,
+            &["bun".to_owned(), "install".to_owned(), "--yarn".to_owned()],
+            bun_yarn_project.path(),
+        )
+        .unwrap();
+        assert!(bun_yarn_project.path().join("bun.lock").is_file());
+        assert!(bun_yarn_project.path().join("yarn.lock").is_file());
+        assert!(!bun_yarn_project.path().join("package-lock.json").exists());
+        assert!(!bun_yarn_project.path().join("pnpm-lock.yaml").exists());
+
         let frozen_bun_project = tempfile::tempdir().unwrap();
         let frozen_bun_profile = SandboxProfile::for_ecosystem(
             Ecosystem::Node,
@@ -1898,6 +2144,84 @@ mod tests {
         )
         .unwrap();
         assert!(!read_only_project.path().join("package-lock.json").exists());
+
+        let relocated_project = tempfile::tempdir().unwrap();
+        let relocated_profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Node,
+            Path::new("/home/test"),
+            relocated_project.path(),
+        );
+        assert!(
+            ensure_literal_write_targets(
+                &relocated_profile,
+                &[
+                    "npm".to_owned(),
+                    "--prefix".to_owned(),
+                    "subproject".to_owned(),
+                    "install".to_owned(),
+                ],
+                relocated_project.path(),
+            )
+            .is_err()
+        );
+        assert!(!relocated_project.path().join("package-lock.json").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous filesystem setup is isolated to this launcher helper unit test"
+    )]
+    fn literal_write_targets_select_one_node_workspace_root() {
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repository.path().join(".git")).unwrap();
+        std::fs::write(
+            repository.path().join("package.json"),
+            r#"{"name":"workspace","workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        let member = repository.path().join("packages/app");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(member.join("package.json"), r#"{"name":"app"}"#).unwrap();
+        let profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Node, Path::new("/home/test"), &member);
+        ensure_literal_write_targets(&profile, &["npm".to_owned(), "install".to_owned()], &member)
+            .unwrap();
+        assert!(repository.path().join("package-lock.json").is_file());
+        assert!(!member.join("package-lock.json").exists());
+
+        let standalone_repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir(standalone_repository.path().join(".git")).unwrap();
+        std::fs::write(
+            standalone_repository.path().join("package.json"),
+            r#"{"name":"unrelated-root"}"#,
+        )
+        .unwrap();
+        let standalone = standalone_repository.path().join("nested");
+        std::fs::create_dir(&standalone).unwrap();
+        std::fs::write(standalone.join("package.json"), r#"{"name":"standalone"}"#).unwrap();
+        let standalone_profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Node, Path::new("/home/test"), &standalone);
+        ensure_literal_write_targets(
+            &standalone_profile,
+            &["npm".to_owned(), "install".to_owned()],
+            &standalone,
+        )
+        .unwrap();
+        assert!(standalone.join("package-lock.json").is_file());
+        assert!(
+            !standalone_repository
+                .path()
+                .join("package-lock.json")
+                .exists()
+        );
+
+        assert!(workspace_glob_matches_prefix(
+            "packages/*",
+            "packages/app/src"
+        ));
+        assert!(!workspace_glob_matches_prefix("examples/*", "packages/app"));
     }
 
     #[cfg(target_os = "linux")]
