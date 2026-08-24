@@ -133,7 +133,10 @@ runs:
         # The checksum detects transfer corruption; the GitHub attestation
         # independently binds this archive digest to this repository's
         # protected release workflow and tagged source revision.
-        gh attestation verify "$tmp/$asset" --repo tyrchen/sbe
+        gh attestation verify "$tmp/$asset" \
+          --repo tyrchen/sbe \
+          --signer-workflow tyrchen/sbe/.github/workflows/release-cli.yml \
+          --source-ref "refs/tags/$TAG"
 
         tar -xzf "$tmp/$asset" -C "$tmp"
 

@@ -183,6 +183,20 @@ jobs:
             exit 1
           fi
 
+      - name: Linux parent environment is not recoverable through procfs
+        if: runner.os == 'Linux'
+        env:
+          SBE_PARENT_PROC_SECRET: parent-proc-sentinel
+        run: |
+          set -euo pipefail
+          sbe run --allow-all-network --profile rust -- /bin/sh -c '
+            if /bin/cat "/proc/$PPID/environ" 2>/dev/null \
+                | /usr/bin/tr "\000" "\n" \
+                | /usr/bin/grep -q parent-proc-sentinel; then
+              exit 1
+            fi
+          '
+
       - name: inherited file descriptors are closed before target exec
         run: |
           set -euo pipefail

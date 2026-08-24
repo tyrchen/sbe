@@ -81,6 +81,15 @@ impl DomainPattern {
             host == pattern
         }
     }
+
+    /// Return whether two allow/deny patterns authorize at least one common
+    /// hostname. Since the proxy has no separate denylist, an overlapping
+    /// allow pattern must be removed in full for a denial to remain effective.
+    pub fn overlaps(&self, other: &Self) -> bool {
+        let self_root = self.0.strip_prefix("*.").unwrap_or(&self.0);
+        let other_root = other.0.strip_prefix("*.").unwrap_or(&other.0);
+        self.matches(other_root) || other.matches(self_root)
+    }
 }
 
 impl fmt::Display for DomainPattern {
@@ -496,20 +505,9 @@ impl SandboxProfile {
             self.add_allow_exec(path.clone(), GrantOrigin::Cli);
         }
 
-        if !overrides.deny_domains.is_empty() {
-            self.allow_domains
-                .retain(|d| !overrides.deny_domains.iter().any(|denied| denied.0 == d.0));
-            self.grant_origins.retain(|record| {
-                record.kind != GrantKind::AllowDomain
-                    || !overrides
-                        .deny_domains
-                        .iter()
-                        .any(|denied| denied.0 == record.value)
-            });
-        }
-
         self.allow_fetch
             .extend(overrides.allow_fetch.iter().cloned());
+        self.remove_denied_domains(&overrides.deny_domains);
 
         if overrides.allow_all_network {
             self.allow_all_network = true;
@@ -529,6 +527,26 @@ impl SandboxProfile {
                 origin: GrantOrigin::Cli,
             });
         }
+    }
+
+    /// Apply a higher-precedence domain denial to every network grant that
+    /// has been accumulated so far. Pattern intersection matters: retaining
+    /// `*.example.com` would otherwise defeat a denial for `bad.example.com`.
+    pub(crate) fn remove_denied_domains(&mut self, denied: &[DomainPattern]) {
+        if denied.is_empty() {
+            return;
+        }
+        self.allow_domains
+            .retain(|allowed| !denied.iter().any(|pattern| pattern.overlaps(allowed)));
+        self.allow_fetch
+            .retain(|allowed| !denied.iter().any(|pattern| pattern.overlaps(allowed)));
+        self.grant_origins.retain(|record| {
+            if !matches!(record.kind, GrantKind::AllowDomain | GrantKind::AllowFetch) {
+                return true;
+            }
+            DomainPattern::new(&record.value)
+                .is_ok_and(|allowed| !denied.iter().any(|pattern| pattern.overlaps(&allowed)))
+        });
     }
 
     /// Finalize the profile: apply allow_fetch effects to allow_exec and allow_domains.
@@ -1096,6 +1114,50 @@ mod tests {
         assert!(has(&profile.allow_exec, "/usr/bin/curl"));
         assert!(has(&profile.allow_exec, "/usr/bin/wget"));
         assert!(profile.allow_domains.iter().any(|d| d.0 == "example.com"));
+    }
+
+    #[test]
+    fn domain_denials_remove_fetch_grants_before_finalize() {
+        let home = PathBuf::from("/Users/test");
+        let pwd = PathBuf::from("/Users/test/project");
+        let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, &home, &pwd);
+        let overrides = ProfileOverrides {
+            allow_fetch: vec![DomainPattern::from("downloads.example.com")],
+            deny_domains: vec![DomainPattern::from("downloads.example.com")],
+            ..Default::default()
+        };
+
+        profile.merge_overrides(&overrides);
+        profile.finalize();
+
+        assert!(profile.allow_fetch.is_empty());
+        assert!(
+            !profile
+                .allow_domains
+                .iter()
+                .any(|domain| domain.matches("downloads.example.com"))
+        );
+    }
+
+    #[test]
+    fn domain_denials_remove_intersecting_exact_and_wildcard_grants() {
+        let home = PathBuf::from("/Users/test");
+        let pwd = PathBuf::from("/Users/test/project");
+        let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, &home, &pwd);
+        profile.allow_domains = vec![
+            DomainPattern::from("*.example.com"),
+            DomainPattern::from("api.other.test"),
+        ];
+
+        profile.remove_denied_domains(&[DomainPattern::from("bad.example.com")]);
+        assert_eq!(
+            profile.allow_domains,
+            vec![DomainPattern::from("api.other.test")]
+        );
+
+        profile.allow_domains = vec![DomainPattern::from("api.example.com")];
+        profile.remove_denied_domains(&[DomainPattern::from("*.example.com")]);
+        assert!(profile.allow_domains.is_empty());
     }
 
     #[test]

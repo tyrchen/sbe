@@ -283,13 +283,6 @@ impl ProfileConfig {
             });
             profile.allow_domains.push(domain);
         }
-        for d in &self.deny_domains {
-            let denied = DomainPattern::new(d).map_err(CoreError::ProfileLint)?;
-            profile.allow_domains.retain(|domain| domain != &denied);
-            profile
-                .grant_origins
-                .retain(|record| record.kind != GrantKind::AllowDomain || record.value != denied.0);
-        }
         for p in &self.deny_exec {
             profile.add_deny_exec(expand_path(p, home, pwd), origin.clone());
         }
@@ -305,6 +298,12 @@ impl ProfileConfig {
             });
             profile.allow_fetch.push(domain);
         }
+        let denied_domains = self
+            .deny_domains
+            .iter()
+            .map(|domain| DomainPattern::new(domain).map_err(CoreError::ProfileLint))
+            .collect::<Result<Vec<_>, _>>()?;
+        profile.remove_denied_domains(&denied_domains);
         if let Some(allow_all) = self.allow_all_network {
             profile.allow_all_network = allow_all;
         }
@@ -751,6 +750,37 @@ profiles:
 
         assert_eq!(profile.allow_write.len(), original_write + 1);
         assert_eq!(profile.allow_domains.len(), original_domains + 1);
+    }
+
+    #[test]
+    fn profile_config_denials_cover_wildcards_and_same_layer_fetches() {
+        let home = PathBuf::from("/Users/test");
+        let pwd = PathBuf::from("/Users/test/project");
+        let pc = ProfileConfig {
+            allow_domains: vec!["*.example.com".to_owned()],
+            deny_domains: vec!["bad.example.com".to_owned()],
+            allow_fetch: vec!["bad.example.com".to_owned()],
+            ..Default::default()
+        };
+        let mut profile =
+            SandboxProfile::for_ecosystem(crate::detect::Ecosystem::Node, &home, &pwd);
+
+        pc.apply_to(
+            &mut profile,
+            &home,
+            &pwd,
+            &GrantOrigin::Explicit(PathBuf::from("test.yaml")),
+        )
+        .unwrap();
+        profile.finalize();
+
+        assert!(profile.allow_fetch.is_empty());
+        assert!(
+            !profile
+                .allow_domains
+                .iter()
+                .any(|domain| domain.matches("bad.example.com"))
+        );
     }
 
     #[test]

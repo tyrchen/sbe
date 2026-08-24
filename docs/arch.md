@@ -143,10 +143,12 @@ rules when they contain a protected descendant such as `$PWD/.env`.
 Landlock ABI v4 can restrict a TCP destination **port**, not an address. SBE
 therefore refuses `Proxy` mode on Linux by default. The user must explicitly
 acknowledge the bypass with `--allow-insecure-linux-network`, ideally combined
-with a network namespace or trusted egress firewall. Restricted modes also use
-seccomp to reject Internet datagram/raw/packet sockets. The syscall layer also
-blocks keyring access, cross-process descriptor duplication, `io_uring`, and
-old and new mount APIs that could bypass ordinary syscall or capability paths.
+with a network namespace or trusted egress firewall. Proxy mode uses seccomp to
+reject Internet datagram/raw/packet sockets; direct-443 compatibility retains
+datagrams for libc DNS while still rejecting raw and packet sockets. The
+syscall layer also blocks keyring access, cross-process descriptor duplication,
+`io_uring`, and old and new mount APIs that could bypass ordinary syscall or
+capability paths.
 
 ## 7. CONNECT proxy
 

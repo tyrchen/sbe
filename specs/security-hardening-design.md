@@ -214,6 +214,8 @@ The resolver must reject contradictory inputs. In particular:
 - `enableProxy=true` plus no allowed destinations becomes `DenyAll`.
 - `allowAllNetwork=false` at a higher precedence recomputes the mode; it must
   not retain an earlier `enableProxy=false` side effect.
+- A higher-precedence `denyDomains` removes intersecting exact or wildcard
+  grants from both `allowDomains` and `allowFetch`, before fetch finalization.
 - Proxy startup failure aborts the command.
 - A proxy task that exits while the command is alive terminates the command and
   reports an SBE failure.
@@ -288,6 +290,12 @@ fallback. macOS should use the corresponding close-on-exec mechanism. Stdio
 inheritance remains intentional and must be documented: redirecting a secret
 file to stdin explicitly grants it to the command.
 
+Linux must not grant recursive read access to `/proc`: that would let the
+child recover filtered credentials from `/proc/$PPID/environ`. Grant the
+current process's procfs subtree by descriptor plus an explicit list of public
+kernel-information nodes; parent and sibling process directories remain
+unreadable.
+
 ### 6.4 Safe launcher architecture on Linux
 
 Do not install Landlock and seccomp through a complex `pre_exec` closure in a
@@ -330,7 +338,10 @@ one of the following:
 
 UDP, Unix sockets, inherited sockets, and local services are separately
 modeled capabilities. Strict mode denies all except what the profile explicitly
-needs.
+needs. Direct-TCP-443 compatibility may retain datagram sockets for libc DNS,
+but must disclose that UDP egress is not destination-confined. An explicit
+allow-all mode must also stop handling Landlock `ResolveUnix`, so it does not
+silently continue blocking ambient Unix-domain sockets.
 
 ### 6.6 Linux filesystem policy
 
@@ -376,6 +387,13 @@ not all of `$PWD`. `.git`, `.github/workflows`, SBE config, source files, and
 package manifests remain non-writable during install/build by default. A
 compatibility option may grant full workspace write, but inspection must label
 it as persistent-source mutation authority.
+
+On Linux, missing literal lockfiles are created only when the invoked package
+manager subcommand can update that specific lockfile. Mutually exclusive
+manager outputs and read-only commands must not acquire empty lockfiles as a
+launcher side effect. Denied read paths that traverse symlinks fail policy
+compilation, and user grants are rejected whether they contain a denied path or
+are nested beneath one.
 
 ### 6.8 macOS SBPL generation and IPC
 

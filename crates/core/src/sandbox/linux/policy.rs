@@ -96,7 +96,11 @@ pub fn render(
     // The curated read allowlist is materialized by the landlock builder at
     // run time; we list its anchors here for transparency.
     let _ = writeln!(out, "  readAllowlistAnchors:");
-    for anchor in super::landlock::READ_ALLOWLIST_ANCHORS {
+    for anchor in super::landlock::READ_ALLOWLIST_ANCHORS
+        .iter()
+        .chain(super::landlock::PROC_READ_ALLOWLIST_ANCHORS)
+        .chain(std::iter::once(&"/proc/self"))
+    {
         let _ = writeln!(out, "    - {}", yaml_string(anchor));
     }
 
@@ -141,9 +145,14 @@ pub fn render(
             NetworkMode::DenyAll => {
                 let _ = writeln!(out, "        - socket(all families)");
             }
-            NetworkMode::Proxy | NetworkMode::DirectHttps443 => {
+            NetworkMode::Proxy => {
                 let _ = writeln!(out, "        - socket(AF_PACKET)");
                 let _ = writeln!(out, "        - socket(AF_INET|AF_INET6, datagram|raw)");
+            }
+            NetworkMode::DirectHttps443 => {
+                let _ = writeln!(out, "        - socket(AF_PACKET)");
+                let _ = writeln!(out, "        - socket(AF_INET|AF_INET6, raw)");
+                let _ = writeln!(out, "  dnsCompatibility: UDP datagrams permitted");
             }
             NetworkMode::AllowAll => {}
         }

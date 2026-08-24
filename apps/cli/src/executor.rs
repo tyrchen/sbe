@@ -1,12 +1,12 @@
+use std::{collections::HashMap, path::Path, process::ExitCode};
+
+#[cfg(target_os = "linux")]
 use std::{
-    collections::HashMap,
     ffi::CString,
     os::{
         fd::{AsRawFd, FromRawFd},
         unix::ffi::OsStrExt,
     },
-    path::Path,
-    process::ExitCode,
 };
 
 use anyhow::Context;
@@ -93,15 +93,9 @@ async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
     }
     profile.finalize();
 
-    // Cargo atomically initializes a missing target directory through a
-    // sibling `targetXXXXXX` path. Creating the fixed output root before the
-    // untrusted command avoids granting a broad `target*` write pattern.
     if !args.dry_run {
-        if ecosystem == Ecosystem::Rust {
-            ensure_child_directory(&pwd, c"target")?;
-        }
         #[cfg(target_os = "linux")]
-        ensure_literal_write_targets(&profile)?;
+        ensure_literal_write_targets(&profile, &args.command)?;
     }
 
     // Give each invocation an isolated temporary tree. The handle remains
@@ -153,6 +147,7 @@ async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
         proxy.as_ref().map(|runtime| &runtime.endpoint),
         &runtime_temp_path,
         &pwd,
+        &args.command,
     )
     .await?;
 
@@ -307,6 +302,7 @@ async fn build_extra_env(
     proxy_endpoint: Option<&ProxyEndpoint>,
     runtime_temp: &Path,
     project_dir: &Path,
+    command: &[String],
 ) -> anyhow::Result<HashMap<String, String>> {
     let mut env = filter_parent_environment(std::env::vars());
     let mut inherited: Vec<String> = env.keys().cloned().collect();
@@ -322,11 +318,24 @@ async fn build_extra_env(
     let profile_name = profile.name.clone();
     match profile_name.as_str() {
         "rust" => {
+            let cargo_executes_target = Path::new(command.first().map_or("", String::as_str))
+                .file_name()
+                .is_some_and(|name| name == "cargo")
+                && command
+                    .iter()
+                    .skip(1)
+                    .take_while(|argument| argument.as_str() != "--")
+                    .any(|argument| matches!(argument.as_str(), "run" | "test" | "bench"));
+            let target_dir = if cargo_executes_target {
+                runtime_temp.join("cargo-target")
+            } else {
+                project_dir.join("target")
+            };
             insert_runtime_environment(
                 profile,
                 &mut env,
                 "CARGO_TARGET_DIR",
-                project_dir.join("target").to_string_lossy().into_owned(),
+                target_dir.to_string_lossy().into_owned(),
             );
             insert_runtime_environment(
                 profile,
@@ -514,57 +523,82 @@ where
         .collect()
 }
 
-/// Atomically create or verify a direct child directory without following a
-/// final-component symlink. The parent descriptor fixes the target directory
-/// even if another process renames a path component concurrently.
-fn ensure_child_directory(parent: &Path, name: &std::ffi::CStr) -> anyhow::Result<()> {
-    let parent =
-        CString::new(parent.as_os_str().as_bytes()).context("project directory contains NUL")?;
-    // SAFETY: both C strings are NUL-terminated and remain alive for each
-    // syscall; successful descriptors are immediately owned and closed.
-    let parent_fd = unsafe {
-        libc::open(
-            parent.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-        )
-    };
-    if parent_fd < 0 {
-        return Err(std::io::Error::last_os_error()).context("open project directory safely");
-    }
-    let parent_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(parent_fd) };
-    let created = unsafe { libc::mkdirat(parent_fd.as_raw_fd(), name.as_ptr(), 0o700) };
-    if created < 0 {
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(error).context("create dedicated build output directory");
-        }
-    }
-    let child_fd = unsafe {
-        libc::openat(
-            parent_fd.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-        )
-    };
-    if child_fd < 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("build output must be a real directory, not a symlink");
-    }
-    drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(child_fd) });
-    Ok(())
-}
-
 /// Landlock can grant writes to an existing file inode, but creating one
-/// requires directory-wide `MakeReg`. Pre-create only the explicitly listed
-/// literal outputs through a no-symlink parent descriptor so fresh lockfiles
-/// work without broadening source-directory authority.
+/// requires directory-wide `MakeReg`. Pre-create only the built-in lockfile
+/// associated with the invoked package manager plus user-requested literal
+/// outputs. This avoids creating mutually exclusive lockfiles as a side
+/// effect of an unrelated or read-only command.
 #[cfg(target_os = "linux")]
-fn ensure_literal_write_targets(profile: &SandboxProfile) -> anyhow::Result<()> {
+fn ensure_literal_write_targets(
+    profile: &SandboxProfile,
+    command: &[String],
+) -> anyhow::Result<()> {
     use sbe_core::config::PathKind;
     use std::os::fd::OwnedFd;
 
-    for target in &profile.allow_write {
+    let program = command.first().map_or("", String::as_str);
+    let program = Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program);
+    let invokes = |subcommands: &[&str]| {
+        command
+            .iter()
+            .skip(1)
+            .take_while(|argument| argument.as_str() != "--")
+            .any(|argument| subcommands.contains(&argument.as_str()))
+    };
+    let refuses_lockfile_creation =
+        invokes(&["--frozen", "--frozen-lockfile", "--immutable", "--locked"]);
+    let built_in_lockfile = if refuses_lockfile_creation {
+        None
+    } else {
+        match program {
+            "cargo"
+                if invokes(&[
+                    "bench",
+                    "build",
+                    "check",
+                    "doc",
+                    "fetch",
+                    "generate-lockfile",
+                    "metadata",
+                    "run",
+                    "test",
+                    "tree",
+                    "update",
+                ]) =>
+            {
+                Some("Cargo.lock")
+            }
+            "npm" if invokes(&["dedupe", "install", "uninstall", "update"]) => {
+                Some("package-lock.json")
+            }
+            "yarn" if invokes(&["add", "dedupe", "install", "remove", "up"]) => Some("yarn.lock"),
+            "pnpm" if invokes(&["add", "dedupe", "import", "install", "remove", "update"]) => {
+                Some("pnpm-lock.yaml")
+            }
+            "uv" if invokes(&["add", "lock", "remove", "run", "sync", "tree"]) => Some("uv.lock"),
+            "poetry" if invokes(&["add", "install", "lock", "remove", "update"]) => {
+                Some("poetry.lock")
+            }
+            "pdm" if invokes(&["add", "install", "lock", "remove", "run", "sync", "update"]) => {
+                Some("pdm.lock")
+            }
+            "mix" if invokes(&["deps.get", "deps.update", "local.hex", "local.rebar"]) => {
+                Some("mix.lock")
+            }
+            _ => None,
+        }
+    };
+
+    for (index, target) in profile.allow_write.iter().enumerate() {
         if target.kind != PathKind::Literal {
+            continue;
+        }
+        if index < profile.first_user_allow_write
+            && target.path.file_name().and_then(|name| name.to_str()) != built_in_lockfile
+        {
             continue;
         }
         let parent = target
@@ -890,13 +924,56 @@ mod tests {
         let mut profile =
             SandboxProfile::for_ecosystem(Ecosystem::Java, Path::new("/home/test"), project.path());
 
-        let environment = build_extra_env(&mut profile, None, runtime.path(), project.path())
+        let environment = build_extra_env(&mut profile, None, runtime.path(), project.path(), &[])
             .await
             .unwrap();
         let sbt_options = environment.get("SBT_OPTS").unwrap();
 
         assert!(sbt_options.contains("-Dsbt.boot.directory="));
         assert!(sbt_options.contains("-Dsbt.ivy.home="));
+    }
+
+    #[tokio::test]
+    async fn rust_runtime_places_executable_artifacts_in_private_temp() {
+        let project = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let mut profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Rust, Path::new("/home/test"), project.path());
+
+        let environment = build_extra_env(
+            &mut profile,
+            None,
+            runtime.path(),
+            project.path(),
+            &["cargo".to_owned(), "test".to_owned()],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            environment.get("CARGO_TARGET_DIR").map(String::as_str),
+            runtime.path().join("cargo-target").to_str()
+        );
+        assert_ne!(
+            environment.get("CARGO_TARGET_DIR").map(String::as_str),
+            project.path().join("target").to_str()
+        );
+
+        let build_environment = build_extra_env(
+            &mut profile,
+            None,
+            runtime.path(),
+            project.path(),
+            &["cargo".to_owned(), "build".to_owned()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            build_environment
+                .get("CARGO_TARGET_DIR")
+                .map(String::as_str),
+            project.path().join("target").to_str()
+        );
     }
 
     #[tokio::test]
@@ -913,24 +990,38 @@ mod tests {
         assert!(install_java_proxy_agent(runtime.path()).await.is_err());
     }
 
-    #[test]
-    fn dedicated_output_directory_refuses_symlinks() {
-        let project = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(outside.path(), project.path().join("target")).unwrap();
-        assert!(ensure_child_directory(project.path(), c"target").is_err());
-    }
-
     #[cfg(target_os = "linux")]
     #[test]
-    fn literal_write_targets_are_created_without_broad_parent_grants() {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous filesystem setup is isolated to this launcher helper unit test"
+    )]
+    fn literal_write_targets_only_create_the_selected_managers_lockfile() {
         let project = tempfile::tempdir().unwrap();
-        let mut profile =
+        let profile =
             SandboxProfile::for_ecosystem(Ecosystem::Rust, Path::new("/home/test"), project.path());
         let lockfile = project.path().join("Cargo.lock");
-        profile.allow_write = vec![SandboxPath::file(lockfile.clone())];
-        ensure_literal_write_targets(&profile).unwrap();
+        ensure_literal_write_targets(&profile, &["/usr/bin/cargo".to_owned(), "build".to_owned()])
+            .unwrap();
         assert!(lockfile.is_file());
+
+        let profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Node, Path::new("/home/test"), project.path());
+        ensure_literal_write_targets(&profile, &["npm".to_owned(), "install".to_owned()]).unwrap();
+        assert!(project.path().join("package-lock.json").is_file());
+        assert!(!project.path().join("yarn.lock").exists());
+        assert!(!project.path().join("pnpm-lock.yaml").exists());
+        assert!(!project.path().join(".pnp.cjs").exists());
+
+        let read_only_project = tempfile::tempdir().unwrap();
+        let profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Node,
+            Path::new("/home/test"),
+            read_only_project.path(),
+        );
+        ensure_literal_write_targets(&profile, &["npm".to_owned(), "--version".to_owned()])
+            .unwrap();
+        assert!(!read_only_project.path().join("package-lock.json").exists());
     }
 
     #[cfg(target_os = "linux")]
@@ -946,14 +1037,21 @@ mod tests {
         let mut profile =
             SandboxProfile::for_ecosystem(Ecosystem::Rust, Path::new("/home/test"), project.path());
         profile.allow_write = vec![SandboxPath::file(project.path().join("redirect/lock"))];
-        assert!(ensure_literal_write_targets(&profile).is_err());
+        profile.first_user_allow_write = 0;
+        assert!(
+            ensure_literal_write_targets(&profile, &["cargo".to_owned(), "build".to_owned()])
+                .is_err()
+        );
 
         let target = project.path().join("real-lock");
         std::fs::write(&target, "sentinel").unwrap();
         let link = project.path().join("Cargo.lock");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         profile.allow_write = vec![SandboxPath::file(link)];
-        assert!(ensure_literal_write_targets(&profile).is_err());
+        assert!(
+            ensure_literal_write_targets(&profile, &["cargo".to_owned(), "build".to_owned()])
+                .is_err()
+        );
         assert_eq!(std::fs::read_to_string(target).unwrap(), "sentinel");
     }
 }

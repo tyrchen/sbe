@@ -2,7 +2,8 @@
 //!
 //! The filters are the defense-in-depth layer behind Landlock: they block
 //! syscalls Landlock doesn't cover (ptrace, raw sockets, user-namespace
-//! creation) and reject Internet datagram/raw sockets for restricted modes.
+//! creation), reject Internet datagram/raw sockets in proxy mode, and retain
+//! only datagram compatibility for DNS in direct-443 mode.
 //!
 //! We emit **two** [`BpfProgram`]s rather than one: a "kill" filter for
 //! hostile syscalls (`ptrace`, `bpf`, `kexec_*`, `init_module`, …) that map
@@ -176,23 +177,31 @@ fn network_socket_rules(mode: NetworkMode) -> Result<Vec<SeccompRule>, CoreError
     let internet_families = [libc::AF_INET as u64, libc::AF_INET6 as u64];
     let mut rules = Vec::new();
     for family in internet_families {
-        if mode != NetworkMode::AllowAll {
-            // The low four bits are the socket type; SOCK_CLOEXEC and
-            // SOCK_NONBLOCK may be ORed into the argument.
-            for socket_type in [
-                libc::SOCK_DGRAM,
-                libc::SOCK_RAW,
-                libc::SOCK_RDM,
-                libc::SOCK_SEQPACKET,
-            ] {
-                rules.push(socket_rule(family, Some(socket_type as u64))?);
-            }
+        // The low four bits are the socket type; SOCK_CLOEXEC and
+        // SOCK_NONBLOCK may be ORed into the argument. Direct-443 mode must
+        // retain datagram sockets because libc normally resolves DNS over
+        // UDP; this compatibility mode does not claim domain confinement.
+        for socket_type in blocked_internet_socket_types(mode) {
+            rules.push(socket_rule(family, Some(*socket_type as u64))?);
         }
     }
     if mode != NetworkMode::AllowAll {
         rules.push(socket_rule(libc::AF_PACKET as u64, None)?);
     }
     Ok(rules)
+}
+
+fn blocked_internet_socket_types(mode: NetworkMode) -> &'static [libc::c_int] {
+    match mode {
+        NetworkMode::Proxy => &[
+            libc::SOCK_DGRAM,
+            libc::SOCK_RAW,
+            libc::SOCK_RDM,
+            libc::SOCK_SEQPACKET,
+        ],
+        NetworkMode::DirectHttps443 => &[libc::SOCK_RAW, libc::SOCK_RDM, libc::SOCK_SEQPACKET],
+        NetworkMode::DenyAll | NetworkMode::AllowAll => &[],
+    }
 }
 
 fn socket_rule(family: u64, socket_type: Option<u64>) -> Result<SeccompRule, CoreError> {
@@ -344,6 +353,16 @@ mod tests {
     #[test]
     fn proxy_mode_blocks_datagram_raw_and_packet_sockets() {
         assert_eq!(network_socket_rules(NetworkMode::Proxy).unwrap().len(), 9);
+        assert_eq!(
+            network_socket_rules(NetworkMode::DirectHttps443)
+                .unwrap()
+                .len(),
+            7,
+            "direct-443 retains IPv4/IPv6 datagrams for DNS"
+        );
+        assert!(
+            !blocked_internet_socket_types(NetworkMode::DirectHttps443).contains(&libc::SOCK_DGRAM)
+        );
         assert!(
             network_socket_rules(NetworkMode::AllowAll)
                 .unwrap()

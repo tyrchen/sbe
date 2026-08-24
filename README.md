@@ -45,7 +45,8 @@ SBE therefore does not call this domain confinement. A proxy profile either:
 
 `--allow-all-network` remains an explicit request to remove network isolation.
 `--no-proxy` selects direct-TCP-443 compatibility mode and is never described
-as domain-filtered.
+as domain-filtered. On Linux it also permits Internet datagram sockets so libc
+can resolve DNS; use proxy mode when UDP egress must remain blocked.
 
 See the [security hardening design](specs/security-hardening-design.md) for the
 threat model, findings, and adversarial verification plan.

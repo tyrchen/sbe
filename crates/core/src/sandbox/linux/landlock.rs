@@ -50,7 +50,6 @@ pub const READ_ALLOWLIST_ANCHORS: &[&str] = &[
     "/lib32",
     "/lib64",
     "/usr",
-    "/proc",
     "/sys",
     // Named devices only; never expose the complete /dev tree.
     "/dev/null",
@@ -73,6 +72,20 @@ pub const READ_ALLOWLIST_ANCHORS: &[&str] = &[
     // allowlist. Narrow to the two read-only stub files.
     "/run/systemd/resolve/stub-resolv.conf",
     "/run/systemd/resolve/resolv.conf",
+];
+
+/// Public procfs data needed by common runtimes. `/proc` itself is
+/// deliberately not granted: doing so would expose `/proc/$PPID/environ` and
+/// undo the child environment allowlist.
+pub const PROC_READ_ALLOWLIST_ANCHORS: &[&str] = &[
+    "/proc/cpuinfo",
+    "/proc/filesystems",
+    "/proc/loadavg",
+    "/proc/meminfo",
+    "/proc/stat",
+    "/proc/sys",
+    "/proc/uptime",
+    "/proc/version",
 ];
 
 /// Baseline writable paths injected into every Linux ruleset.
@@ -185,6 +198,17 @@ fn highest_abi(probe: &ProbeResult) -> ABI {
     }
 }
 
+fn handled_fs_access(abi: ABI, mode: NetworkMode) -> BitFlags<AccessFs> {
+    let mut access = AccessFs::from_all(abi);
+    if mode == NetworkMode::AllowAll {
+        // ResolveUnix is classified as a filesystem right by Landlock, but it
+        // is network mediation. Handling it in allow-all mode would still
+        // block ambient sockets outside the private runtime root.
+        access.remove(AccessFs::ResolveUnix);
+    }
+    access
+}
+
 /// A ready-to-apply Landlock ruleset. Built in the single-threaded launcher;
 /// the wrapped [`RulesetCreated`] holds all preopened path FDs internally.
 pub struct CompiledLandlock {
@@ -214,7 +238,7 @@ pub fn compile(
     let abi = highest_abi(probe);
     let ruleset = Ruleset::default()
         .set_compatibility(CompatLevel::HardRequirement)
-        .handle_access(AccessFs::from_all(abi))?;
+        .handle_access(handled_fs_access(abi, profile.network_mode))?;
     let ruleset =
         if probe.abi.supports_net_port_filter() && profile.network_mode != NetworkMode::AllowAll {
             ruleset.handle_access(AccessNet::ConnectTcp | AccessNet::BindTcp)?
@@ -229,7 +253,11 @@ pub fn compile(
     // Every rule is opened atomically without following user-controlled
     // symlinks. Root-owned distro symlinks are resolved only after verifying
     // every lexical and canonical ancestor.
-    let baseline_reads: Vec<PathBuf> = READ_ALLOWLIST_ANCHORS.iter().map(PathBuf::from).collect();
+    let baseline_reads: Vec<PathBuf> = READ_ALLOWLIST_ANCHORS
+        .iter()
+        .chain(PROC_READ_ALLOWLIST_ANCHORS)
+        .map(PathBuf::from)
+        .collect();
     let mut carved_entries = 0_usize;
     for path in &baseline_reads {
         let sandbox_path = if path.is_dir() {
@@ -245,6 +273,7 @@ pub fn compile(
             &mut carved_entries,
         )?;
     }
+    created = add_proc_self_read_rule(created, abi)?;
     for sp in &profile.allow_read {
         created = add_read_rule(created, sp, &forbidden_reads, abi, &mut carved_entries)?;
     }
@@ -322,6 +351,26 @@ pub fn compile(
     }
 
     Ok(CompiledLandlock { ruleset: created })
+}
+
+/// Grant only this process's procfs subtree. The descriptor is opened by the
+/// single-threaded launcher and continues to identify the same process after
+/// exec, while parent and sibling process directories receive no rule.
+fn add_proc_self_read_rule(created: RulesetCreated, abi: ABI) -> Result<RulesetCreated, CoreError> {
+    let fd = unsafe {
+        libc::open(
+            c"/proc/self".as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(CoreError::Io(std::io::Error::last_os_error()));
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let compatible = access_for_fd(&fd, read_access(abi), abi)?;
+    created
+        .add_rule(PathBeneath::new(fd, compatible))
+        .map_err(CoreError::from)
 }
 
 /// Add a read subtree while preserving holes for built-in `denyRead` paths.
@@ -727,6 +776,18 @@ fn root_owned_chain(path: &Path) -> Result<(), String> {
 fn build_forbidden_reads(profile: &SandboxProfile) -> Result<BTreeSet<PathBuf>, CoreError> {
     let mut set = BTreeSet::new();
     for sp in &profile.deny_read {
+        match open_no_symlinks(&sp.path, false) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+                return Err(CoreError::ProfileLint(format!(
+                    "denyRead path '{}' traverses a symlink; refusing a policy whose canonical \
+                     target could receive a read grant",
+                    sp.path.display()
+                )));
+            }
+            Err(error) => return Err(CoreError::Io(error)),
+        }
         set.insert(sp.path.clone());
     }
     Ok(set)
@@ -766,12 +827,12 @@ fn lint_forbidden_reads_against_grants(
     for (field, paths) in user_slices {
         for sp in paths {
             for f in forbidden {
-                if path_is_under(f, &sp.path) {
+                if path_is_under(f, &sp.path) || path_is_under(&sp.path, f) {
                     return Err(CoreError::ProfileLint(format!(
-                        "denyRead path '{}' is under user-supplied {} entry '{}'. Landlock grants \
+                        "denyRead path '{}' overlaps user-supplied {} entry '{}'. Landlock grants \
                          on allowWrite and allowExec include data-read, so this would silently \
-                         expose the denied path. Either narrow the {} entry, remove the denyRead \
-                         entry.",
+                         expose the denied path. Remove or relocate the {} entry, or remove the \
+                         denyRead entry.",
                         f.display(),
                         field,
                         sp.path.display(),
@@ -871,6 +932,12 @@ mod tests {
         }
         assert!(ephemeral_write_access(ABI::V9).contains(AccessFs::ResolveUnix));
         assert!(!ephemeral_write_access(ABI::V9).contains(AccessFs::IoctlDev));
+    }
+
+    #[test]
+    fn allow_all_does_not_handle_unix_socket_resolution() {
+        assert!(handled_fs_access(ABI::V9, NetworkMode::Proxy).contains(AccessFs::ResolveUnix));
+        assert!(!handled_fs_access(ABI::V9, NetworkMode::AllowAll).contains(AccessFs::ResolveUnix));
     }
 
     #[test]
@@ -1080,6 +1147,58 @@ mod tests {
             lint_forbidden_reads_against_grants(&profile, &forbidden, BackendOptions::default())
                 .unwrap_err();
         assert!(format!("{err}").contains("allowExec"));
+    }
+
+    #[test]
+    fn test_should_reject_user_grants_nested_beneath_forbidden_read() {
+        for field in ["allowRead", "allowWrite", "allowExec"] {
+            let mut profile = SandboxProfile::for_ecosystem(
+                Ecosystem::Rust,
+                &PathBuf::from("/home/test"),
+                &PathBuf::from("/home/test/pwd"),
+            );
+            profile.deny_read.clear();
+            profile
+                .deny_read
+                .push(SandboxPath::dir(PathBuf::from("/home/test/.ssh")));
+            let grant = SandboxPath::file(PathBuf::from("/home/test/.ssh/id_rsa"));
+            match field {
+                "allowRead" => profile.allow_read.push(grant),
+                "allowWrite" => profile.allow_write.push(grant),
+                "allowExec" => profile.allow_exec.push(grant),
+                _ => unreachable!(),
+            }
+
+            let forbidden = build_forbidden_reads(&profile).unwrap();
+            let error = lint_forbidden_reads_against_grants(
+                &profile,
+                &forbidden,
+                BackendOptions::default(),
+            )
+            .unwrap_err();
+            assert!(format!("{error}").contains(field));
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous filesystem setup is isolated to this Linux policy unit test"
+    )]
+    fn forbidden_read_symlink_fails_closed() {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir().unwrap();
+        let target = project.path().join("config.env");
+        std::fs::write(&target, "secret").unwrap();
+        let denied = project.path().join(".env");
+        symlink(&target, &denied).unwrap();
+        let mut profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Rust, project.path(), project.path());
+        profile.deny_read = vec![SandboxPath::file(denied)];
+
+        let error = build_forbidden_reads(&profile).unwrap_err();
+        assert!(format!("{error}").contains("traverses a symlink"));
     }
 
     #[test]
