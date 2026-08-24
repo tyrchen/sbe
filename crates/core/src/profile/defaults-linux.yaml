@@ -145,6 +145,11 @@ common:
     - "/usr/bin/pkg-config"
     - "/usr/local/bin/cmake"
     - "/usr/local/bin/pkg-config"
+    # GCC launches versioned, architecture-specific helpers such as
+    # collect2, cc1, and lto-wrapper from these immutable compiler-only
+    # trees. Keep the grant narrower than /usr/lib or /usr/libexec.
+    - "/usr/libexec/gcc/"
+    - "/usr/lib/gcc/"
     # Dynamic linker — Landlock EXECUTE is required to start any
     # dynamically-linked binary on Linux.
     - "/lib64/ld-linux-x86-64.so.2"
