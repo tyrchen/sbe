@@ -502,19 +502,19 @@ fn open_existing_safely(path: &Path) -> Result<Option<OwnedFd>, CoreError> {
         Ok(fd) => Ok(Some(fd)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
-            if !root_owned_chain(path) {
-                return Err(CoreError::ProfileLint(format!(
-                    "allowlist path '{}' traverses an untrusted symlink",
+            root_owned_chain(path).map_err(|reason| {
+                CoreError::ProfileLint(format!(
+                    "allowlist path '{}' traverses an untrusted symlink: {reason}",
                     path.display()
-                )));
-            }
+                ))
+            })?;
             let canonical = std::fs::canonicalize(path).map_err(CoreError::Io)?;
-            if !root_owned_chain(&canonical) {
-                return Err(CoreError::ProfileLint(format!(
-                    "allowlist path '{}' resolves outside a root-owned immutable tree",
+            root_owned_chain(&canonical).map_err(|reason| {
+                CoreError::ProfileLint(format!(
+                    "allowlist path '{}' resolves outside a root-owned immutable tree: {reason}",
                     path.display()
-                )));
-            }
+                ))
+            })?;
             open_no_symlinks(&canonical, false)
                 .map(Some)
                 .map_err(CoreError::Io)
@@ -628,18 +628,22 @@ fn openat2_component(
     clippy::disallowed_methods,
     reason = "the policy compiler runs synchronously in the pre-runtime Linux launcher"
 )]
-fn root_owned_chain(path: &Path) -> bool {
+fn root_owned_chain(path: &Path) -> Result<(), String> {
     let mut current = PathBuf::from("/");
     for component in path.components() {
         use std::path::Component;
         match component {
             Component::RootDir => continue,
             Component::Normal(name) => current.push(name),
-            _ => return false,
+            _ => {
+                return Err(format!(
+                    "'{}' contains a non-normal path component",
+                    path.display()
+                ));
+            }
         }
-        let Ok(metadata) = std::fs::symlink_metadata(&current) else {
-            return false;
-        };
+        let metadata = std::fs::symlink_metadata(&current)
+            .map_err(|error| format!("cannot inspect '{}': {error}", current.display()))?;
         // A symlink has no mutable payload: replacing it requires write
         // access to its parent directory. We verify every non-symlink
         // lexical ancestor here and separately verify the complete
@@ -650,11 +654,22 @@ fn root_owned_chain(path: &Path) -> bool {
         if metadata.file_type().is_symlink() {
             continue;
         }
-        if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
-            return false;
+        if metadata.uid() != 0 {
+            return Err(format!(
+                "'{}' is owned by UID {}, not root",
+                current.display(),
+                metadata.uid()
+            ));
+        }
+        if metadata.mode() & 0o022 != 0 {
+            return Err(format!(
+                "'{}' is group/world writable (mode {:o})",
+                current.display(),
+                metadata.mode() & 0o7777
+            ));
         }
     }
-    true
+    Ok(())
 }
 
 fn build_forbidden_reads(profile: &SandboxProfile) -> Result<BTreeSet<PathBuf>, CoreError> {
@@ -840,9 +855,9 @@ mod tests {
             Path::new("/lib/ld-linux-aarch64.so.1"),
         ] {
             if path.exists() {
-                assert!(root_owned_chain(path), "{}", path.display());
+                root_owned_chain(path).unwrap();
                 let canonical = std::fs::canonicalize(path).unwrap();
-                assert!(root_owned_chain(&canonical), "{}", canonical.display());
+                root_owned_chain(&canonical).unwrap();
             }
         }
     }
