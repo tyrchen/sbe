@@ -318,7 +318,7 @@ async fn build_extra_env(
     insert_runtime_environment(profile, &mut env, "TMPDIR", temp.clone());
     insert_runtime_environment(profile, &mut env, "TMP", temp.clone());
     insert_runtime_environment(profile, &mut env, "TEMP", temp.clone());
-    insert_runtime_environment(profile, &mut env, "XDG_RUNTIME_DIR", temp);
+    insert_runtime_environment(profile, &mut env, "XDG_RUNTIME_DIR", temp.clone());
     let profile_name = profile.name.clone();
     match profile_name.as_str() {
         "rust" => {
@@ -422,7 +422,7 @@ async fn build_extra_env(
         insert_runtime_environment(profile, &mut env, "no_proxy", String::new());
         if profile.name == "java" {
             let agent_path = install_java_proxy_agent(runtime_temp).await?;
-            for (name, value) in endpoint.java_environment(&agent_path) {
+            for (name, value) in endpoint.java_environment(&agent_path, &temp) {
                 insert_runtime_environment(profile, &mut env, name, value);
             }
         }

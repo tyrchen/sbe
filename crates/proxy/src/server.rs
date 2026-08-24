@@ -88,9 +88,10 @@ impl ProxyEndpoint {
         )
     }
 
-    fn java_tool_options(&self, agent_path: &str) -> String {
+    fn java_tool_options(&self, agent_path: &str, temp_path: &str) -> String {
         format!(
             "-javaagent:{agent_path} \
+             -Djava.io.tmpdir={temp_path} \
              -Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort={} \
              -Dhttp.proxyProtocol=http \
              -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort={} \
@@ -103,9 +104,16 @@ impl ProxyEndpoint {
 
     /// Runtime variables for JVM clients. The one-time token stays outside
     /// `JAVA_TOOL_OPTIONS`, which the JVM prints to stderr on every launch.
-    pub fn java_environment(&self, agent_path: &str) -> [(&'static str, String); 2] {
+    pub fn java_environment(
+        &self,
+        agent_path: &str,
+        temp_path: &str,
+    ) -> [(&'static str, String); 2] {
         [
-            ("JAVA_TOOL_OPTIONS", self.java_tool_options(agent_path)),
+            (
+                "JAVA_TOOL_OPTIONS",
+                self.java_tool_options(agent_path, temp_path),
+            ),
             ("SBE_PROXY_TOKEN", self.token.clone()),
         ]
     }
@@ -593,10 +601,11 @@ mod tests {
             port: 12345,
             token: "sentinel-token".to_owned(),
         };
-        let environment = endpoint.java_environment("/private/sbe/proxy-agent.jar");
+        let environment = endpoint.java_environment("/private/sbe/proxy-agent.jar", "/private/sbe");
         let options = &environment[0].1;
 
         assert!(options.contains("-javaagent:/private/sbe/proxy-agent.jar"));
+        assert!(options.contains("-Djava.io.tmpdir=/private/sbe"));
         assert!(options.contains("-Dhttp.proxyProtocol=http"));
         assert!(options.contains("-Dhttps.proxyProtocol=http"));
         assert!(options.contains("-Djdk.http.auth.tunneling.disabledSchemes="));
