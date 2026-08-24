@@ -486,6 +486,11 @@ and `audit_stream` is false when the required source is unavailable.
 - No persistent path is both writable and executable.
 - Workflow lint rejects mutable action references and excessive permissions.
 - CI runs `cargo audit`, `cargo deny`, and `cargo machete`.
+- Hex 2.5.x dependency extraction is staged outside strict mode because it
+  creates unpredictable `tmp_*` entries in the project root. CI still runs
+  dependency compilation and adversarial Mix project evaluation inside SBE;
+  SBE does not silently trade source immutability for `mix deps.get`
+  compatibility.
 
 ### 7.3 Documentation tests
 

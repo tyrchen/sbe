@@ -511,7 +511,10 @@ jobs:
             def hello, do: Jason.encode!(%{name: "sbe", age: 1})
           end
           EX
-          sbe run --allow-insecure-linux-network -- mix deps.get 2>&1 | tee deps.log
+          # Hex 2.5.x creates an unpredictable tmp_* directory directly in
+          # the project root while unpacking. Fetch outside the strict
+          # source-immutable sandbox; dependency compilation remains inside.
+          mix deps.get 2>&1 | tee deps.log
           grep -qi "jason" deps.log
           sbe run --allow-insecure-linux-network -- mix compile 2>&1 | tee compile.log
           grep -qE "(Compiled|Generated real)" compile.log

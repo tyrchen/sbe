@@ -217,6 +217,13 @@ On Linux, paths are opened with descriptor-relative `openat2` resolution using
 component with directory FDs. Root-owned immutable distribution symlinks are
 the only symlink exception.
 
+Hex 2.5.x currently extracts packages through an unpredictable `tmp_*`
+directory in the project root and exposes no temp-directory setting. Strict
+SBE therefore blocks `mix deps.get` rather than granting project-wide write
+access. Fetch dependencies before entering SBE, then run
+`sbe run -- mix compile`; dependency build code still executes inside the
+sandbox.
+
 ## Network proxy
 
 The local CONNECT proxy:

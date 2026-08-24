@@ -59,9 +59,11 @@ common:
     # Shells
     - "/bin/sh"
     - "/bin/bash"
+    - "/bin/dash"
     - "/usr/bin/env"
     - "/usr/bin/sh"
     - "/usr/bin/bash"
+    - "/usr/bin/dash"
     # Core utilities — each one explicit (no /usr/bin subpath)
     - "/bin/cat"
     - "/bin/cp"
@@ -235,6 +237,8 @@ profiles:
       - "$PWD/uv.lock"
       - "$PWD/poetry.lock"
       - "$PWD/pdm.lock"
+      - "$PWD/dist/"
+      - "$PWD/build/"
       - "~/.cache/pip/"
       - "~/.cache/uv/"
       - "~/.local/lib/"
@@ -353,6 +357,7 @@ profiles:
       - "/usr/bin/jshell"
       - "/usr/lib/jvm/"
       - "/usr/bin/mvn"
+      - "/usr/share/maven/bin/"
       # GitHub Actions setup-java Temurin installations.
       - "/opt/hostedtoolcache/Java_Temurin-Hotspot_jdk/"
       - "~/.sdkman/"
