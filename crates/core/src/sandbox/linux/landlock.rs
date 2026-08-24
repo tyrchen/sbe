@@ -502,13 +502,22 @@ fn open_existing_safely(path: &Path) -> Result<Option<OwnedFd>, CoreError> {
         Ok(fd) => Ok(Some(fd)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            // `RESOLVE_NO_SYMLINKS` reports ELOOP as soon as it encounters an
+            // intermediate system link (for example `/lib -> /usr/lib`),
+            // even when the final cross-distribution fallback path does not
+            // exist. A missing target receives no Landlock rule and is safe
+            // to skip; existing targets still have both chains verified.
+            let canonical = match std::fs::canonicalize(path) {
+                Ok(canonical) => canonical,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(CoreError::Io(error)),
+            };
             root_owned_chain(path).map_err(|reason| {
                 CoreError::ProfileLint(format!(
                     "allowlist path '{}' traverses an untrusted symlink: {reason}",
                     path.display()
                 ))
             })?;
-            let canonical = std::fs::canonicalize(path).map_err(CoreError::Io)?;
             root_owned_chain(&canonical).map_err(|reason| {
                 CoreError::ProfileLint(format!(
                     "allowlist path '{}' resolves outside a root-owned immutable tree: {reason}",
@@ -860,6 +869,30 @@ mod tests {
                 root_owned_chain(&canonical).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn missing_target_through_symlink_is_skipped_without_a_rule() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), temp.path().join("redirect")).unwrap();
+
+        let missing = temp.path().join("redirect/missing");
+        assert!(open_existing_safely(&missing).unwrap().is_none());
+    }
+
+    #[test]
+    fn existing_target_through_untrusted_symlink_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = tempfile::NamedTempFile::new_in(outside.path()).unwrap();
+        symlink(target.path(), temp.path().join("redirect")).unwrap();
+
+        assert!(open_existing_safely(&temp.path().join("redirect")).is_err());
     }
 
     #[test]
