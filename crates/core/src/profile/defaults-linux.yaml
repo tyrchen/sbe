@@ -198,6 +198,8 @@ profiles:
       - "~/.fnm/"
       - "~/.local/share/fnm/"
       - "~/.local/state/fnm_multishells/"
+      # GitHub Actions setup-node installs versioned toolchains here.
+      - "/opt/hostedtoolcache/node/"
       # mise (polyglot version manager)
       - "~/.local/share/mise/"
       # asdf shim layout

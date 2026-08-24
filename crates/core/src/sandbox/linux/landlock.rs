@@ -82,6 +82,12 @@ pub const READ_ALLOWLIST_ANCHORS: &[&str] = &[
 const BASELINE_WRITE_PATHS: &[&str] = &["/dev/null", "/dev/zero"];
 const MAX_CARVED_READ_ENTRIES: usize = 100_000;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UntrustedSymlinkBehavior {
+    Reject,
+    Skip,
+}
+
 /// Privilege-escalation binaries that must never appear under an
 /// `allow_exec` subpath. The lint refuses to build the ruleset if a
 /// user-supplied profile would re-enable any of these via a directory rule.
@@ -261,6 +267,7 @@ pub fn compile(
             std::slice::from_ref(&sp.path),
             read_access(abi),
             abi,
+            UntrustedSymlinkBehavior::Reject,
         )?;
     }
     for path in BASELINE_WRITE_PATHS {
@@ -278,12 +285,23 @@ pub fn compile(
     // tamper with them; Refuse for anything else (notably $HOME-relative
     // entries like ~/.cargo/bin/, ~/.nvm/) because a hostile earlier
     // build can plant a symlink there.
-    for sp in &profile.allow_exec {
+    for (index, sp) in profile.allow_exec.iter().enumerate() {
+        // Built-in profiles list alternatives for multiple distributions and
+        // tool managers. If an optional alias exists under a mutable parent,
+        // omitting its rule is fail-closed and lets unrelated commands use
+        // the profile. User/runtime grants remain strict because silently
+        // ignoring an explicitly requested capability would be misleading.
+        let symlink_behavior = if index < profile.first_user_allow_exec {
+            UntrustedSymlinkBehavior::Skip
+        } else {
+            UntrustedSymlinkBehavior::Reject
+        };
         created = add_path_rules(
             created,
             std::slice::from_ref(&sp.path),
             exec_access(abi),
             abi,
+            symlink_behavior,
         )?;
     }
 
@@ -334,6 +352,7 @@ fn add_read_rule(
             std::slice::from_ref(&path.path),
             read_access(abi),
             abi,
+            UntrustedSymlinkBehavior::Reject,
         );
     }
     if !matches!(path.kind, PathKind::Subpath) {
@@ -431,9 +450,10 @@ fn add_path_rules(
     paths: &[PathBuf],
     access: BitFlags<AccessFs>,
     abi: ABI,
+    symlink_behavior: UntrustedSymlinkBehavior,
 ) -> Result<RulesetCreated, CoreError> {
     for path in paths {
-        if let Some(fd) = open_existing_safely(path)? {
+        if let Some(fd) = open_existing_safely_with(path, symlink_behavior)? {
             let compatible = access_for_fd(&fd, access, abi)?;
             created = created.add_rule(PathBeneath::new(fd, compatible))?;
         }
@@ -493,11 +513,18 @@ fn access_for_fd(
 /// Open an existing path with no symlink or magic-link traversal. A distro
 /// symlink is accepted only if every original and canonical ancestor is
 /// root-owned and not group/world writable.
+fn open_existing_safely(path: &Path) -> Result<Option<OwnedFd>, CoreError> {
+    open_existing_safely_with(path, UntrustedSymlinkBehavior::Reject)
+}
+
 #[allow(
     clippy::disallowed_methods,
     reason = "the policy compiler runs synchronously in the pre-runtime Linux launcher"
 )]
-fn open_existing_safely(path: &Path) -> Result<Option<OwnedFd>, CoreError> {
+fn open_existing_safely_with(
+    path: &Path,
+    symlink_behavior: UntrustedSymlinkBehavior,
+) -> Result<Option<OwnedFd>, CoreError> {
     match open_no_symlinks(path, false) {
         Ok(fd) => Ok(Some(fd)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -512,23 +539,39 @@ fn open_existing_safely(path: &Path) -> Result<Option<OwnedFd>, CoreError> {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(error) => return Err(CoreError::Io(error)),
             };
-            root_owned_chain(path).map_err(|reason| {
-                CoreError::ProfileLint(format!(
-                    "allowlist path '{}' traverses an untrusted symlink: {reason}",
-                    path.display()
-                ))
-            })?;
-            root_owned_chain(&canonical).map_err(|reason| {
-                CoreError::ProfileLint(format!(
-                    "allowlist path '{}' resolves outside a root-owned immutable tree: {reason}",
-                    path.display()
-                ))
-            })?;
+            if let Err(reason) = root_owned_chain(path) {
+                return handle_untrusted_symlink(path, &reason, symlink_behavior);
+            }
+            if let Err(reason) = root_owned_chain(&canonical) {
+                let reason = format!("canonical target is not immutable: {reason}");
+                return handle_untrusted_symlink(path, &reason, symlink_behavior);
+            }
             open_no_symlinks(&canonical, false)
                 .map(Some)
                 .map_err(CoreError::Io)
         }
         Err(error) => Err(CoreError::Io(error)),
+    }
+}
+
+fn handle_untrusted_symlink(
+    path: &Path,
+    reason: &str,
+    behavior: UntrustedSymlinkBehavior,
+) -> Result<Option<OwnedFd>, CoreError> {
+    match behavior {
+        UntrustedSymlinkBehavior::Reject => Err(CoreError::ProfileLint(format!(
+            "allowlist path '{}' traverses an untrusted symlink: {reason}",
+            path.display()
+        ))),
+        UntrustedSymlinkBehavior::Skip => {
+            tracing::warn!(
+                path = %path.display(),
+                reason,
+                "skipping unsafe optional built-in executable"
+            );
+            Ok(None)
+        }
     }
 }
 
@@ -892,7 +935,13 @@ mod tests {
         let target = tempfile::NamedTempFile::new_in(outside.path()).unwrap();
         symlink(target.path(), temp.path().join("redirect")).unwrap();
 
-        assert!(open_existing_safely(&temp.path().join("redirect")).is_err());
+        let redirect = temp.path().join("redirect");
+        assert!(open_existing_safely(&redirect).is_err());
+        assert!(
+            open_existing_safely_with(&redirect, UntrustedSymlinkBehavior::Skip)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
