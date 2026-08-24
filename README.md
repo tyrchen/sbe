@@ -30,6 +30,7 @@ SBE 0.4 fails closed when a requested guarantee cannot be enforced.
 | Ambient file descriptors | `CLOEXEC` before target exec | `close_range(CLOEXEC)` with bounded fallback |
 | Domain-filtered HTTPS | Enforced through the exact authenticated proxy port | Not currently enforceable; strict mode refuses to run |
 | Restricted TCP/UDP | SBPL network policy | Landlock TCP plus seccomp Internet datagram/raw-socket rules |
+| Same-user signals and Unix sockets | SBPL signal/network rules | Landlock ABI v6 signal and abstract-socket scopes; ABI v9 pathname-socket mediation |
 | Persistent W^X | Validated before launch | Validated before launch, including existing symlink aliases |
 | Private temporary storage | Per-run root; other shared temp roots denied | Per-run root; other temp paths omitted from Landlock grants |
 | Violation audit stream | Reported unavailable unless a correlatable source exists | Reported unavailable until kernel-domain correlation is verifiable |
@@ -42,6 +43,13 @@ SBE therefore does not call this domain confinement. A proxy profile either:
 - refuses by default; or
 - runs only after `--allow-insecure-linux-network`, with a warning explaining
   the bypass.
+
+Linux intentionally exposes only curated public procfs nodes such as
+`/proc/cpuinfo`; it does not grant `/proc/self`. A rule opened for the launcher's
+`/proc/self` inode would not follow spawned descendants to their different proc
+inodes and would create a false guarantee. On kernels before Landlock ABI v6,
+same-user signal and abstract Unix-socket isolation is unavailable; pathname
+Unix-socket mediation requires ABI v9.
 
 `--allow-all-network` remains an explicit request to remove network isolation.
 `--no-proxy` selects direct-TCP-443 compatibility mode and is never described

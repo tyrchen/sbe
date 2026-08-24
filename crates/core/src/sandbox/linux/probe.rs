@@ -48,6 +48,12 @@ impl LandlockAbi {
         self >= Self::V5
     }
 
+    /// Whether Landlock can isolate signals and abstract Unix sockets to the
+    /// current ruleset domain.
+    pub fn supports_scopes(self) -> bool {
+        self >= Self::V6
+    }
+
     /// Whether filesystem Unix-socket connection resolution is mediated.
     pub fn supports_unix_path_filter(self) -> bool {
         self >= Self::V9
@@ -193,6 +199,13 @@ mod tests {
         assert!(!LandlockAbi::V3.supports_net_port_filter());
         assert!(LandlockAbi::V4.supports_net_port_filter());
         assert!(LandlockAbi::V9.supports_net_port_filter());
+    }
+
+    #[test]
+    fn test_should_report_scope_capability() {
+        assert!(!LandlockAbi::V5.supports_scopes());
+        assert!(LandlockAbi::V6.supports_scopes());
+        assert!(LandlockAbi::V9.supports_scopes());
     }
 
     #[test]

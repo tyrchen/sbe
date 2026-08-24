@@ -5,7 +5,7 @@ use std::{
         fd::{AsRawFd, FromRawFd},
         unix::ffi::OsStrExt,
     },
-    path::Path,
+    path::{Component, Path},
     process::ExitCode,
 };
 
@@ -524,21 +524,190 @@ fn command_is(command: &[String], expected: &str) -> bool {
         .is_some_and(|name| name == expected)
 }
 
-fn command_invokes(command: &[String], subcommands: &[&str]) -> bool {
+#[cfg(target_os = "linux")]
+fn command_has_flag(command: &[String], flags: &[&str]) -> bool {
     command
         .iter()
         .skip(1)
         .take_while(|argument| argument.as_str() != "--")
-        .any(|argument| subcommands.contains(&argument.as_str()))
+        .any(|argument| flags.contains(&argument.as_str()))
+}
+
+/// Return the package manager's top-level subcommand. Options (and the values
+/// of known value-taking global options) are skipped so an option value or a
+/// nested command cannot accidentally select a write policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ParsedTopLevel<'a> {
+    Command(&'a str),
+    NoCommand,
+    Ambiguous,
+}
+
+impl ParsedTopLevel<'_> {
+    fn is_command(self, candidates: &[&str]) -> bool {
+        matches!(self, Self::Command(command) if candidates.contains(&command))
+    }
+}
+
+fn top_level_subcommand(command: &[String]) -> ParsedTopLevel<'_> {
+    let Some(program) = command
+        .first()
+        .and_then(|program| Path::new(program).file_name())
+    else {
+        return ParsedTopLevel::NoCommand;
+    };
+    let program = program.to_str().unwrap_or_default();
+    let mut arguments = command.iter().skip(1).peekable();
+    while let Some(argument) = arguments.next() {
+        let argument = argument.as_str();
+        if argument == "--" {
+            return ParsedTopLevel::NoCommand;
+        }
+        if program == "cargo" && argument.starts_with('+') {
+            continue;
+        }
+        if !argument.starts_with('-') || argument == "-" {
+            return ParsedTopLevel::Command(argument);
+        }
+        if option_takes_value(program, argument) {
+            if !option_has_attached_value(argument) {
+                arguments.next();
+            }
+            continue;
+        }
+        if option_is_known_boolean(program, argument) {
+            continue;
+        }
+        // Unknown options are deliberately ambiguous. Guessing that they are
+        // boolean could mistake their value for a mutating subcommand and
+        // create a file the user never requested.
+        return ParsedTopLevel::Ambiguous;
+    }
+    ParsedTopLevel::NoCommand
+}
+
+fn option_takes_value(program: &str, option: &str) -> bool {
+    let option = option.split_once('=').map_or(option, |(name, _)| name);
+    let option = if program == "cargo" && option.len() > 2 {
+        option
+            .get(..2)
+            .filter(|prefix| matches!(*prefix, "-C" | "-Z"))
+            .unwrap_or(option)
+    } else {
+        option
+    };
+    match program {
+        "cargo" => matches!(
+            option,
+            "--color" | "--config" | "--explain" | "--target-dir" | "-C" | "-Z"
+        ),
+        "npm" => matches!(
+            option,
+            "--cache"
+                | "--location"
+                | "--loglevel"
+                | "--prefix"
+                | "--registry"
+                | "--userconfig"
+                | "--workspace"
+        ),
+        "yarn" => matches!(
+            option,
+            "--cache-folder"
+                | "--cwd"
+                | "--modules-folder"
+                | "--mutex"
+                | "--network-concurrency"
+                | "--network-timeout"
+                | "--registry"
+                | "--use-yarnrc"
+        ),
+        "pnpm" => matches!(
+            option,
+            "--cache-dir"
+                | "--config-dir"
+                | "--dir"
+                | "--global-bin-dir"
+                | "--global-dir"
+                | "--state-dir"
+                | "--store-dir"
+                | "--virtual-store-dir"
+        ),
+        "uv" => matches!(
+            option,
+            "--color" | "--config-file" | "--directory" | "--project" | "--python"
+        ),
+        "poetry" | "pdm" => {
+            matches!(option, "--directory" | "--project" | "-C" | "-P" | "-p")
+        }
+        _ => false,
+    }
+}
+
+fn option_has_attached_value(option: &str) -> bool {
+    option.contains('=')
+        || (option.len() > 2 && (option.starts_with("-C") || option.starts_with("-Z")))
+}
+
+fn option_is_known_boolean(program: &str, option: &str) -> bool {
+    match program {
+        "cargo" => matches!(
+            option,
+            "--frozen"
+                | "--help"
+                | "--list"
+                | "--locked"
+                | "--offline"
+                | "--quiet"
+                | "--verbose"
+                | "--version"
+                | "-V"
+                | "-h"
+                | "-q"
+                | "-v"
+                | "-vv"
+        ),
+        "npm" | "pnpm" => matches!(
+            option,
+            "--global"
+                | "--help"
+                | "--json"
+                | "--silent"
+                | "--version"
+                | "--workspaces"
+                | "-g"
+                | "-h"
+                | "-v"
+        ),
+        "yarn" => matches!(
+            option,
+            "--help"
+                | "--immutable"
+                | "--immutable-cache"
+                | "--inline-builds"
+                | "--json"
+                | "--silent"
+                | "--version"
+                | "-h"
+                | "-v"
+        ),
+        "uv" | "poetry" | "pdm" => matches!(
+            option,
+            "--help" | "--no-ansi" | "--quiet" | "--verbose" | "--version" | "-h" | "-q" | "-v"
+        ),
+        _ => false,
+    }
 }
 
 fn cargo_executes_target(command: &[String]) -> bool {
-    command_is(command, "cargo") && command_invokes(command, &["bench", "run", "test"])
+    command_is(command, "cargo")
+        && top_level_subcommand(command).is_command(&["bench", "run", "test", "r", "t"])
 }
 
 fn cargo_uses_persistent_target(command: &[String]) -> bool {
     command_is(command, "cargo")
-        && command_invokes(command, &["build", "check", "doc", "install", "rustc"])
+        && top_level_subcommand(command)
+            .is_command(&["build", "check", "doc", "install", "rustc", "b", "c", "d"])
 }
 
 /// Atomically create or verify a direct child directory without following a
@@ -599,69 +768,98 @@ fn ensure_literal_write_targets(
         .and_then(|program| Path::new(program).file_name())
         .and_then(|name| name.to_str())
         .unwrap_or_default();
-    let refuses_lockfile_creation = command_invokes(
+    let refuses_lockfile_creation = command_has_flag(
         command,
         &["--frozen", "--frozen-lockfile", "--immutable", "--locked"],
     );
-    let built_in_lockfile = if refuses_lockfile_creation {
+    let yarn_is_informational =
+        program == "yarn" && command_has_flag(command, &["--help", "--version", "-h", "-v"]);
+    let subcommand = top_level_subcommand(command);
+    let built_in_lockfile = if refuses_lockfile_creation || yarn_is_informational {
         None
     } else {
         match program {
             "cargo"
-                if command_invokes(
-                    command,
-                    &[
-                        "bench",
-                        "build",
-                        "check",
-                        "doc",
-                        "fetch",
-                        "generate-lockfile",
-                        "metadata",
-                        "run",
-                        "test",
-                        "tree",
-                        "update",
-                    ],
-                ) =>
+                if subcommand.is_command(&[
+                    "bench",
+                    "build",
+                    "check",
+                    "doc",
+                    "fetch",
+                    "generate-lockfile",
+                    "metadata",
+                    "run",
+                    "test",
+                    "tree",
+                    "update",
+                    "b",
+                    "c",
+                    "d",
+                    "r",
+                    "t",
+                ]) =>
             {
                 Some("Cargo.lock")
             }
-            "npm" if command_invokes(command, &["dedupe", "install", "uninstall", "update"]) => {
+            "npm"
+                if subcommand.is_command(&[
+                    "add",
+                    "dedupe",
+                    "i",
+                    "install",
+                    "r",
+                    "remove",
+                    "rm",
+                    "un",
+                    "uninstall",
+                    "unlink",
+                    "up",
+                    "update",
+                ]) =>
+            {
                 Some("package-lock.json")
             }
-            "yarn" if command_invokes(command, &["add", "dedupe", "install", "remove", "up"]) => {
+            "yarn"
+                if subcommand == ParsedTopLevel::NoCommand
+                    || subcommand.is_command(&["add", "dedupe", "install", "remove", "up"]) =>
+            {
                 Some("yarn.lock")
             }
             "pnpm"
-                if command_invokes(
-                    command,
-                    &["add", "dedupe", "import", "install", "remove", "update"],
-                ) =>
+                if subcommand.is_command(&[
+                    "add",
+                    "dedupe",
+                    "i",
+                    "import",
+                    "install",
+                    "remove",
+                    "rm",
+                    "uninstall",
+                    "up",
+                    "update",
+                ]) =>
             {
                 Some("pnpm-lock.yaml")
             }
-            "uv" if command_invokes(command, &["add", "lock", "remove", "run", "sync", "tree"]) => {
+            "uv" if subcommand.is_command(&["add", "lock", "remove", "run", "sync", "tree"]) => {
                 Some("uv.lock")
             }
-            "poetry"
-                if command_invokes(command, &["add", "install", "lock", "remove", "update"]) =>
-            {
+            "poetry" if subcommand.is_command(&["add", "install", "lock", "remove", "update"]) => {
                 Some("poetry.lock")
             }
             "pdm"
-                if command_invokes(
-                    command,
-                    &["add", "install", "lock", "remove", "run", "sync", "update"],
-                ) =>
+                if subcommand
+                    .is_command(&["add", "install", "lock", "remove", "run", "sync", "update"]) =>
             {
                 Some("pdm.lock")
             }
             "mix"
-                if command_invokes(
-                    command,
-                    &["deps.get", "deps.update", "local.hex", "local.rebar"],
-                ) =>
+                if subcommand.is_command(&[
+                    "deps.get",
+                    "deps.update",
+                    "local.hex",
+                    "local.rebar",
+                ]) =>
             {
                 Some("mix.lock")
             }
@@ -934,6 +1132,12 @@ fn expand_cli_path(path: &Path, home: &Path, pwd: &Path) -> anyhow::Result<Sandb
     if raw.contains('\0') || raw.chars().any(char::is_control) {
         anyhow::bail!("sandbox path contains a control character: {path:?}");
     }
+    if path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        anyhow::bail!("sandbox path must not contain '..': {path:?}");
+    }
     Ok(expand_path(raw, home, pwd))
 }
 
@@ -1061,6 +1265,63 @@ mod tests {
         ]));
     }
 
+    #[test]
+    fn top_level_command_parsing_ignores_option_values_and_nested_commands() {
+        assert_eq!(
+            top_level_subcommand(&[
+                "cargo".to_owned(),
+                "+stable".to_owned(),
+                "--color".to_owned(),
+                "always".to_owned(),
+                "build".to_owned(),
+            ]),
+            ParsedTopLevel::Command("build")
+        );
+        assert!(cargo_uses_persistent_target(&[
+            "cargo".to_owned(),
+            "build".to_owned(),
+            "--package".to_owned(),
+            "test".to_owned(),
+        ]));
+        assert!(!cargo_executes_target(&[
+            "cargo".to_owned(),
+            "build".to_owned(),
+            "--package".to_owned(),
+            "test".to_owned(),
+        ]));
+        assert!(cargo_executes_target(&[
+            "cargo".to_owned(),
+            "test".to_owned(),
+            "--package".to_owned(),
+            "build".to_owned(),
+        ]));
+        assert_eq!(
+            top_level_subcommand(&["poetry".to_owned(), "run".to_owned(), "install".to_owned(),]),
+            ParsedTopLevel::Command("run")
+        );
+        assert_eq!(
+            top_level_subcommand(&[
+                "npm".to_owned(),
+                "--future-option".to_owned(),
+                "install".to_owned(),
+                "view".to_owned(),
+            ]),
+            ParsedTopLevel::Ambiguous
+        );
+    }
+
+    #[test]
+    fn cli_paths_reject_parent_traversal() {
+        assert!(
+            expand_cli_path(
+                Path::new("$PWD/output/../.ssh/"),
+                Path::new("/home/test"),
+                Path::new("/work/project"),
+            )
+            .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn java_proxy_agent_is_private_and_refuses_replacement() {
         use std::os::unix::fs::PermissionsExt;
@@ -1115,6 +1376,88 @@ mod tests {
         ensure_literal_write_targets(&profile, &["npm".to_owned(), "--version".to_owned()])
             .unwrap();
         assert!(!read_only_project.path().join("package-lock.json").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous filesystem setup is isolated to this launcher helper unit test"
+    )]
+    fn literal_write_targets_handle_aliases_defaults_and_nested_commands() {
+        let npm_project = tempfile::tempdir().unwrap();
+        let npm_profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Node,
+            Path::new("/home/test"),
+            npm_project.path(),
+        );
+        ensure_literal_write_targets(&npm_profile, &["npm".to_owned(), "i".to_owned()]).unwrap();
+        assert!(npm_project.path().join("package-lock.json").is_file());
+
+        let yarn_project = tempfile::tempdir().unwrap();
+        let yarn_profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Node,
+            Path::new("/home/test"),
+            yarn_project.path(),
+        );
+        ensure_literal_write_targets(&yarn_profile, &["yarn".to_owned()]).unwrap();
+        assert!(yarn_project.path().join("yarn.lock").is_file());
+
+        let yarn_info_project = tempfile::tempdir().unwrap();
+        let yarn_info_profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Node,
+            Path::new("/home/test"),
+            yarn_info_project.path(),
+        );
+        ensure_literal_write_targets(
+            &yarn_info_profile,
+            &["yarn".to_owned(), "--version".to_owned()],
+        )
+        .unwrap();
+        assert!(!yarn_info_project.path().join("yarn.lock").exists());
+
+        let read_only_node = tempfile::tempdir().unwrap();
+        let node_profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Node,
+            Path::new("/home/test"),
+            read_only_node.path(),
+        );
+        ensure_literal_write_targets(
+            &node_profile,
+            &["npm".to_owned(), "view".to_owned(), "install".to_owned()],
+        )
+        .unwrap();
+        assert!(!read_only_node.path().join("package-lock.json").exists());
+        ensure_literal_write_targets(
+            &node_profile,
+            &[
+                "npm".to_owned(),
+                "--future-option".to_owned(),
+                "install".to_owned(),
+                "view".to_owned(),
+            ],
+        )
+        .unwrap();
+        assert!(!read_only_node.path().join("package-lock.json").exists());
+
+        let python_project = tempfile::tempdir().unwrap();
+        let python_profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Python,
+            Path::new("/home/test"),
+            python_project.path(),
+        );
+        ensure_literal_write_targets(
+            &python_profile,
+            &["uv".to_owned(), "pip".to_owned(), "install".to_owned()],
+        )
+        .unwrap();
+        ensure_literal_write_targets(
+            &python_profile,
+            &["poetry".to_owned(), "run".to_owned(), "install".to_owned()],
+        )
+        .unwrap();
+        assert!(!python_project.path().join("uv.lock").exists());
+        assert!(!python_project.path().join("poetry.lock").exists());
     }
 
     #[cfg(target_os = "linux")]

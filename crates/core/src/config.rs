@@ -1,8 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
     io::Read,
-    os::unix::fs::OpenOptionsExt,
-    path::{Path, PathBuf},
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    path::{Component, Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
@@ -356,6 +356,26 @@ impl ProfileConfig {
                 }
             }
         }
+        for (name, values) in [
+            ("allowWrite", &self.allow_write),
+            ("denyRead", &self.deny_read),
+            ("allowRead", &self.allow_read),
+            ("denyExec", &self.deny_exec),
+            ("allowExec", &self.allow_exec),
+        ] {
+            for value in values {
+                let without_directory_marker = value.strip_suffix('/').unwrap_or(value);
+                if Path::new(without_directory_marker)
+                    .components()
+                    .any(|component| component == Component::ParentDir)
+                {
+                    return Err(config_policy(
+                        path,
+                        format!("{name} path must not contain '..'"),
+                    ));
+                }
+            }
+        }
         for domain in self
             .allow_domains
             .iter()
@@ -544,6 +564,13 @@ pub async fn load_configs(
     trust_project_config: bool,
 ) -> Result<Vec<LoadedConfig>, CoreError> {
     let mut configs = Vec::new();
+    let explicit_path = explicit_config.map(|path| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            pwd.join(path)
+        }
+    });
 
     // Global config
     if let Some(global_path) = SbeConfig::global_config_path()
@@ -558,30 +585,51 @@ pub async fn load_configs(
     }
 
     // Project config
-    if let Some(project_path) = SbeConfig::find_project_config(pwd)
-        && let Some(cfg) = SbeConfig::load(&project_path).await?
-    {
-        configs.push(LoadedConfig {
-            config: cfg,
-            origin: ConfigOrigin::Project,
-            path: project_path,
-            trusted: trust_project_config,
-        });
+    if let Some(project_path) = SbeConfig::find_project_config(pwd) {
+        let selected_explicitly = if let Some(explicit) = &explicit_path {
+            same_configuration_file(&project_path, explicit).await
+        } else {
+            false
+        };
+        if !selected_explicitly && let Some(cfg) = SbeConfig::load(&project_path).await? {
+            configs.push(LoadedConfig {
+                config: cfg,
+                origin: ConfigOrigin::Project,
+                path: project_path,
+                trusted: trust_project_config,
+            });
+        }
     }
 
     // Explicit config
-    if let Some(explicit) = explicit_config
-        && let Some(cfg) = SbeConfig::load(explicit).await?
+    if let Some(explicit) = explicit_path
+        && let Some(cfg) = SbeConfig::load(&explicit).await?
     {
         configs.push(LoadedConfig {
             config: cfg,
             origin: ConfigOrigin::Explicit,
-            path: explicit.to_path_buf(),
+            path: explicit,
             trusted: true,
         });
     }
 
     Ok(configs)
+}
+
+/// Compare file identities instead of spellings so relative paths and hard
+/// links cannot make one policy file appear as both an untrusted project
+/// source and a trusted explicit source. Any metadata error falls through to
+/// normal loading, which reports the appropriate path-specific error.
+async fn same_configuration_file(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    let (left_metadata, right_metadata) =
+        tokio::join!(tokio::fs::metadata(left), tokio::fs::metadata(right));
+    matches!(
+        (left_metadata, right_metadata),
+        (Ok(left), Ok(right)) if left.dev() == right.dev() && left.ino() == right.ino()
+    )
 }
 
 /// Resolve the final `SandboxProfile` by merging configs into the ecosystem default.
@@ -809,6 +857,40 @@ profiles:
         assert!(SbeConfig::load(&path).await.is_err());
     }
 
+    #[tokio::test]
+    async fn explicit_project_config_is_loaded_once_as_trusted() {
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join(".sbe.yaml");
+        tokio::fs::write(
+            &path,
+            "profiles:\n  rust:\n    allowWrite:\n      - '$PWD/generated/'\n",
+        )
+        .await
+        .unwrap();
+
+        let configs = load_configs(project.path(), Some(Path::new(".sbe.yaml")), false)
+            .await
+            .unwrap();
+        let selected: Vec<_> = configs
+            .iter()
+            .filter(|config| config.path == path)
+            .collect();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].origin, ConfigOrigin::Explicit);
+        assert!(selected[0].trusted);
+    }
+
+    #[tokio::test]
+    async fn configuration_identity_recognizes_hard_links() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original.yaml");
+        let alias = directory.path().join("alias.yaml");
+        tokio::fs::write(&original, "profiles: {}\n").await.unwrap();
+        tokio::fs::hard_link(&original, &alias).await.unwrap();
+
+        assert!(same_configuration_file(&original, &alias).await);
+    }
+
     #[test]
     fn test_should_reject_reserved_environment_variable() {
         let yaml = r#"
@@ -816,6 +898,18 @@ profiles:
   rust:
     env:
       HTTPS_PROXY: http://attacker.invalid
+"#;
+        let config: SbeConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.validate(Path::new("config.yaml")).is_err());
+    }
+
+    #[test]
+    fn test_should_reject_parent_traversal_in_policy_paths() {
+        let yaml = r#"
+profiles:
+  rust:
+    denyRead:
+      - "$PWD/output/../.ssh/"
 "#;
         let config: SbeConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(config.validate(Path::new("config.yaml")).is_err());

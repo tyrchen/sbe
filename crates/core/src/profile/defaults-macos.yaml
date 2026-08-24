@@ -159,6 +159,8 @@ profiles:
     allowExec:
       - "/usr/local/bin/node"
       - "/opt/homebrew/bin/node"
+      # actions/setup-node installs into this non-system toolcache on hosted runners.
+      - "/Users/runner/hostedtoolcache/node/"
       - "~/.nvm/"
       - "~/.volta/"
       - "~/.fnm/"
@@ -243,6 +245,8 @@ profiles:
       - "/usr/local/bin/python3"
       - "/usr/local/bin/pip3"
       - "/usr/local/bin/uv"
+      # actions/setup-python uses a fixed, non-relocatable macOS toolcache.
+      - "/Users/runner/hostedtoolcache/Python/"
       # Version managers
       - "~/.pyenv/"
       - "~/.local/bin/"
@@ -327,6 +331,8 @@ profiles:
       - "/usr/libexec/java_home"
       - "/opt/homebrew/opt/openjdk/"
       - "/Library/Java/JavaVirtualMachines/"
+      # actions/setup-java installs Temurin distributions here on hosted runners.
+      - "/Users/runner/hostedtoolcache/Java_Temurin-Hotspot_jdk/"
       - "~/.sdkman/"
       # Gradle wrapper and daemon
       - "~/.gradle/"

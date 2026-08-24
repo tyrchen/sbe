@@ -77,6 +77,15 @@ pub fn render(
         let _ = writeln!(out, "      - connectTcp");
         let _ = writeln!(out, "      - bindTcp");
     }
+    if probe.abi.supports_scopes() {
+        let _ = writeln!(out, "  scoped:");
+        let _ = writeln!(out, "    - signal");
+        if profile.network_mode != NetworkMode::AllowAll {
+            let _ = writeln!(out, "    - abstractUnixSocket");
+        }
+    } else {
+        let _ = writeln!(out, "  scoped: []");
+    }
 
     let _ = writeln!(out, "  pathBeneath:");
     for sp in &profile.allow_write {
@@ -99,7 +108,6 @@ pub fn render(
     for anchor in super::landlock::READ_ALLOWLIST_ANCHORS
         .iter()
         .chain(super::landlock::PROC_READ_ALLOWLIST_ANCHORS)
-        .chain(std::iter::once(&"/proc/self"))
     {
         let _ = writeln!(out, "    - {}", yaml_string(anchor));
     }
@@ -276,6 +284,64 @@ mod tests {
 
         assert!(handled["net"].is_null());
         assert!(!fs.iter().any(|right| right.as_str() == Some("resolveUnix")));
+        let scoped = value["landlock"]["scoped"]
+            .as_sequence()
+            .expect("signal scope remains active");
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].as_str(), Some("signal"));
+    }
+
+    #[test]
+    fn restricted_network_renders_process_and_unix_socket_scopes() {
+        let home = PathBuf::from("/home/test");
+        let pwd = PathBuf::from("/home/test/project");
+        let profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, &home, &pwd);
+
+        let out = render(
+            &profile,
+            Some(12345),
+            &probe(LandlockAbi::V9),
+            BackendOptions::default(),
+        );
+        let value: serde_yaml::Value = serde_yaml::from_str(&out).expect("policy YAML parses");
+        let scoped = value["landlock"]["scoped"]
+            .as_sequence()
+            .expect("Landlock scopes");
+
+        assert!(scoped.iter().any(|scope| scope.as_str() == Some("signal")));
+        assert!(
+            scoped
+                .iter()
+                .any(|scope| scope.as_str() == Some("abstractUnixSocket"))
+        );
+        let read_anchors = value["landlock"]["readAllowlistAnchors"]
+            .as_sequence()
+            .expect("read anchors");
+        assert!(
+            !read_anchors
+                .iter()
+                .any(|anchor| anchor.as_str() == Some("/proc/self"))
+        );
+    }
+
+    #[test]
+    fn pre_v6_does_not_claim_unavailable_scopes() {
+        let home = PathBuf::from("/home/test");
+        let pwd = PathBuf::from("/home/test/project");
+        let profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, &home, &pwd);
+        let out = render(
+            &profile,
+            Some(12345),
+            &probe(LandlockAbi::V5),
+            BackendOptions::default(),
+        );
+        let value: serde_yaml::Value = serde_yaml::from_str(&out).expect("policy YAML parses");
+
+        assert!(
+            value["landlock"]["scoped"]
+                .as_sequence()
+                .is_some_and(Vec::is_empty)
+        );
     }
 
     #[test]

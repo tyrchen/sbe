@@ -254,7 +254,10 @@ ignored escalation.
 An explicit `--trust-project-config` may authorize expansion for one run. A
 future approval store may remember a repository identity plus config digest;
 changing the file invalidates approval. Non-interactive CI must never prompt
-and must require an explicit flag or explicit config path.
+and must require an explicit flag or explicit config path. When `--config`
+names the same inode as the auto-discovered project file, load it exactly once
+with explicit trusted provenance; path spelling, relative components, or a hard
+link must not cause a second untrusted copy to be applied first.
 
 Tool discovery, including Cargo's `target-dir` and `JAVA_HOME`, is not built-in
 authority. A discovered Cargo target must be canonicalized and limited to the
@@ -264,7 +267,9 @@ subject to forbidden-read, privilege-exec, trusted-ancestor, and W^X lints.
 All config structs use `deny_unknown_fields`. Loading enforces a small maximum
 file size, YAML nesting/alias limits supported by the selected parser, list
 length limits, and maximum string lengths. Missing or cyclic `extends` is an
-error. Config and CLI paths containing NUL or unsupported encoding are rejected.
+error. Config and CLI paths containing NUL, unsupported encoding, or a `..`
+component are rejected before expansion so lexical security lints and kernel
+resolution operate on the same path meaning.
 
 ### 6.3 Process capability hygiene
 
@@ -291,10 +296,10 @@ inheritance remains intentional and must be documented: redirecting a secret
 file to stdin explicitly grants it to the command.
 
 Linux must not grant recursive read access to `/proc`: that would let the
-child recover filtered credentials from `/proc/$PPID/environ`. Grant the
-current process's procfs subtree by descriptor plus an explicit list of public
-kernel-information nodes; parent and sibling process directories remain
-unreadable.
+child recover filtered credentials from `/proc/$PPID/environ`. Grant only an
+explicit list of public kernel-information nodes. Do not grant `/proc/self` by
+a launcher-opened descriptor: it identifies only the launcher's proc inode and
+does not authorize the distinct proc inode of a later descendant.
 
 ### 6.4 Safe launcher architecture on Linux
 
@@ -343,6 +348,11 @@ but must disclose that UDP egress is not destination-confined. An explicit
 allow-all mode must also stop handling Landlock `ResolveUnix`, so it does not
 silently continue blocking ambient Unix-domain sockets.
 
+Landlock ABI v6 signal scoping is installed for every network mode. Restricted
+network modes also install ABI v6 abstract Unix-socket scoping; ABI v9 adds
+`ResolveUnix` for pathname sockets. Policy inspection must distinguish these
+capabilities and must not claim either scope on older kernels.
+
 ### 6.6 Linux filesystem policy
 
 Path opening must be descriptor-based and atomic. Prefer `openat2` with
@@ -389,8 +399,10 @@ compatibility option may grant full workspace write, but inspection must label
 it as persistent-source mutation authority.
 
 On Linux, missing literal lockfiles are created only when the invoked package
-manager subcommand can update that specific lockfile. Mutually exclusive
-manager outputs and read-only commands must not acquire empty lockfiles as a
+manager's parsed top-level subcommand can update that specific lockfile.
+Supported aliases and default install forms are recognized, while option
+values, nested commands, `--` payloads, informational flags, mutually exclusive
+manager outputs, and read-only commands must not acquire empty lockfiles as a
 launcher side effect. Denied read paths that traverse symlinks fail policy
 compilation, and user grants are rejected whether they contain a denied path or
 are nested beneath one.

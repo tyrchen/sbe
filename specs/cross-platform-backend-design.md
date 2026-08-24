@@ -593,8 +593,10 @@ section, not silently swallowed:
 - **UDP is unfiltered by Landlock.** Egress UDP (DNS on :53, NTP, QUIC) is
   not subject to kernel filtering. The seccomp baseline blocks `AF_PACKET`
   raw sockets but not `SOCK_DGRAM` on `AF_INET`. Document.
-- **`AF_UNIX` sockets pre-ABI v6** are unrestricted. On 6.12+, Landlock
-  scope rules tighten this; we don't depend on it.
+- **Unix-domain sockets are ABI-dependent.** Before ABI v6, abstract sockets
+  are unrestricted. ABI v6 scopes abstract sockets to the sandbox domain, and
+  ABI v9 additionally mediates pathname-socket connections with `ResolveUnix`.
+  Signal scoping is likewise available and installed from ABI v6 onward.
 
 ### Cross-OS YAML hygiene
 

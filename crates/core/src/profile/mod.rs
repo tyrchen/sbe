@@ -1041,6 +1041,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn macos_defaults_allow_github_actions_toolcache_runtimes() {
+        let macos: DefaultsFile =
+            serde_yaml::from_str(include_str!("defaults-macos.yaml")).expect("macOS defaults");
+        for (profile, path) in [
+            ("node", "/Users/runner/hostedtoolcache/node/"),
+            ("python", "/Users/runner/hostedtoolcache/Python/"),
+            (
+                "java",
+                "/Users/runner/hostedtoolcache/Java_Temurin-Hotspot_jdk/",
+            ),
+        ] {
+            assert!(
+                macos.profiles[profile]
+                    .allow_exec
+                    .iter()
+                    .any(|entry| entry == path),
+                "macOS {profile} profile missing {path}"
+            );
+        }
+    }
+
     /// Helper: check if a path list contains a given path (ignoring is_dir).
     fn has(paths: &[SandboxPath], path: &str) -> bool {
         paths.iter().any(|sp| sp.has_path(Path::new(path)))

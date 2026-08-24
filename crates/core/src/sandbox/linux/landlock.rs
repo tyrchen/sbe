@@ -24,7 +24,7 @@ use std::{
 
 use landlock::{
     ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath,
-    Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr,
+    Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr, Scope,
 };
 
 use crate::{
@@ -65,7 +65,7 @@ pub const READ_ALLOWLIST_ANCHORS: &[&str] = &[
     // We name the SPECIFIC files used by the libc resolver rather than the
     // whole directory. The directory also contains
     // `/run/systemd/resolve/io.systemd.Resolve` — a varlink Unix-domain
-    // socket. Landlock pre-ABI v6 does NOT gate UDS connect by path-based
+    // socket. Landlock pre-ABI v9 does NOT gate UDS connect by path-based
     // access, so granting read on the directory enables a build script to
     // connect to the varlink endpoint and ask systemd-resolved to perform
     // arbitrary DNS lookups, bypassing the HTTP CONNECT proxy's domain
@@ -239,6 +239,21 @@ pub fn compile(
     let ruleset = Ruleset::default()
         .set_compatibility(CompatLevel::HardRequirement)
         .handle_access(handled_fs_access(abi, profile.network_mode))?;
+    // Signals are a process-isolation capability, not a network capability,
+    // so keep them scoped even when the user explicitly requests AllowAll
+    // networking. Abstract Unix sockets, on the other hand, are deliberately
+    // left ambient only in AllowAll mode. Descendants remain in the same
+    // Landlock domain and can signal/connect to one another.
+    let ruleset = if probe.abi.supports_scopes() {
+        let ruleset = ruleset.scope(Scope::Signal)?;
+        if profile.network_mode == NetworkMode::AllowAll {
+            ruleset
+        } else {
+            ruleset.scope(Scope::AbstractUnixSocket)?
+        }
+    } else {
+        ruleset
+    };
     let ruleset =
         if probe.abi.supports_net_port_filter() && profile.network_mode != NetworkMode::AllowAll {
             ruleset.handle_access(AccessNet::ConnectTcp | AccessNet::BindTcp)?
@@ -273,7 +288,6 @@ pub fn compile(
             &mut carved_entries,
         )?;
     }
-    created = add_proc_self_read_rule(created, abi)?;
     for sp in &profile.allow_read {
         created = add_read_rule(created, sp, &forbidden_reads, abi, &mut carved_entries)?;
     }
@@ -351,26 +365,6 @@ pub fn compile(
     }
 
     Ok(CompiledLandlock { ruleset: created })
-}
-
-/// Grant only this process's procfs subtree. The descriptor is opened by the
-/// single-threaded launcher and continues to identify the same process after
-/// exec, while parent and sibling process directories receive no rule.
-fn add_proc_self_read_rule(created: RulesetCreated, abi: ABI) -> Result<RulesetCreated, CoreError> {
-    let fd = unsafe {
-        libc::open(
-            c"/proc/self".as_ptr(),
-            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(CoreError::Io(std::io::Error::last_os_error()));
-    }
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    let compatible = access_for_fd(&fd, read_access(abi), abi)?;
-    created
-        .add_rule(PathBeneath::new(fd, compatible))
-        .map_err(CoreError::from)
 }
 
 /// Add a read subtree while preserving holes for built-in `denyRead` paths.

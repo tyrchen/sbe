@@ -335,6 +335,42 @@ jobs:
   # Wrapped in a Bash function via $GITHUB_ENV could work, but a composite
   # action would be cleaner. For now we inline a heredoc in each step.
 
+  macos-toolcache:
+    name: macOS hosted toolcache runtimes
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install sbe
+        run: cargo install --path apps/cli --locked --force
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Verify hosted toolcache runtimes execute inside sbe
+        run: |
+          set -euo pipefail
+          for runtime in node python java; do
+            resolved=$(command -v "$runtime")
+            case "$resolved" in
+              /Users/runner/hostedtoolcache/*) ;;
+              *) echo "::error::$runtime did not resolve through hostedtoolcache: $resolved"; exit 1 ;;
+            esac
+          done
+          sbe run -- node --version
+          sbe run -- python --version
+          sbe run -- java -version
+
   ecosystem-rust:
     name: ecosystem / cargo
     needs: install

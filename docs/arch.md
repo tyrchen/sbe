@@ -139,6 +139,14 @@ Root-owned immutable distribution symlinks are the only exception. Landlock
 read grants exclude `Execute`; write grants add only data-read rights, while
 execute grants are separate. Parent read trees are carved into safe inode
 rules when they contain a protected descendant such as `$PWD/.env`.
+Only curated public procfs files are readable. `/proc/self` is deliberately
+not granted because a descriptor opened by the launcher names only that
+process's proc inode; descendants get different inodes after spawning.
+
+On Landlock ABI v6 and newer, every sandbox domain scopes signals, and
+restricted network modes also scope abstract Unix sockets. ABI v9 additionally
+mediates connections to pathname Unix sockets. `sbe inspect` reports only the
+scopes supported and installed on the current kernel.
 
 Landlock ABI v4 can restrict a TCP destination **port**, not an address. SBE
 therefore refuses `Proxy` mode on Linux by default. The user must explicitly
