@@ -96,7 +96,8 @@ jobs:
           case "$TARGET" in
             aarch64-apple-darwin)
               rustup target add "$TARGET"
-              sbe run -- cargo build --release --locked --target "$TARGET" \
+              sbe run --allow-insecure-linux-network -- \
+                cargo build --release --locked --target "$TARGET" \
                 --manifest-path apps/cli/Cargo.toml
               ;;
             *)
@@ -104,7 +105,7 @@ jobs:
               # upload-rust-binary-action provisions internally — avoid
               # duplicating that here. A host-native `cargo check` still
               # gives us a real sbe workload to dogfood against.
-              sbe run -- cargo check --locked \
+              sbe run --allow-insecure-linux-network -- cargo check --locked \
                 --manifest-path apps/cli/Cargo.toml
               ;;
           esac
