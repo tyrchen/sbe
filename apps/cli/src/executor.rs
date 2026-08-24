@@ -1,12 +1,12 @@
-use std::{collections::HashMap, path::Path, process::ExitCode};
-
-#[cfg(target_os = "linux")]
 use std::{
+    collections::HashMap,
     ffi::CString,
     os::{
         fd::{AsRawFd, FromRawFd},
         unix::ffi::OsStrExt,
     },
+    path::Path,
+    process::ExitCode,
 };
 
 use anyhow::Context;
@@ -94,6 +94,9 @@ async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
     profile.finalize();
 
     if !args.dry_run {
+        if cargo_uses_persistent_target(&args.command) {
+            ensure_child_directory(&pwd, c"target")?;
+        }
         #[cfg(target_os = "linux")]
         ensure_literal_write_targets(&profile, &args.command)?;
     }
@@ -318,15 +321,7 @@ async fn build_extra_env(
     let profile_name = profile.name.clone();
     match profile_name.as_str() {
         "rust" => {
-            let cargo_executes_target = Path::new(command.first().map_or("", String::as_str))
-                .file_name()
-                .is_some_and(|name| name == "cargo")
-                && command
-                    .iter()
-                    .skip(1)
-                    .take_while(|argument| argument.as_str() != "--")
-                    .any(|argument| matches!(argument.as_str(), "run" | "test" | "bench"));
-            let target_dir = if cargo_executes_target {
+            let target_dir = if cargo_executes_target(command) {
                 runtime_temp.join("cargo-target")
             } else {
                 project_dir.join("target")
@@ -523,6 +518,69 @@ where
         .collect()
 }
 
+fn command_is(command: &[String], expected: &str) -> bool {
+    Path::new(command.first().map_or("", String::as_str))
+        .file_name()
+        .is_some_and(|name| name == expected)
+}
+
+fn command_invokes(command: &[String], subcommands: &[&str]) -> bool {
+    command
+        .iter()
+        .skip(1)
+        .take_while(|argument| argument.as_str() != "--")
+        .any(|argument| subcommands.contains(&argument.as_str()))
+}
+
+fn cargo_executes_target(command: &[String]) -> bool {
+    command_is(command, "cargo") && command_invokes(command, &["bench", "run", "test"])
+}
+
+fn cargo_uses_persistent_target(command: &[String]) -> bool {
+    command_is(command, "cargo")
+        && command_invokes(command, &["build", "check", "doc", "install", "rustc"])
+}
+
+/// Atomically create or verify a direct child directory without following a
+/// final-component symlink. The parent descriptor fixes the target directory
+/// even if another process renames a path component concurrently.
+fn ensure_child_directory(parent: &Path, name: &std::ffi::CStr) -> anyhow::Result<()> {
+    let parent =
+        CString::new(parent.as_os_str().as_bytes()).context("project directory contains NUL")?;
+    // SAFETY: both C strings are NUL-terminated and remain alive for each
+    // syscall; successful descriptors are immediately owned and closed.
+    let parent_fd = unsafe {
+        libc::open(
+            parent.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if parent_fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("open project directory safely");
+    }
+    let parent_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(parent_fd) };
+    let created = unsafe { libc::mkdirat(parent_fd.as_raw_fd(), name.as_ptr(), 0o700) };
+    if created < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(error).context("create dedicated build output directory");
+        }
+    }
+    let child_fd = unsafe {
+        libc::openat(
+            parent_fd.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if child_fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("build output must be a real directory, not a symlink");
+    }
+    drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(child_fd) });
+    Ok(())
+}
+
 /// Landlock can grant writes to an existing file inode, but creating one
 /// requires directory-wide `MakeReg`. Pre-create only the built-in lockfile
 /// associated with the invoked package manager plus user-requested literal
@@ -536,56 +594,75 @@ fn ensure_literal_write_targets(
     use sbe_core::config::PathKind;
     use std::os::fd::OwnedFd;
 
-    let program = command.first().map_or("", String::as_str);
-    let program = Path::new(program)
-        .file_name()
+    let program = command
+        .first()
+        .and_then(|program| Path::new(program).file_name())
         .and_then(|name| name.to_str())
-        .unwrap_or(program);
-    let invokes = |subcommands: &[&str]| {
-        command
-            .iter()
-            .skip(1)
-            .take_while(|argument| argument.as_str() != "--")
-            .any(|argument| subcommands.contains(&argument.as_str()))
-    };
-    let refuses_lockfile_creation =
-        invokes(&["--frozen", "--frozen-lockfile", "--immutable", "--locked"]);
+        .unwrap_or_default();
+    let refuses_lockfile_creation = command_invokes(
+        command,
+        &["--frozen", "--frozen-lockfile", "--immutable", "--locked"],
+    );
     let built_in_lockfile = if refuses_lockfile_creation {
         None
     } else {
         match program {
             "cargo"
-                if invokes(&[
-                    "bench",
-                    "build",
-                    "check",
-                    "doc",
-                    "fetch",
-                    "generate-lockfile",
-                    "metadata",
-                    "run",
-                    "test",
-                    "tree",
-                    "update",
-                ]) =>
+                if command_invokes(
+                    command,
+                    &[
+                        "bench",
+                        "build",
+                        "check",
+                        "doc",
+                        "fetch",
+                        "generate-lockfile",
+                        "metadata",
+                        "run",
+                        "test",
+                        "tree",
+                        "update",
+                    ],
+                ) =>
             {
                 Some("Cargo.lock")
             }
-            "npm" if invokes(&["dedupe", "install", "uninstall", "update"]) => {
+            "npm" if command_invokes(command, &["dedupe", "install", "uninstall", "update"]) => {
                 Some("package-lock.json")
             }
-            "yarn" if invokes(&["add", "dedupe", "install", "remove", "up"]) => Some("yarn.lock"),
-            "pnpm" if invokes(&["add", "dedupe", "import", "install", "remove", "update"]) => {
+            "yarn" if command_invokes(command, &["add", "dedupe", "install", "remove", "up"]) => {
+                Some("yarn.lock")
+            }
+            "pnpm"
+                if command_invokes(
+                    command,
+                    &["add", "dedupe", "import", "install", "remove", "update"],
+                ) =>
+            {
                 Some("pnpm-lock.yaml")
             }
-            "uv" if invokes(&["add", "lock", "remove", "run", "sync", "tree"]) => Some("uv.lock"),
-            "poetry" if invokes(&["add", "install", "lock", "remove", "update"]) => {
+            "uv" if command_invokes(command, &["add", "lock", "remove", "run", "sync", "tree"]) => {
+                Some("uv.lock")
+            }
+            "poetry"
+                if command_invokes(command, &["add", "install", "lock", "remove", "update"]) =>
+            {
                 Some("poetry.lock")
             }
-            "pdm" if invokes(&["add", "install", "lock", "remove", "run", "sync", "update"]) => {
+            "pdm"
+                if command_invokes(
+                    command,
+                    &["add", "install", "lock", "remove", "run", "sync", "update"],
+                ) =>
+            {
                 Some("pdm.lock")
             }
-            "mix" if invokes(&["deps.get", "deps.update", "local.hex", "local.rebar"]) => {
+            "mix"
+                if command_invokes(
+                    command,
+                    &["deps.get", "deps.update", "local.hex", "local.rebar"],
+                ) =>
+            {
                 Some("mix.lock")
             }
             _ => None,
@@ -974,6 +1051,14 @@ mod tests {
                 .map(String::as_str),
             project.path().join("target").to_str()
         );
+        assert!(cargo_uses_persistent_target(&[
+            "cargo".to_owned(),
+            "build".to_owned()
+        ]));
+        assert!(!cargo_uses_persistent_target(&[
+            "cargo".to_owned(),
+            "test".to_owned()
+        ]));
     }
 
     #[tokio::test]
@@ -988,6 +1073,14 @@ mod tests {
         assert_eq!(metadata.permissions().mode() & 0o777, 0o400);
         assert!(bytes.starts_with(b"PK\x03\x04"));
         assert!(install_java_proxy_agent(runtime.path()).await.is_err());
+    }
+
+    #[test]
+    fn dedicated_output_directory_refuses_symlinks() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), project.path().join("target")).unwrap();
+        assert!(ensure_child_directory(project.path(), c"target").is_err());
     }
 
     #[cfg(target_os = "linux")]
