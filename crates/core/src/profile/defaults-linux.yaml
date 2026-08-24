@@ -199,6 +199,11 @@ profiles:
       - "~/.asdf/"
 
   rust:
+    allowRead:
+      # The rustup proxy reads its selected toolchain from this non-secret
+      # settings file before dispatching cargo/rustc. Toolchain contents are
+      # already read+execute via allowExec below.
+      - "~/.rustup/settings.toml"
     allowWrite:
       - "$PWD/target/"
       - "$PWD/Cargo.lock"
