@@ -640,10 +640,17 @@ fn root_owned_chain(path: &Path) -> bool {
         let Ok(metadata) = std::fs::symlink_metadata(&current) else {
             return false;
         };
-        if metadata.uid() != 0 {
-            return false;
+        // A symlink has no mutable payload: replacing it requires write
+        // access to its parent directory. We verify every non-symlink
+        // lexical ancestor here and separately verify the complete
+        // canonical target chain in `open_existing_safely`. Requiring the
+        // link inode itself to be root-owned rejects immutable system links
+        // on distributions that preserve a non-root package-builder UID,
+        // without adding any security boundary.
+        if metadata.file_type().is_symlink() {
+            continue;
         }
-        if !metadata.file_type().is_symlink() && metadata.mode() & 0o022 != 0 {
+        if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
             return false;
         }
     }
@@ -818,6 +825,26 @@ mod tests {
         assert!(file_access.contains(AccessFs::WriteFile));
         assert!(!file_access.contains(AccessFs::ReadDir));
         assert!(!file_access.contains(AccessFs::MakeReg));
+    }
+
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the Linux-only policy test is synchronous"
+    )]
+    fn immutable_system_symlinks_are_trusted() {
+        for path in [
+            Path::new("/bin/sh"),
+            Path::new("/lib64/ld-linux-x86-64.so.2"),
+            Path::new("/lib/ld-linux-x86-64.so.2"),
+            Path::new("/lib/ld-linux-aarch64.so.1"),
+        ] {
+            if path.exists() {
+                assert!(root_owned_chain(path), "{}", path.display());
+                let canonical = std::fs::canonicalize(path).unwrap();
+                assert!(root_owned_chain(&canonical), "{}", canonical.display());
+            }
+        }
     }
 
     #[test]
