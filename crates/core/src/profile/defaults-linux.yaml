@@ -262,6 +262,8 @@ profiles:
       - "/usr/local/bin/pip3"
       - "/usr/local/bin/uv"
       - "/usr/bin/uv"
+      # GitHub Actions setup-python installs versioned interpreters here.
+      - "/opt/hostedtoolcache/Python/"
       # GitHub Actions setup-uv installs versioned binaries here.
       - "/opt/hostedtoolcache/uv/"
       - "/usr/local/bin/poetry"

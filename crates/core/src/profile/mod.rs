@@ -925,6 +925,18 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn python_profile_allows_github_setup_python_toolchains() {
+        let profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Python,
+            &PathBuf::from("/home/test"),
+            &PathBuf::from("/work/project"),
+        );
+
+        assert!(has(&profile.allow_exec, "/opt/hostedtoolcache/Python"));
+    }
+
     #[test]
     fn default_profiles_satisfy_persistent_write_xor_execute() {
         let home = PathBuf::from("/Users/test");

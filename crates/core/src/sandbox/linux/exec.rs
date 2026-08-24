@@ -341,7 +341,12 @@ fn enforce_network_capability(
     probe: &ProbeResult,
     options: BackendOptions,
 ) -> Result<(), CoreError> {
-    if profile.network_mode == NetworkMode::AllowAll {
+    if matches!(
+        profile.network_mode,
+        NetworkMode::AllowAll | NetworkMode::DenyAll
+    ) {
+        // DenyAll is fully enforced by the unconditional seccomp socket(2)
+        // rule and does not depend on Landlock's ABI-v4 TCP port mediation.
         return Ok(());
     }
     if profile.network_mode == NetworkMode::Proxy && !options.allow_insecure_network {
@@ -422,6 +427,24 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn deny_all_does_not_require_landlock_v4_port_filtering() {
+        let mut profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Node,
+            &PathBuf::from("/home/test"),
+            &PathBuf::from("/work/project"),
+        );
+        profile.allow_domains.clear();
+        profile.recompute_network_mode();
+        assert_eq!(profile.network_mode, NetworkMode::DenyAll);
+        let probe = ProbeResult {
+            kernel: "test".to_owned(),
+            abi: super::super::probe::LandlockAbi::V3,
+        };
+
+        assert!(enforce_network_capability(&profile, &probe, BackendOptions::default()).is_ok());
     }
 
     #[test]

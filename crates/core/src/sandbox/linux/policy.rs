@@ -69,10 +69,10 @@ pub fn render(
     if probe.abi.supports_ioctl_dev() {
         let _ = writeln!(out, "      - ioctlDev");
     }
-    if probe.abi.supports_unix_path_filter() {
+    if probe.abi.supports_unix_path_filter() && profile.network_mode != NetworkMode::AllowAll {
         let _ = writeln!(out, "      - resolveUnix");
     }
-    if features.net_port_filter {
+    if features.net_port_filter && profile.network_mode != NetworkMode::AllowAll {
         let _ = writeln!(out, "    net:");
         let _ = writeln!(out, "      - connectTcp");
         let _ = writeln!(out, "      - bindTcp");
@@ -157,7 +157,12 @@ pub fn render(
             NetworkMode::AllowAll => {}
         }
     }
-    if !features.net_port_filter && profile.network_mode != NetworkMode::AllowAll {
+    if !features.net_port_filter
+        && matches!(
+            profile.network_mode,
+            NetworkMode::Proxy | NetworkMode::DirectHttps443
+        )
+    {
         let _ = writeln!(
             out,
             "  netFallback: unavailable — strict execution refuses unless explicitly opted into \
@@ -249,5 +254,46 @@ mod tests {
         let value: serde_yaml::Value = serde_yaml::from_str(&out).expect("policy YAML parses");
         assert_eq!(value["backend"].as_str(), Some("landlock+seccomp"));
         assert_eq!(value["landlockAbi"].as_str(), Some("v4"));
+    }
+
+    #[test]
+    fn allow_all_renders_network_rights_as_unhandled() {
+        let home = PathBuf::from("/home/test");
+        let pwd = PathBuf::from("/home/test/project");
+        let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, &home, &pwd);
+        profile.allow_all_network = true;
+        profile.recompute_network_mode();
+
+        let out = render(
+            &profile,
+            None,
+            &probe(LandlockAbi::V9),
+            BackendOptions::default(),
+        );
+        let value: serde_yaml::Value = serde_yaml::from_str(&out).expect("policy YAML parses");
+        let handled = &value["landlock"]["handled"];
+        let fs = handled["fs"].as_sequence().expect("filesystem rights");
+
+        assert!(handled["net"].is_null());
+        assert!(!fs.iter().any(|right| right.as_str() == Some("resolveUnix")));
+    }
+
+    #[test]
+    fn deny_all_below_v4_does_not_render_insecure_fallback() {
+        let home = PathBuf::from("/home/test");
+        let pwd = PathBuf::from("/home/test/project");
+        let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, &home, &pwd);
+        profile.allow_domains.clear();
+        profile.recompute_network_mode();
+
+        let out = render(
+            &profile,
+            None,
+            &probe(LandlockAbi::V3),
+            BackendOptions::default(),
+        );
+
+        assert!(!out.contains("netFallback:"));
+        assert!(out.contains("socket(all families)"));
     }
 }
