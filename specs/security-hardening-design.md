@@ -403,11 +403,17 @@ manager's parsed top-level subcommand can update that specific lockfile.
 Supported aliases and default install forms are recognized, while option
 values, nested commands, `--` payloads, informational flags, mutually exclusive
 manager outputs, and read-only commands must not acquire empty lockfiles as a
-launcher side effect. Denied read paths that traverse symlinks fail policy
-compilation. Denied regular files, including descendants of denied directories,
-must have exactly one hard link because Landlock cannot distinguish pathname
-aliases of the same inode. User grants are rejected whether they contain a
-denied path or are nested beneath one.
+launcher side effect. Yarn PnP outputs are selected only when bounded,
+no-follow project metadata identifies Berry/PnP, including the optional ESM
+loader flag. Commands that explicitly execute installed Node tools replace the
+built-in `node_modules` write grant with an execute grant for that invocation;
+install commands retain write-without-execute. Cargo subcommands and plugins
+that execute target artifacts, including nextest, use the private per-run
+target root. Denied read paths that traverse symlinks fail policy compilation.
+Denied regular files, including descendants of denied directories, must have
+exactly one hard link because Landlock cannot distinguish pathname aliases of
+the same inode. User grants are rejected whether they contain a denied path or
+are nested beneath one.
 
 ### 6.8 macOS SBPL generation and IPC
 

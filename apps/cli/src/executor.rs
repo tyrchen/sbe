@@ -92,13 +92,14 @@ async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
         });
     }
     profile.finalize();
+    enable_existing_node_dependency_execution(&mut profile, &args.command);
 
     if !args.dry_run {
         if cargo_uses_persistent_target(&args.command) {
             ensure_child_directory(&pwd, c"target")?;
         }
         #[cfg(target_os = "linux")]
-        ensure_literal_write_targets(&profile, &args.command)?;
+        ensure_literal_write_targets(&profile, &args.command, &pwd)?;
     }
 
     // Give each invocation an isolated temporary tree. The handle remains
@@ -701,13 +702,110 @@ fn option_is_known_boolean(program: &str, option: &str) -> bool {
 
 fn cargo_executes_target(command: &[String]) -> bool {
     command_is(command, "cargo")
-        && top_level_subcommand(command).is_command(&["bench", "run", "test", "r", "t"])
+        && top_level_subcommand(command).is_command(&["bench", "nextest", "run", "test", "r", "t"])
 }
 
 fn cargo_uses_persistent_target(command: &[String]) -> bool {
     command_is(command, "cargo")
         && top_level_subcommand(command)
             .is_command(&["build", "check", "doc", "install", "rustc", "b", "c", "d"])
+}
+
+/// Installed Node dependencies are mutable during package-manager operations,
+/// but commands that explicitly run project tools need the opposite side of
+/// the W^X boundary. For those commands, replace only the built-in
+/// `node_modules` write grants with read/execute grants. User-supplied write
+/// grants remain intact and will still trip the persistent W^X lint instead
+/// of being silently weakened.
+fn enable_existing_node_dependency_execution(profile: &mut SandboxProfile, command: &[String]) {
+    if profile.name != "node" || !node_command_executes_dependencies(command) {
+        return;
+    }
+
+    let built_in_boundary = profile
+        .first_user_allow_write
+        .min(profile.allow_write.len());
+    let mut dependency_roots = Vec::new();
+    let mut retained = Vec::with_capacity(profile.allow_write.len());
+    for (index, grant) in profile.allow_write.drain(..).enumerate() {
+        if index < built_in_boundary
+            && grant
+                .path
+                .file_name()
+                .is_some_and(|name| name == "node_modules")
+        {
+            dependency_roots.push(grant.path);
+        } else {
+            retained.push(grant);
+        }
+    }
+    profile.allow_write = retained;
+    profile.first_user_allow_write = built_in_boundary.saturating_sub(dependency_roots.len());
+
+    profile.grant_origins.retain(|record| {
+        record.kind != GrantKind::AllowWrite
+            || record.origin != GrantOrigin::BuiltIn
+            || !dependency_roots
+                .iter()
+                .any(|root| record.value == root.to_string_lossy())
+    });
+
+    for root in dependency_roots {
+        // A higher-precedence deny must continue to win. Landlock cannot
+        // subtract a denied child from a directory execute rule, so skip the
+        // complete runtime grant on any overlap.
+        if profile
+            .deny_exec
+            .iter()
+            .any(|denied| paths_overlap(&root, &denied.path))
+            || profile
+                .allow_exec
+                .iter()
+                .any(|allowed| allowed.path == root)
+        {
+            continue;
+        }
+        profile.allow_exec.push(SandboxPath::dir(root.clone()));
+        profile.grant_origins.push(GrantRecord {
+            kind: GrantKind::AllowExec,
+            value: root.to_string_lossy().into_owned(),
+            origin: GrantOrigin::Runtime,
+        });
+    }
+}
+
+fn node_command_executes_dependencies(command: &[String]) -> bool {
+    let subcommand = top_level_subcommand(command);
+    if command_is(command, "npx") {
+        return !matches!(
+            subcommand,
+            ParsedTopLevel::NoCommand | ParsedTopLevel::Ambiguous
+        );
+    }
+    if command_is(command, "npm") {
+        return subcommand.is_command(&[
+            "exec",
+            "explore",
+            "restart",
+            "run",
+            "run-script",
+            "start",
+            "stop",
+            "t",
+            "test",
+            "tst",
+            "x",
+        ]);
+    }
+    if command_is(command, "pnpm") {
+        return subcommand.is_command(&["exec", "restart", "run", "start", "stop", "test"]);
+    }
+    command_is(command, "yarn")
+        && subcommand.is_command(&["exec", "node", "restart", "run", "start", "stop", "test"])
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
 }
 
 /// Atomically create or verify a direct child directory without following a
@@ -751,14 +849,15 @@ fn ensure_child_directory(parent: &Path, name: &std::ffi::CStr) -> anyhow::Resul
 }
 
 /// Landlock can grant writes to an existing file inode, but creating one
-/// requires directory-wide `MakeReg`. Pre-create only the built-in lockfile
-/// associated with the invoked package manager plus user-requested literal
-/// outputs. This avoids creating mutually exclusive lockfiles as a side
+/// requires directory-wide `MakeReg`. Pre-create only the built-in outputs
+/// selected for the invoked package-manager operation plus user-requested
+/// literal outputs. This avoids creating mutually exclusive files as a side
 /// effect of an unrelated or read-only command.
 #[cfg(target_os = "linux")]
 fn ensure_literal_write_targets(
     profile: &SandboxProfile,
     command: &[String],
+    project_dir: &Path,
 ) -> anyhow::Result<()> {
     use sbe_core::config::PathKind;
     use std::os::fd::OwnedFd;
@@ -775,8 +874,8 @@ fn ensure_literal_write_targets(
     let yarn_is_informational =
         program == "yarn" && command_has_flag(command, &["--help", "--version", "-h", "-v"]);
     let subcommand = top_level_subcommand(command);
-    let built_in_lockfile = if refuses_lockfile_creation || yarn_is_informational {
-        None
+    let built_in_outputs = if refuses_lockfile_creation || yarn_is_informational {
+        Vec::new()
     } else {
         match program {
             "cargo"
@@ -799,7 +898,7 @@ fn ensure_literal_write_targets(
                     "t",
                 ]) =>
             {
-                Some("Cargo.lock")
+                vec!["Cargo.lock"]
             }
             "npm"
                 if subcommand.is_command(&[
@@ -817,13 +916,21 @@ fn ensure_literal_write_targets(
                     "update",
                 ]) =>
             {
-                Some("package-lock.json")
+                vec!["package-lock.json"]
             }
             "yarn"
                 if subcommand == ParsedTopLevel::NoCommand
                     || subcommand.is_command(&["add", "dedupe", "install", "remove", "up"]) =>
             {
-                Some("yarn.lock")
+                let (uses_pnp, uses_esm_loader) = yarn_pnp_configuration(project_dir)?;
+                let mut outputs = vec!["yarn.lock"];
+                if uses_pnp {
+                    outputs.push(".pnp.cjs");
+                }
+                if uses_esm_loader {
+                    outputs.push(".pnp.loader.mjs");
+                }
+                outputs
             }
             "pnpm"
                 if subcommand.is_command(&[
@@ -839,19 +946,19 @@ fn ensure_literal_write_targets(
                     "update",
                 ]) =>
             {
-                Some("pnpm-lock.yaml")
+                vec!["pnpm-lock.yaml"]
             }
             "uv" if subcommand.is_command(&["add", "lock", "remove", "run", "sync", "tree"]) => {
-                Some("uv.lock")
+                vec!["uv.lock"]
             }
             "poetry" if subcommand.is_command(&["add", "install", "lock", "remove", "update"]) => {
-                Some("poetry.lock")
+                vec!["poetry.lock"]
             }
             "pdm"
                 if subcommand
                     .is_command(&["add", "install", "lock", "remove", "run", "sync", "update"]) =>
             {
-                Some("pdm.lock")
+                vec!["pdm.lock"]
             }
             "mix"
                 if subcommand.is_command(&[
@@ -861,9 +968,9 @@ fn ensure_literal_write_targets(
                     "local.rebar",
                 ]) =>
             {
-                Some("mix.lock")
+                vec!["mix.lock"]
             }
-            _ => None,
+            _ => Vec::new(),
         }
     };
 
@@ -872,7 +979,11 @@ fn ensure_literal_write_targets(
             continue;
         }
         if index < profile.first_user_allow_write
-            && target.path.file_name().and_then(|name| name.to_str()) != built_in_lockfile
+            && !target
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| built_in_outputs.contains(&name))
         {
             continue;
         }
@@ -934,6 +1045,106 @@ fn ensure_literal_write_targets(
         }
     }
     Ok(())
+}
+
+/// Determine which Yarn linker outputs are required without executing Yarn or
+/// following project-controlled symlinks. Yarn Berry uses PnP by default when
+/// a `.yarnrc.yml` is present; `packageManager: yarn@2+` is the other explicit
+/// modern-Yarn signal. Classic/unspecified Yarn remains lockfile-only so SBE
+/// does not create an unrelated empty `.pnp.cjs`.
+#[cfg(target_os = "linux")]
+fn yarn_pnp_configuration(project_dir: &Path) -> anyhow::Result<(bool, bool)> {
+    if let Some(contents) = read_bounded_project_file(&project_dir.join(".yarnrc.yml"))? {
+        let config: serde_yaml::Value =
+            serde_yaml::from_slice(&contents).context("parse .yarnrc.yml for output policy")?;
+        let mapping = if config.is_null() {
+            None
+        } else {
+            Some(
+                config
+                    .as_mapping()
+                    .context(".yarnrc.yml must contain a mapping")?,
+            )
+        };
+        let linker = mapping
+            .and_then(|mapping| mapping.get(serde_yaml::Value::String("nodeLinker".to_owned())))
+            .and_then(serde_yaml::Value::as_str);
+        let uses_pnp = match linker {
+            None | Some("pnp") => true,
+            Some("node-modules" | "pnpm") => false,
+            Some(other) => anyhow::bail!("unsupported Yarn nodeLinker value '{other}'"),
+        };
+        let uses_esm_loader = uses_pnp
+            && mapping
+                .and_then(|mapping| {
+                    mapping.get(serde_yaml::Value::String("pnpEnableEsmLoader".to_owned()))
+                })
+                .and_then(serde_yaml::Value::as_bool)
+                .unwrap_or(false);
+        return Ok((uses_pnp, uses_esm_loader));
+    }
+
+    let Some(contents) = read_bounded_project_file(&project_dir.join("package.json"))? else {
+        return Ok((false, false));
+    };
+    let package: serde_json::Value =
+        serde_json::from_slice(&contents).context("parse package.json for Yarn output policy")?;
+    let modern_yarn = package
+        .get("packageManager")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|manager| manager.strip_prefix("yarn@"))
+        .is_some_and(|version| {
+            version == "berry"
+                || version
+                    .split('.')
+                    .next()
+                    .and_then(|major| major.parse::<u64>().ok())
+                    .is_some_and(|major| major >= 2)
+        });
+    Ok((modern_yarn, false))
+}
+
+#[cfg(target_os = "linux")]
+#[allow(
+    clippy::disallowed_types,
+    reason = "bounded synchronous metadata reads run before the Linux launcher and use O_NOFOLLOW"
+)]
+fn read_bounded_project_file(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    use std::{fs::OpenOptions, io::Read, os::unix::fs::OpenOptionsExt};
+
+    const MAX_PROJECT_METADATA_BYTES: u64 = 256 * 1024;
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("open project metadata safely: {}", path.display()));
+        }
+    };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect project metadata: {}", path.display()))?;
+    if !metadata.is_file() {
+        anyhow::bail!("project metadata is not a regular file: {}", path.display());
+    }
+    if metadata.len() > MAX_PROJECT_METADATA_BYTES {
+        anyhow::bail!("project metadata is too large: {}", path.display());
+    }
+    let mut contents = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_PROJECT_METADATA_BYTES + 1)
+        .read_to_end(&mut contents)
+        .with_context(|| format!("read project metadata: {}", path.display()))?;
+    if contents.len() as u64 > MAX_PROJECT_METADATA_BYTES {
+        anyhow::bail!(
+            "project metadata grew beyond the size limit: {}",
+            path.display()
+        );
+    }
+    Ok(Some(contents))
 }
 
 #[cfg(target_os = "linux")]
@@ -1263,6 +1474,94 @@ mod tests {
             "cargo".to_owned(),
             "test".to_owned()
         ]));
+
+        let nextest_environment = build_extra_env(
+            &mut profile,
+            None,
+            runtime.path(),
+            project.path(),
+            &["cargo".to_owned(), "nextest".to_owned(), "run".to_owned()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            nextest_environment
+                .get("CARGO_TARGET_DIR")
+                .map(String::as_str),
+            runtime.path().join("cargo-target").to_str()
+        );
+        assert!(cargo_executes_target(&[
+            "cargo".to_owned(),
+            "nextest".to_owned(),
+            "run".to_owned(),
+        ]));
+    }
+
+    #[test]
+    fn node_tool_commands_switch_builtin_dependencies_from_write_to_execute() {
+        let project_directory = tempfile::tempdir().unwrap();
+        let project = project_directory.path();
+        let base_profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Node, Path::new("/Users/test"), project);
+        for command in [
+            vec!["npm".to_owned(), "test".to_owned()],
+            vec!["npm".to_owned(), "exec".to_owned(), "eslint".to_owned()],
+            vec!["npx".to_owned(), "eslint".to_owned()],
+        ] {
+            let mut profile = base_profile.clone();
+            enable_existing_node_dependency_execution(&mut profile, &command);
+
+            let dependencies = project.join("node_modules");
+            assert!(
+                !profile
+                    .allow_write
+                    .iter()
+                    .any(|grant| grant.path == dependencies),
+                "{command:?} retained a writable dependency tree"
+            );
+            assert!(
+                profile
+                    .allow_exec
+                    .iter()
+                    .any(|grant| grant.path == dependencies),
+                "{command:?} did not authorize installed tools"
+            );
+            profile.validate_security_invariants().unwrap();
+        }
+
+        let mut install_profile = base_profile.clone();
+        enable_existing_node_dependency_execution(
+            &mut install_profile,
+            &["npm".to_owned(), "install".to_owned()],
+        );
+        assert!(
+            install_profile
+                .allow_write
+                .iter()
+                .any(|grant| grant.path == project.join("node_modules"))
+        );
+        assert!(
+            !install_profile
+                .allow_exec
+                .iter()
+                .any(|grant| grant.path == project.join("node_modules"))
+        );
+
+        let mut denied_profile = base_profile;
+        denied_profile.deny_exec.push(SandboxPath::file(
+            project.join("node_modules/eslint/bin/eslint.js"),
+        ));
+        enable_existing_node_dependency_execution(
+            &mut denied_profile,
+            &["npm".to_owned(), "test".to_owned()],
+        );
+        assert!(
+            !denied_profile
+                .allow_exec
+                .iter()
+                .any(|grant| grant.path == project.join("node_modules")),
+            "a higher-precedence executable denial must not be re-authorized"
+        );
     }
 
     #[test]
@@ -1355,13 +1654,22 @@ mod tests {
         let profile =
             SandboxProfile::for_ecosystem(Ecosystem::Rust, Path::new("/home/test"), project.path());
         let lockfile = project.path().join("Cargo.lock");
-        ensure_literal_write_targets(&profile, &["/usr/bin/cargo".to_owned(), "build".to_owned()])
-            .unwrap();
+        ensure_literal_write_targets(
+            &profile,
+            &["/usr/bin/cargo".to_owned(), "build".to_owned()],
+            project.path(),
+        )
+        .unwrap();
         assert!(lockfile.is_file());
 
         let profile =
             SandboxProfile::for_ecosystem(Ecosystem::Node, Path::new("/home/test"), project.path());
-        ensure_literal_write_targets(&profile, &["npm".to_owned(), "install".to_owned()]).unwrap();
+        ensure_literal_write_targets(
+            &profile,
+            &["npm".to_owned(), "install".to_owned()],
+            project.path(),
+        )
+        .unwrap();
         assert!(project.path().join("package-lock.json").is_file());
         assert!(!project.path().join("yarn.lock").exists());
         assert!(!project.path().join("pnpm-lock.yaml").exists());
@@ -1373,8 +1681,12 @@ mod tests {
             Path::new("/home/test"),
             read_only_project.path(),
         );
-        ensure_literal_write_targets(&profile, &["npm".to_owned(), "--version".to_owned()])
-            .unwrap();
+        ensure_literal_write_targets(
+            &profile,
+            &["npm".to_owned(), "--version".to_owned()],
+            read_only_project.path(),
+        )
+        .unwrap();
         assert!(!read_only_project.path().join("package-lock.json").exists());
     }
 
@@ -1391,7 +1703,12 @@ mod tests {
             Path::new("/home/test"),
             npm_project.path(),
         );
-        ensure_literal_write_targets(&npm_profile, &["npm".to_owned(), "i".to_owned()]).unwrap();
+        ensure_literal_write_targets(
+            &npm_profile,
+            &["npm".to_owned(), "i".to_owned()],
+            npm_project.path(),
+        )
+        .unwrap();
         assert!(npm_project.path().join("package-lock.json").is_file());
 
         let yarn_project = tempfile::tempdir().unwrap();
@@ -1400,8 +1717,71 @@ mod tests {
             Path::new("/home/test"),
             yarn_project.path(),
         );
-        ensure_literal_write_targets(&yarn_profile, &["yarn".to_owned()]).unwrap();
+        ensure_literal_write_targets(&yarn_profile, &["yarn".to_owned()], yarn_project.path())
+            .unwrap();
         assert!(yarn_project.path().join("yarn.lock").is_file());
+        assert!(!yarn_project.path().join(".pnp.cjs").exists());
+
+        let modern_yarn_project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            modern_yarn_project.path().join("package.json"),
+            r#"{"name":"modern","packageManager":"yarn@4.9.2"}"#,
+        )
+        .unwrap();
+        let modern_yarn_profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Node,
+            Path::new("/home/test"),
+            modern_yarn_project.path(),
+        );
+        ensure_literal_write_targets(
+            &modern_yarn_profile,
+            &["yarn".to_owned(), "install".to_owned()],
+            modern_yarn_project.path(),
+        )
+        .unwrap();
+        assert!(modern_yarn_project.path().join("yarn.lock").is_file());
+        assert!(modern_yarn_project.path().join(".pnp.cjs").is_file());
+        assert!(!modern_yarn_project.path().join(".pnp.loader.mjs").exists());
+
+        let esm_yarn_project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            esm_yarn_project.path().join(".yarnrc.yml"),
+            "pnpEnableEsmLoader: true\n",
+        )
+        .unwrap();
+        let esm_yarn_profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Node,
+            Path::new("/home/test"),
+            esm_yarn_project.path(),
+        );
+        ensure_literal_write_targets(
+            &esm_yarn_profile,
+            &["yarn".to_owned()],
+            esm_yarn_project.path(),
+        )
+        .unwrap();
+        assert!(esm_yarn_project.path().join(".pnp.cjs").is_file());
+        assert!(esm_yarn_project.path().join(".pnp.loader.mjs").is_file());
+
+        let node_modules_yarn_project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            node_modules_yarn_project.path().join(".yarnrc.yml"),
+            "nodeLinker: node-modules\n",
+        )
+        .unwrap();
+        let node_modules_yarn_profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Node,
+            Path::new("/home/test"),
+            node_modules_yarn_project.path(),
+        );
+        ensure_literal_write_targets(
+            &node_modules_yarn_profile,
+            &["yarn".to_owned(), "install".to_owned()],
+            node_modules_yarn_project.path(),
+        )
+        .unwrap();
+        assert!(node_modules_yarn_project.path().join("yarn.lock").is_file());
+        assert!(!node_modules_yarn_project.path().join(".pnp.cjs").exists());
 
         let yarn_info_project = tempfile::tempdir().unwrap();
         let yarn_info_profile = SandboxProfile::for_ecosystem(
@@ -1412,6 +1792,7 @@ mod tests {
         ensure_literal_write_targets(
             &yarn_info_profile,
             &["yarn".to_owned(), "--version".to_owned()],
+            yarn_info_project.path(),
         )
         .unwrap();
         assert!(!yarn_info_project.path().join("yarn.lock").exists());
@@ -1425,6 +1806,7 @@ mod tests {
         ensure_literal_write_targets(
             &node_profile,
             &["npm".to_owned(), "view".to_owned(), "install".to_owned()],
+            read_only_node.path(),
         )
         .unwrap();
         assert!(!read_only_node.path().join("package-lock.json").exists());
@@ -1436,6 +1818,7 @@ mod tests {
                 "install".to_owned(),
                 "view".to_owned(),
             ],
+            read_only_node.path(),
         )
         .unwrap();
         assert!(!read_only_node.path().join("package-lock.json").exists());
@@ -1449,11 +1832,13 @@ mod tests {
         ensure_literal_write_targets(
             &python_profile,
             &["uv".to_owned(), "pip".to_owned(), "install".to_owned()],
+            python_project.path(),
         )
         .unwrap();
         ensure_literal_write_targets(
             &python_profile,
             &["poetry".to_owned(), "run".to_owned(), "install".to_owned()],
+            python_project.path(),
         )
         .unwrap();
         assert!(!python_project.path().join("uv.lock").exists());
@@ -1475,8 +1860,12 @@ mod tests {
         profile.allow_write = vec![SandboxPath::file(project.path().join("redirect/lock"))];
         profile.first_user_allow_write = 0;
         assert!(
-            ensure_literal_write_targets(&profile, &["cargo".to_owned(), "build".to_owned()])
-                .is_err()
+            ensure_literal_write_targets(
+                &profile,
+                &["cargo".to_owned(), "build".to_owned()],
+                project.path(),
+            )
+            .is_err()
         );
 
         let target = project.path().join("real-lock");
@@ -1485,8 +1874,12 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         profile.allow_write = vec![SandboxPath::file(link)];
         assert!(
-            ensure_literal_write_targets(&profile, &["cargo".to_owned(), "build".to_owned()])
-                .is_err()
+            ensure_literal_write_targets(
+                &profile,
+                &["cargo".to_owned(), "build".to_owned()],
+                project.path(),
+            )
+            .is_err()
         );
         assert_eq!(std::fs::read_to_string(target).unwrap(), "sentinel");
     }

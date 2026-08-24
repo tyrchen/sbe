@@ -93,7 +93,12 @@ to the invocation.
 
 For Rust, Cargo's stable `build.build-dir` split keeps final artifacts in the
 non-executable `$PWD/target` grant and places intermediate objects, build
-scripts, and procedural build tools in the private per-run W+X root.
+scripts, and procedural build tools in the private per-run W+X root. Commands
+that execute target artifacts, including cargo-nextest, use a private
+`CARGO_TARGET_DIR`. Node install commands keep `node_modules` writable and
+non-executable; explicit local-tool execution switches that built-in grant to
+read/execute without write. Yarn linker metadata selects only the required
+lock/PnP output files.
 All persistent outputs and caches remain tainted untrusted data; the sandbox
 does not certify them for later execution outside the boundary.
 

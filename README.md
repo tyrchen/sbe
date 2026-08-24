@@ -157,7 +157,17 @@ prints effective variable names and origins, but all values are redacted.
 On current stable Cargo, SBE keeps final Rust artifacts in `$PWD/target` while
 placing intermediate artifacts and executable build scripts in the private
 per-run tree through `CARGO_BUILD_BUILD_DIR`. This preserves persistent W^X
-without discarding the final build output.
+without discarding the final build output. Commands that execute target
+artifacts—including `cargo test`, `cargo run`, and `cargo nextest`—instead use
+the private executable `CARGO_TARGET_DIR`.
+
+Node dependency installation keeps `node_modules` writable but non-executable.
+Commands that explicitly run already-installed tools, such as `npm test`,
+`npm exec`, and `npx`, switch the built-in dependency-tree grant to
+read/execute and remove its write grant for that invocation. Modern Yarn PnP
+installs pre-create `.pnp.cjs` (and the optional ESM loader when configured)
+only when `.yarnrc.yml` or `packageManager` identifies a PnP-capable Yarn;
+Classic Yarn and the `node-modules` linker remain lockfile-only.
 
 Persistent outputs and package caches are still attacker-controlled data after
 an untrusted build. W^X prevents direct execution during that invocation; it

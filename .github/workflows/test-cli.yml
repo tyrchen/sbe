@@ -458,16 +458,34 @@ jobs:
           set -euo pipefail
           mkdir -p "$HOME/sbe-node" && cd "$HOME/sbe-node"
           rm -rf real && mkdir real && cd real
+          mkdir local-tool
+          cat > local-tool/package.json <<'JSON'
+          {
+            "name": "local-sbe-tool",
+            "version": "1.0.0",
+            "bin": { "local-sbe-tool": "cli.js" }
+          }
+          JSON
+          cat > local-tool/cli.js <<'JS'
+          #!/usr/bin/env node
+          console.log('sbe-local-tool-ok')
+          JS
+          chmod 0755 local-tool/cli.js
           cat > package.json <<'JSON'
           {
             "name": "real",
             "version": "0.0.1",
-            "dependencies": { "lodash": "4.17.21", "chalk": "4.1.2" }
+            "dependencies": {
+              "chalk": "4.1.2",
+              "local-sbe-tool": "file:./local-tool",
+              "lodash": "4.17.21"
+            }
           }
           JSON
           sbe run --allow-insecure-linux-network -- npm install --no-audit --no-fund 2>&1 | tee out.log
           test -d node_modules/lodash
           test -d node_modules/chalk
+          sbe run --allow-insecure-linux-network -- npm exec --offline -- local-sbe-tool | grep -Fx sbe-local-tool-ok
 
       - name: hostile fixture — every attack must be SAFE (10/10)
         run: |
