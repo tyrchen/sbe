@@ -362,6 +362,8 @@ jobs:
           set -euo pipefail
           for runtime in node python java; do
             resolved=$(command -v "$runtime")
+            canonical=$(realpath "$resolved")
+            echo "$runtime: $resolved -> $canonical"
             case "$resolved" in
               /Users/runner/hostedtoolcache/*) ;;
               *) echo "::error::$runtime did not resolve through hostedtoolcache: $resolved"; exit 1 ;;

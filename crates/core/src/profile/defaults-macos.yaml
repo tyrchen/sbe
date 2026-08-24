@@ -247,6 +247,8 @@ profiles:
       - "/usr/local/bin/uv"
       # actions/setup-python uses a fixed, non-relocatable macOS toolcache.
       - "/Users/runner/hostedtoolcache/Python/"
+      # Toolcache launchers resolve into this fixed framework installation.
+      - "/Library/Frameworks/Python.framework/Versions/"
       # Version managers
       - "~/.pyenv/"
       - "~/.local/bin/"

@@ -1048,6 +1048,7 @@ mod tests {
         for (profile, path) in [
             ("node", "/Users/runner/hostedtoolcache/node/"),
             ("python", "/Users/runner/hostedtoolcache/Python/"),
+            ("python", "/Library/Frameworks/Python.framework/Versions/"),
             (
                 "java",
                 "/Users/runner/hostedtoolcache/Java_Temurin-Hotspot_jdk/",
