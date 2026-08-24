@@ -364,15 +364,38 @@ async fn handle_connection(
     let client = client.into_inner();
     let (client_read, client_write) = client.into_split();
     let (upstream_read, upstream_write) = upstream.into_split();
-    let tunnel = async {
-        tokio::try_join!(
-            copy_with_idle_timeout(client_read, upstream_write, config.idle_timeout),
-            copy_with_idle_timeout(upstream_read, client_write, config.idle_timeout),
-        )
-    };
+    let tunnel = relay_tunnel(
+        client_read,
+        client_write,
+        upstream_read,
+        upstream_write,
+        config.idle_timeout,
+    );
     timeout(config.tunnel_timeout, tunnel)
         .await
         .map_err(|_| ProxyError::Timeout("maximum tunnel lifetime"))??;
+    Ok(())
+}
+
+async fn relay_tunnel<CR, CW, UR, UW>(
+    client_read: CR,
+    client_write: CW,
+    upstream_read: UR,
+    upstream_write: UW,
+    idle_timeout: Duration,
+) -> Result<(), ProxyError>
+where
+    CR: AsyncRead + Unpin,
+    CW: AsyncWrite + Unpin,
+    UR: AsyncRead + Unpin,
+    UW: AsyncWrite + Unpin,
+{
+    let (activity_tx, activity_rx) = watch::channel(Instant::now());
+    tokio::try_join!(
+        copy_with_tunnel_activity(client_read, upstream_write, activity_tx.clone()),
+        copy_with_tunnel_activity(upstream_read, client_write, activity_tx),
+        enforce_tunnel_idle_timeout(activity_rx, idle_timeout),
+    )?;
     Ok(())
 }
 
@@ -395,10 +418,10 @@ async fn connect_to_validated_address(
     })
 }
 
-async fn copy_with_idle_timeout<R, W>(
+async fn copy_with_tunnel_activity<R, W>(
     mut reader: R,
     mut writer: W,
-    idle_timeout: Duration,
+    activity: watch::Sender<Instant>,
 ) -> Result<u64, ProxyError>
 where
     R: AsyncRead + Unpin,
@@ -407,15 +430,43 @@ where
     let mut copied = 0_u64;
     let mut buffer = [0_u8; 16 * 1024];
     loop {
-        let count = timeout(idle_timeout, reader.read(&mut buffer))
-            .await
-            .map_err(|_| ProxyError::Timeout("tunnel idle period"))??;
+        let count = reader.read(&mut buffer).await?;
         if count == 0 {
             writer.shutdown().await?;
             return Ok(copied);
         }
-        writer.write_all(&buffer[..count]).await?;
+        activity.send_replace(Instant::now());
+        let mut written = 0;
+        while written < count {
+            let amount = writer.write(&buffer[written..count]).await?;
+            if amount == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
+            }
+            written += amount;
+            activity.send_replace(Instant::now());
+        }
         copied = copied.saturating_add(count as u64);
+    }
+}
+
+/// Expire a tunnel only when neither direction has transferred bytes for the
+/// configured interval. Each copy task updates the same watch channel, so a
+/// continuous download keeps an otherwise quiet upload direction alive.
+async fn enforce_tunnel_idle_timeout(
+    mut activity: watch::Receiver<Instant>,
+    idle_timeout: Duration,
+) -> Result<(), ProxyError> {
+    loop {
+        let deadline = *activity.borrow_and_update() + idle_timeout;
+        match timeout_at(deadline, activity.changed()).await {
+            Ok(Ok(())) => continue,
+            Ok(Err(_closed)) => return Ok(()),
+            Err(_elapsed) => {
+                if Instant::now().saturating_duration_since(*activity.borrow()) >= idle_timeout {
+                    return Err(ProxyError::Timeout("tunnel idle period"));
+                }
+            }
+        }
     }
 }
 
@@ -662,12 +713,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tunnel_copy_enforces_idle_timeout() {
-        let (_writer, reader) = tokio::io::duplex(64);
-        let (_reader, output) = tokio::io::duplex(64);
+    async fn tunnel_enforces_aggregate_idle_timeout() {
+        let (activity_tx, activity_rx) = watch::channel(Instant::now());
+        let result = enforce_tunnel_idle_timeout(activity_rx, Duration::from_millis(10)).await;
+        drop(activity_tx);
         assert!(matches!(
-            copy_with_idle_timeout(reader, output, Duration::from_millis(10)).await,
+            result,
             Err(ProxyError::Timeout("tunnel idle period"))
         ));
+    }
+
+    #[tokio::test]
+    async fn activity_in_either_direction_resets_tunnel_idle_timeout() {
+        let (activity_tx, activity_rx) = watch::channel(Instant::now());
+        let monitor = tokio::spawn(enforce_tunnel_idle_timeout(
+            activity_rx,
+            Duration::from_millis(40),
+        ));
+
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            activity_tx.send_replace(Instant::now());
+        }
+        drop(activity_tx);
+
+        assert!(monitor.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn continuous_one_way_transfer_keeps_quiet_direction_alive() {
+        let (client_app, relay_client) = tokio::io::duplex(64);
+        let (upstream_app, relay_upstream) = tokio::io::duplex(64);
+        let (client_read, client_write) = tokio::io::split(relay_client);
+        let (upstream_read, upstream_write) = tokio::io::split(relay_upstream);
+        let relay = tokio::spawn(relay_tunnel(
+            client_read,
+            client_write,
+            upstream_read,
+            upstream_write,
+            Duration::from_millis(200),
+        ));
+        let (mut client_output, mut client_input) = tokio::io::split(client_app);
+        let (upstream_output, mut upstream_input) = tokio::io::split(upstream_app);
+
+        for byte in b"download" {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            upstream_input.write_all(&[*byte]).await.unwrap();
+        }
+        upstream_input.shutdown().await.unwrap();
+        client_input.shutdown().await.unwrap();
+
+        let mut received = Vec::new();
+        client_output.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, b"download");
+        let relay_result = relay.await.unwrap();
+        assert!(relay_result.is_ok(), "{relay_result:?}");
+        drop(upstream_output);
     }
 }

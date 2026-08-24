@@ -84,7 +84,9 @@ No exact Rust patch version is pinned. CI installs `stable`.
 
 Release 0.4.0 and newer publishes SHA-256 checksums, an SPDX SBOM, and GitHub
 build-provenance attestations. The composite action verifies both the checksum
-and the attestation before installing the binary.
+and the attestation before installing the binary. The action defaults to the
+audited `0.4.0` release; pass `version: latest` only when intentionally opting
+into automatic release upgrades.
 
 ```yaml
 permissions:
@@ -103,6 +105,11 @@ For high-assurance workflows, replace the SBE release tag in `uses:` with the
 full commit SHA belonging to that tag. Supported release targets are
 `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, and
 `aarch64-apple-darwin`.
+
+The action accepts `0.4.0`, `v0.4.0`, or `sbexec-v0.4.0` and reports the
+resolved `sbexec-v0.4.0` tag through its `version` output. Releases older than
+0.4.0 are rejected because they do not provide the required checksum and
+provenance artifacts.
 
 ## Quick start
 
@@ -224,7 +231,9 @@ On Linux, paths are opened with descriptor-relative `openat2` resolution using
 `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and
 `RESOLVE_NO_MAGICLINKS`. Writable directories are created component by
 component with directory FDs. Root-owned immutable distribution symlinks are
-the only symlink exception.
+the only symlink exception. Because Landlock authorizes inodes rather than
+pathnames, SBE fails closed if a denied regular file—or a file below a denied
+directory—has multiple hard links.
 
 Hex 2.5.x currently extracts packages through an unpredictable `tmp_*`
 directory in the project root and exposes no temp-directory setting. Strict
@@ -241,7 +250,8 @@ The local CONNECT proxy:
 - accepts only CONNECT over HTTP/1.0 or HTTP/1.1;
 - bounds request lines, individual and total headers, header count, concurrent
   connections, resolved addresses, and task lifetime;
-- enforces total header, DNS, connect, idle, and maximum tunnel timeouts;
+- enforces total header, DNS, connect, aggregate bidirectional idle, and
+  maximum tunnel timeouts;
 - canonicalizes lowercase IDNA names and matches wildcards on label boundaries;
 - permits port 443 by default;
 - rejects IP literals and any resolution containing loopback, private,

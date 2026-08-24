@@ -404,8 +404,10 @@ Supported aliases and default install forms are recognized, while option
 values, nested commands, `--` payloads, informational flags, mutually exclusive
 manager outputs, and read-only commands must not acquire empty lockfiles as a
 launcher side effect. Denied read paths that traverse symlinks fail policy
-compilation, and user grants are rejected whether they contain a denied path or
-are nested beneath one.
+compilation. Denied regular files, including descendants of denied directories,
+must have exactly one hard link because Landlock cannot distinguish pathname
+aliases of the same inode. User grants are rejected whether they contain a
+denied path or are nested beneath one.
 
 ### 6.8 macOS SBPL generation and IPC
 
@@ -432,7 +434,9 @@ The proxy is a trusted parser and capability broker. It must implement:
 - a maximum request-line size, total header bytes, header count, and per-header
   size without `read_line`-based unbounded growth;
 - a semaphore limiting concurrent connections and in-flight DNS/connect work;
-- header read, DNS, connect, handshake, idle, and maximum tunnel timeouts;
+- header read, DNS, connect, handshake, aggregate bidirectional idle, and
+  maximum tunnel timeouts; activity in either tunnel direction resets the one
+  shared idle deadline;
 - graceful shutdown that tracks and aborts or drains child tasks;
 - a total, non-panicking authority parser using standard URI/authority types;
 - canonical lowercase IDNA hostnames with trailing-dot handling;

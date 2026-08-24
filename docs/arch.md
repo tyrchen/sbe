@@ -166,8 +166,9 @@ The proxy listens on an ephemeral IPv4 loopback port and requires a random
 wildcards, and permits port 443 by default.
 
 Request-line, header-line, total-header, header-count, connection, DNS-result,
-and task limits are enforced. Header, DNS, connect, idle, and maximum-tunnel
-deadlines bound work. IP literals and special-use resolutions are rejected;
+and task limits are enforced. Header, DNS, connect, aggregate bidirectional
+idle, and maximum-tunnel deadlines bound work. IP literals and special-use
+resolutions are rejected;
 all returned addresses are validated once and connections use only that saved
 set. The parent terminates the invocation if its proxy exits unexpectedly.
 

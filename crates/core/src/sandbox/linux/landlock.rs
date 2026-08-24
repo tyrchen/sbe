@@ -769,9 +769,10 @@ fn root_owned_chain(path: &Path) -> Result<(), String> {
 
 fn build_forbidden_reads(profile: &SandboxProfile) -> Result<BTreeSet<PathBuf>, CoreError> {
     let mut set = BTreeSet::new();
+    let mut inspected = 0_usize;
     for sp in &profile.deny_read {
         match open_no_symlinks(&sp.path, false) {
-            Ok(_) => {}
+            Ok(fd) => reject_aliased_forbidden_tree(&fd, &sp.path, &mut inspected)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
                 return Err(CoreError::ProfileLint(format!(
@@ -785,6 +786,74 @@ fn build_forbidden_reads(profile: &SandboxProfile) -> Result<BTreeSet<PathBuf>, 
         set.insert(sp.path.clone());
     }
     Ok(set)
+}
+
+/// Landlock authorizes filesystem objects, not pathnames. If a denied regular
+/// file has another hard link, granting the alias would also authorize the
+/// denied name. Recursively verify denied directories and fail closed instead
+/// of pretending that path carving can distinguish names for one inode.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the policy compiler runs synchronously in the pre-runtime Linux launcher"
+)]
+fn reject_aliased_forbidden_tree(
+    fd: &OwnedFd,
+    logical_path: &Path,
+    inspected: &mut usize,
+) -> Result<(), CoreError> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) } != 0 {
+        return Err(CoreError::Io(std::io::Error::last_os_error()));
+    }
+    let file_type = stat.st_mode & libc::S_IFMT;
+    if file_type == libc::S_IFREG {
+        if stat.st_nlink > 1 {
+            return Err(CoreError::ProfileLint(format!(
+                "denyRead file '{}' has {} hard links; Landlock cannot deny one pathname while \
+                 an alias grants the same inode",
+                logical_path.display(),
+                stat.st_nlink,
+            )));
+        }
+        return Ok(());
+    }
+    if file_type != libc::S_IFDIR {
+        return Ok(());
+    }
+
+    let proc_path = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()));
+    for entry in std::fs::read_dir(proc_path).map_err(CoreError::Io)? {
+        let entry = entry.map_err(CoreError::Io)?;
+        *inspected = inspected.saturating_add(1);
+        if *inspected > MAX_CARVED_READ_ENTRIES {
+            return Err(CoreError::ProfileLint(format!(
+                "denyRead policy under '{}' exceeds {MAX_CARVED_READ_ENTRIES} entries",
+                logical_path.display()
+            )));
+        }
+        let name = entry.file_name();
+        let child_path = logical_path.join(&name);
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            CoreError::ProfileLint(format!(
+                "sandbox path contains NUL below '{}'",
+                logical_path.display()
+            ))
+        })?;
+        let child = match openat2_component(fd.as_raw_fd(), &name, false) {
+            Ok(child) => child,
+            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+                return Err(CoreError::ProfileLint(format!(
+                    "denyRead path '{}' traverses a symlink; refusing a policy whose canonical \
+                     target could receive a read grant",
+                    child_path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(CoreError::Io(error)),
+        };
+        reject_aliased_forbidden_tree(&child, &child_path, inspected)?;
+    }
+    Ok(())
 }
 
 /// Reject any **user-supplied** `allow_write` / `allow_exec` / `allow_read`
@@ -1193,6 +1262,45 @@ mod tests {
 
         let error = build_forbidden_reads(&profile).unwrap_err();
         assert!(format!("{error}").contains("traverses a symlink"));
+    }
+
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous filesystem setup is isolated to this Linux policy unit test"
+    )]
+    fn forbidden_read_hard_link_fails_closed() {
+        let project = tempfile::tempdir().unwrap();
+        let denied = project.path().join(".env");
+        let alias = project.path().join("config.env");
+        std::fs::write(&denied, "secret").unwrap();
+        std::fs::hard_link(&denied, &alias).unwrap();
+        let mut profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Rust, project.path(), project.path());
+        profile.deny_read = vec![SandboxPath::file(denied)];
+
+        let error = build_forbidden_reads(&profile).unwrap_err();
+        assert!(format!("{error}").contains("hard links"));
+    }
+
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous filesystem setup is isolated to this Linux policy unit test"
+    )]
+    fn forbidden_directory_checks_descendant_hard_links() {
+        let project = tempfile::tempdir().unwrap();
+        let denied_directory = project.path().join("credentials");
+        std::fs::create_dir(&denied_directory).unwrap();
+        let denied = denied_directory.join("token");
+        std::fs::write(&denied, "secret").unwrap();
+        std::fs::hard_link(&denied, project.path().join("token-alias")).unwrap();
+        let mut profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Rust, project.path(), project.path());
+        profile.deny_read = vec![SandboxPath::dir(denied_directory)];
+
+        let error = build_forbidden_reads(&profile).unwrap_err();
+        assert!(format!("{error}").contains("hard links"));
     }
 
     #[test]
