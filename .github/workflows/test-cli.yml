@@ -482,7 +482,7 @@ jobs:
             }
           }
           JSON
-          sbe run --allow-insecure-linux-network -- npm install --no-audit --no-fund 2>&1 | tee out.log
+          sbe run --allow-insecure-linux-network -- npm install --install-links --no-audit --no-fund 2>&1 | tee out.log
           test -d node_modules/lodash
           test -d node_modules/chalk
           sbe run --allow-insecure-linux-network -- npm exec --offline -- local-sbe-tool | grep -Fx sbe-local-tool-ok
