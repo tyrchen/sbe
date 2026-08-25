@@ -445,7 +445,7 @@ jobs:
       # warm on subsequent runs. The cache lives at ~/.npm; the node
       # profile's allowWrite already includes it, so sbe can write to
       # it inside the sandbox.
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.npm
@@ -516,7 +516,7 @@ jobs:
       # Persist uv's user-level cache (~/.cache/uv) and pip's so the
       # requests+httpx wheels are warm next time. The python profile's
       # allowWrite already covers both.
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cache/uv
@@ -573,7 +573,7 @@ jobs:
       # tightly enough for hashFiles to be a useful invalidation signal —
       # any change to the workflow drops the cache. The elixir profile's
       # allowWrite already covers all three paths.
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.hex
@@ -650,7 +650,7 @@ jobs:
       # cold-cache fetch of cats-effect + munit-cats-effect + sbt + scala
       # compiler is the dominant CI cost (~3 min). Key is hashed over the
       # build descriptors so any dep bump invalidates cleanly.
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.ivy2/cache
