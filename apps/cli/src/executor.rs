@@ -5,12 +5,9 @@ use std::{
         fd::{AsRawFd, FromRawFd},
         unix::ffi::OsStrExt,
     },
-    path::{Component, Path},
+    path::{Component, Path, PathBuf},
     process::ExitCode,
 };
-
-#[cfg(target_os = "linux")]
-use std::path::PathBuf;
 
 use anyhow::Context;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -81,6 +78,9 @@ async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
 
     // Build and resolve profile
     let mut profile = SandboxProfile::for_ecosystem(ecosystem, &home, &pwd);
+    if ecosystem == Ecosystem::Node {
+        configure_node_workspace(&mut profile, &args.command, &pwd)?;
+    }
     let configs = load_configs(&pwd, args.config.as_deref(), args.trust_project_config).await?;
     resolve_profile(&mut profile, &configs, &home, &pwd)?;
 
@@ -570,13 +570,102 @@ fn project_relocation_option(command: &[String]) -> Option<&str> {
         })
 }
 
-#[cfg(target_os = "linux")]
 fn command_has_flag(command: &[String], flags: &[&str]) -> bool {
     command
         .iter()
         .skip(1)
         .take_while(|argument| argument.as_str() != "--")
         .any(|argument| flags.contains(&argument.as_str()))
+}
+
+#[cfg(target_os = "linux")]
+fn command_option_equals(command: &[String], option: &str, expected: &str) -> bool {
+    let mut arguments = command
+        .iter()
+        .skip(1)
+        .take_while(|argument| argument.as_str() != "--")
+        .peekable();
+    while let Some(argument) = arguments.next() {
+        if argument
+            .strip_prefix(option)
+            .and_then(|suffix| suffix.strip_prefix('='))
+            .is_some_and(|value| value.eq_ignore_ascii_case(expected))
+        {
+            return true;
+        }
+        if argument == option
+            && arguments
+                .peek()
+                .is_some_and(|value| value.eq_ignore_ascii_case(expected))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn configure_node_workspace(
+    profile: &mut SandboxProfile,
+    command: &[String],
+    project_dir: &Path,
+) -> anyhow::Result<()> {
+    let program = command
+        .first()
+        .and_then(|program| Path::new(program).file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let manager = match program {
+        "npm" | "npx" => "npm",
+        "yarn" => "yarn",
+        "pnpm" => "pnpm",
+        "bun" => "bun",
+        _ => return Ok(()),
+    };
+    let workspace_root = discover_node_workspace_root(project_dir, manager)?;
+    if workspace_root == project_dir {
+        return Ok(());
+    }
+
+    let mut grants = vec![SandboxPath::dir(workspace_root.join("node_modules"))];
+    match manager {
+        "npm" => grants.push(SandboxPath::file(workspace_root.join("package-lock.json"))),
+        "yarn" => grants.extend([
+            SandboxPath::file(workspace_root.join("yarn.lock")),
+            SandboxPath::dir(workspace_root.join(".yarn")),
+            SandboxPath::file(workspace_root.join(".pnp.cjs")),
+            SandboxPath::file(workspace_root.join(".pnp.loader.mjs")),
+        ]),
+        "pnpm" => grants.push(SandboxPath::file(workspace_root.join("pnpm-lock.yaml"))),
+        "bun" => {
+            grants.push(SandboxPath::file(workspace_root.join("bun.lock")));
+            if command_has_flag(command, &["--yarn"]) {
+                grants.push(SandboxPath::file(workspace_root.join("yarn.lock")));
+            }
+        }
+        _ => return Ok(()),
+    }
+
+    let mut insertion = profile
+        .first_user_allow_write
+        .min(profile.allow_write.len());
+    for grant in grants {
+        if profile
+            .allow_write
+            .iter()
+            .any(|existing| existing == &grant)
+        {
+            continue;
+        }
+        profile.grant_origins.push(GrantRecord {
+            kind: GrantKind::AllowWrite,
+            value: grant.path.to_string_lossy().into_owned(),
+            origin: GrantOrigin::BuiltIn,
+        });
+        profile.allow_write.insert(insertion, grant);
+        insertion += 1;
+    }
+    profile.first_user_allow_write = insertion;
+    Ok(())
 }
 
 /// Return the package manager's top-level subcommand. Options (and the values
@@ -955,7 +1044,10 @@ fn ensure_literal_write_targets(
         command,
         &["--frozen", "--frozen-lockfile", "--immutable", "--locked"],
     ) || (program == "bun"
-        && command_has_flag(command, &["--no-save"]));
+        && command_has_flag(command, &["--no-save"]))
+        || (program == "npm"
+            && (command_has_flag(command, &["--no-package-lock"])
+                || command_option_equals(command, "--package-lock", "false")));
     let manager_is_informational = matches!(program, "yarn" | "bun")
         && command_has_flag(command, &["--help", "--version", "-h", "-v"]);
     let subcommand = top_level_subcommand(command);
@@ -1002,7 +1094,7 @@ fn ensure_literal_write_targets(
                 ]) =>
             {
                 vec![
-                    selected_node_output_root(profile, project_dir, program, "package-lock.json")?
+                    selected_node_output_root(profile, project_dir, "package-lock.json")
                         .join("package-lock.json"),
                 ]
             }
@@ -1010,8 +1102,7 @@ fn ensure_literal_write_targets(
                 if subcommand == ParsedTopLevel::NoCommand
                     || subcommand.is_command(&["add", "dedupe", "install", "remove", "up"]) =>
             {
-                let output_root =
-                    selected_node_output_root(profile, project_dir, program, "yarn.lock")?;
+                let output_root = selected_node_output_root(profile, project_dir, "yarn.lock");
                 let (uses_pnp, uses_esm_loader) = yarn_pnp_configuration(&output_root)?;
                 let mut outputs = vec![output_root.join("yarn.lock")];
                 if uses_pnp {
@@ -1037,7 +1128,7 @@ fn ensure_literal_write_targets(
                 ]) =>
             {
                 vec![
-                    selected_node_output_root(profile, project_dir, program, "pnpm-lock.yaml")?
+                    selected_node_output_root(profile, project_dir, "pnpm-lock.yaml")
                         .join("pnpm-lock.yaml"),
                 ]
             }
@@ -1052,8 +1143,7 @@ fn ensure_literal_write_targets(
                     "update",
                 ]) =>
             {
-                let output_root =
-                    selected_node_output_root(profile, project_dir, program, "bun.lock")?;
+                let output_root = selected_node_output_root(profile, project_dir, "bun.lock");
                 let mut outputs = vec![output_root.join("bun.lock")];
                 if command_has_flag(command, &["--yarn"]) {
                     outputs.push(output_root.join("yarn.lock"));
@@ -1157,9 +1247,8 @@ fn ensure_literal_write_targets(
 fn selected_node_output_root(
     profile: &SandboxProfile,
     project_dir: &Path,
-    program: &str,
     lockfile: &str,
-) -> anyhow::Result<PathBuf> {
+) -> PathBuf {
     let mut candidates: Vec<PathBuf> = profile.allow_write[..profile
         .first_user_allow_write
         .min(profile.allow_write.len())]
@@ -1173,14 +1262,53 @@ fn selected_node_output_root(
     candidates.dedup();
 
     for root in candidates {
-        if root != project_dir && node_workspace_contains(&root, project_dir, program)? {
-            return Ok(root);
+        if root != project_dir {
+            return root;
         }
+    }
+    project_dir.to_path_buf()
+}
+
+fn discover_node_workspace_root(project_dir: &Path, program: &str) -> anyhow::Result<PathBuf> {
+    if !matches!(program, "npm" | "yarn" | "pnpm" | "bun") {
+        return Ok(project_dir.to_path_buf());
+    }
+    let git_boundary = project_git_boundary(project_dir)?;
+    if git_boundary.as_deref() == Some(project_dir) {
+        return Ok(project_dir.to_path_buf());
+    }
+    let mut candidate = project_dir.parent();
+    while let Some(root) = candidate {
+        if node_workspace_contains(root, project_dir, program)? {
+            return Ok(root.to_path_buf());
+        }
+        if git_boundary.as_deref() == Some(root) {
+            break;
+        }
+        candidate = root.parent();
     }
     Ok(project_dir.to_path_buf())
 }
 
-#[cfg(target_os = "linux")]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "workspace discovery inspects .git without following a project-controlled symlink"
+)]
+fn project_git_boundary(project_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
+    for ancestor in project_dir.ancestors() {
+        match std::fs::symlink_metadata(ancestor.join(".git")) {
+            Ok(_) => return Ok(Some(ancestor.to_path_buf())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("inspect Git workspace boundary: {}", ancestor.display())
+                });
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn node_workspace_contains(root: &Path, project_dir: &Path, program: &str) -> anyhow::Result<bool> {
     let relative = project_dir
         .strip_prefix(root)
@@ -1190,7 +1318,9 @@ fn node_workspace_contains(root: &Path, project_dir: &Path, program: &str) -> an
     }
 
     let mut patterns = Vec::new();
-    if let Some(contents) = read_bounded_project_file(&root.join("package.json"))? {
+    if program != "pnpm"
+        && let Some(contents) = read_bounded_project_file(&root.join("package.json"))?
+    {
         let package: serde_json::Value = serde_json::from_slice(&contents).with_context(|| {
             format!("parse workspace metadata: {}/package.json", root.display())
         })?;
@@ -1249,7 +1379,6 @@ fn node_workspace_contains(root: &Path, project_dir: &Path, program: &str) -> an
     Ok(included)
 }
 
-#[cfg(target_os = "linux")]
 fn workspace_glob_matches_prefix(pattern: &str, path: &str) -> bool {
     fn matches(pattern: &[&str], path: &[&str]) -> bool {
         let Some((component, remaining_pattern)) = pattern.split_first() else {
@@ -1273,7 +1402,6 @@ fn workspace_glob_matches_prefix(pattern: &str, path: &str) -> bool {
     !pattern.is_empty() && matches(&pattern, &path)
 }
 
-#[cfg(target_os = "linux")]
 fn workspace_component_matches(pattern: &str, value: &str) -> bool {
     let pattern = pattern.as_bytes();
     let value = value.as_bytes();
@@ -1359,10 +1487,9 @@ fn yarn_pnp_configuration(project_dir: &Path) -> anyhow::Result<(bool, bool)> {
     Ok((modern_yarn, false))
 }
 
-#[cfg(target_os = "linux")]
 #[allow(
     clippy::disallowed_types,
-    reason = "bounded synchronous metadata reads run before the Linux launcher and use O_NOFOLLOW"
+    reason = "bounded synchronous policy metadata reads use O_NOFOLLOW before sandbox launch"
 )]
 fn read_bounded_project_file(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
     use std::{fs::OpenOptions, io::Read, os::unix::fs::OpenOptionsExt};
@@ -2176,20 +2303,44 @@ mod tests {
     fn literal_write_targets_select_one_node_workspace_root() {
         let repository = tempfile::tempdir().unwrap();
         std::fs::create_dir(repository.path().join(".git")).unwrap();
+        let workspace = repository.path().join("frontend");
+        std::fs::create_dir(&workspace).unwrap();
         std::fs::write(
-            repository.path().join("package.json"),
+            workspace.join("package.json"),
             r#"{"name":"workspace","workspaces":["packages/*"]}"#,
         )
         .unwrap();
-        let member = repository.path().join("packages/app");
+        let member = workspace.join("packages/app");
         std::fs::create_dir_all(&member).unwrap();
         std::fs::write(member.join("package.json"), r#"{"name":"app"}"#).unwrap();
-        let profile =
+        let mut profile =
             SandboxProfile::for_ecosystem(Ecosystem::Node, Path::new("/home/test"), &member);
+        configure_node_workspace(
+            &mut profile,
+            &["npm".to_owned(), "install".to_owned()],
+            &member,
+        )
+        .unwrap();
         ensure_literal_write_targets(&profile, &["npm".to_owned(), "install".to_owned()], &member)
             .unwrap();
-        assert!(repository.path().join("package-lock.json").is_file());
+        assert!(workspace.join("package-lock.json").is_file());
         assert!(!member.join("package-lock.json").exists());
+        assert!(!repository.path().join("package-lock.json").exists());
+        assert!(
+            profile
+                .allow_write
+                .contains(&SandboxPath::dir(workspace.join("node_modules")))
+        );
+        assert!(
+            !profile
+                .allow_write
+                .contains(&SandboxPath::file(workspace.join("yarn.lock")))
+        );
+        assert!(
+            !profile
+                .allow_write
+                .contains(&SandboxPath::dir(repository.path().join("node_modules")))
+        );
 
         let standalone_repository = tempfile::tempdir().unwrap();
         std::fs::create_dir(standalone_repository.path().join(".git")).unwrap();
@@ -2201,8 +2352,14 @@ mod tests {
         let standalone = standalone_repository.path().join("nested");
         std::fs::create_dir(&standalone).unwrap();
         std::fs::write(standalone.join("package.json"), r#"{"name":"standalone"}"#).unwrap();
-        let standalone_profile =
+        let mut standalone_profile =
             SandboxProfile::for_ecosystem(Ecosystem::Node, Path::new("/home/test"), &standalone);
+        configure_node_workspace(
+            &mut standalone_profile,
+            &["npm".to_owned(), "install".to_owned()],
+            &standalone,
+        )
+        .unwrap();
         ensure_literal_write_targets(
             &standalone_profile,
             &["npm".to_owned(), "install".to_owned()],
@@ -2244,6 +2401,23 @@ mod tests {
         )
         .unwrap();
         assert!(npm_project.path().join("package-lock.json").is_file());
+
+        for command in [
+            vec!["npm", "install", "--no-package-lock"],
+            vec!["npm", "install", "--package-lock=false"],
+            vec!["npm", "install", "--package-lock", "false"],
+        ] {
+            let no_lock_project = tempfile::tempdir().unwrap();
+            let no_lock_profile = SandboxProfile::for_ecosystem(
+                Ecosystem::Node,
+                Path::new("/home/test"),
+                no_lock_project.path(),
+            );
+            let command: Vec<String> = command.into_iter().map(str::to_owned).collect();
+            ensure_literal_write_targets(&no_lock_profile, &command, no_lock_project.path())
+                .unwrap();
+            assert!(!no_lock_project.path().join("package-lock.json").exists());
+        }
 
         let yarn_project = tempfile::tempdir().unwrap();
         let yarn_profile = SandboxProfile::for_ecosystem(

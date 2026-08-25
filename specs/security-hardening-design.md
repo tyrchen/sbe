@@ -405,10 +405,13 @@ values, nested commands, `--` payloads, informational flags, mutually exclusive
 manager outputs, and read-only commands must not acquire empty lockfiles as a
 launcher side effect. Yarn PnP outputs are selected only when bounded,
 no-follow project metadata identifies Berry/PnP, including the optional ESM
-loader flag. Nested projects use that same bounded metadata to select exactly
-one active Node workspace lockfile root. Project-relocation options are rejected
-before profile preparation so the launcher cannot create outputs relative to a
-different directory. Mutating Bun commands select `bun.lock`, adding
+loader flag. Nested projects walk ancestors through the Git boundary using that
+same bounded metadata, select the nearest matching Node workspace root, and add
+only the active manager's exact dependency and lock/PnP outputs. Explicit
+lockfile opt-outs, including npm's negative and false-valued forms, suppress
+pre-creation. Project-relocation options are rejected before profile preparation
+so the launcher cannot create outputs relative to a different directory.
+Mutating Bun commands select `bun.lock`, adding
 `yarn.lock` only when `--yarn` requests it, without granting unrelated manager
 outputs. Commands that explicitly execute installed Node tools replace
 the built-in `node_modules` write grant with an execute grant for that
@@ -434,6 +437,10 @@ strings and regular expressions. The encoder must escape SBPL syntax exactly,
 reject NUL/control characters and unsupported non-UTF-8 paths, and preserve path
 semantics without `Path::display()` lossiness. SBE validates the generated
 profile with `sandbox-exec` before launching the untrusted command.
+Each `denyRead` rule emits both its configured pathname and, when it exists,
+its canonical target. Canonicalization failures other than a missing path fail
+policy generation, preventing Seatbelt's resolved-path matching from bypassing
+a secret denial through a symlink.
 
 Network generation switches exhaustively on `NetworkMode`; there is no default
 fallback branch. Proxy mode permits only its exact loopback port. General

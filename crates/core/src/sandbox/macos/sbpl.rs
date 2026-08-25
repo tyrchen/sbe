@@ -120,12 +120,36 @@ fn section_file_read(sb: &mut String, profile: &SandboxProfile) -> Result<(), Co
         writeln!(sb, "(deny file-read*").ok();
         for sp in &profile.deny_read {
             write_sandbox_path(sb, sp, "    ")?;
+            if let Some(resolved) = resolved_deny_read_path(sp)? {
+                write_sandbox_path(sb, &resolved, "    ")?;
+            }
         }
         writeln!(sb, ")").ok();
     }
 
     writeln!(sb).ok();
     Ok(())
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "SBPL is synchronous and must canonicalize denyRead aliases before launch"
+)]
+fn resolved_deny_read_path(path: &SandboxPath) -> Result<Option<SandboxPath>, CoreError> {
+    let resolved = match std::fs::canonicalize(&path.path) {
+        Ok(resolved) => resolved,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(CoreError::ProfileLint(format!(
+                "cannot resolve denyRead path '{}': {error}",
+                path.path.display()
+            )));
+        }
+    };
+    Ok((resolved != path.path).then_some(SandboxPath {
+        path: resolved,
+        kind: path.kind,
+    }))
 }
 
 fn section_file_write(sb: &mut String, profile: &SandboxProfile) -> Result<(), CoreError> {
@@ -435,5 +459,27 @@ mod tests {
     fn test_should_reject_non_utf8_paths() {
         let path = PathBuf::from(OsString::from_vec(vec![b'/', b't', b'm', b'p', b'/', 0xff]));
         assert!(validated_sbpl_path(&path).is_err());
+    }
+
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous filesystem setup is isolated to this SBPL regression test"
+    )]
+    fn deny_read_includes_resolved_symlink_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let protected = directory.path().join("dotfiles/ssh");
+        std::fs::create_dir_all(&protected).unwrap();
+        let canonical_protected = std::fs::canonicalize(&protected).unwrap();
+        let alias = directory.path().join(".ssh");
+        std::os::unix::fs::symlink(&protected, &alias).unwrap();
+
+        let mut profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Rust, directory.path(), directory.path());
+        profile.deny_read = vec![SandboxPath::dir(alias.clone())];
+        let sbpl = generate(&profile, Some(12345)).unwrap();
+
+        assert!(sbpl.contains(&format!("(subpath \"{}\")", alias.display())));
+        assert!(sbpl.contains(&format!("(subpath \"{}\")", canonical_protected.display())));
     }
 }

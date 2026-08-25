@@ -170,9 +170,12 @@ ESM loader when configured)
 only when `.yarnrc.yml` or `packageManager` identifies a PnP-capable Yarn;
 Classic Yarn and the `node-modules` linker remain lockfile-only. Mutating Bun
 commands receive only their own `bun.lock` output, plus `yarn.lock` when Bun's
-`--yarn` compatibility output is requested. In nested Git worktrees, SBE reads
-bounded, no-follow workspace metadata and pre-creates lockfiles at exactly one
-active Node workspace root. Package-manager options that relocate the project
+`--yarn` compatibility output is requested. SBE walks bounded, no-follow
+workspace metadata up to the Git boundary, including workspace roots between
+the current directory and repository root, and grants/pre-creates outputs at
+exactly one active Node workspace root. `npm --no-package-lock` and
+`--package-lock=false` never create an empty lockfile. Package-manager options
+that relocate the project
 (`--prefix`, `--cwd`, `--dir`, `--directory`, `--project`, and equivalent short
 forms) are rejected before policy preparation; change directory before running
 SBE instead.
@@ -263,6 +266,10 @@ component with directory FDs. Root-owned immutable distribution symlinks are
 the only symlink exception. Because Landlock authorizes inodes rather than
 pathnames, SBE fails closed if a denied regular file—or a file below a denied
 directory—has multiple hard links.
+
+On macOS, secret read denials include both the configured pathname and its
+canonical target. A symlinked `~/.ssh`, `.aws`, or similar protected directory
+therefore cannot escape the Seatbelt deny rule through pathname resolution.
 
 Hex 2.5.x currently extracts packages through an unpredictable `tmp_*`
 directory in the project root and exposes no temp-directory setting. Strict

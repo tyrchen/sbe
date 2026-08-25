@@ -338,7 +338,7 @@ impl SandboxProfile {
             .collect();
 
         // Build allow_write: from ecosystem
-        let mut allow_write: Vec<SandboxPath> = eco_cfg
+        let allow_write: Vec<SandboxPath> = eco_cfg
             .allow_write
             .iter()
             .map(|p| expand_path(p, home, pwd))
@@ -350,24 +350,6 @@ impl SandboxProfile {
             .iter()
             .map(|d| DomainPattern::new(d).expect("invalid built-in domain pattern"))
             .collect();
-
-        // Node-specific: monorepos hoist node_modules and lock files to the
-        // workspace root. Only allow writes to specific paths npm needs —
-        // NOT the entire git root, which would let a malicious postinstall
-        // script modify source files in sibling packages or CI configs.
-        if ecosystem == Ecosystem::Node
-            && let Some(git_root) = find_git_root(pwd)
-            && git_root != pwd
-        {
-            allow_write.push(SandboxPath::dir(git_root.join("node_modules")));
-            allow_write.push(SandboxPath::file(git_root.join("package-lock.json")));
-            allow_write.push(SandboxPath::file(git_root.join("yarn.lock")));
-            allow_write.push(SandboxPath::file(git_root.join("pnpm-lock.yaml")));
-            allow_write.push(SandboxPath::file(git_root.join("bun.lock")));
-            allow_write.push(SandboxPath::dir(git_root.join(".yarn")));
-            allow_write.push(SandboxPath::file(git_root.join(".pnp.cjs")));
-            allow_write.push(SandboxPath::file(git_root.join(".pnp.loader.mjs")));
-        }
 
         // Build output locations are selected by SBE-owned environment
         // variables and limited to dedicated profile outputs or the private
@@ -954,17 +936,6 @@ fn resolve_symlinks(paths: &mut Vec<SandboxPath>) {
         .filter(|resolved| !paths.iter().any(|p| p.path == resolved.path))
         .collect();
     paths.extend(additional);
-}
-
-/// Find the git root by walking up from `start`.
-fn find_git_root(start: &Path) -> Option<PathBuf> {
-    let mut dir = start;
-    loop {
-        if dir.join(".git").exists() {
-            return Some(dir.to_path_buf());
-        }
-        dir = dir.parent()?;
-    }
 }
 
 /// Overrides from CLI flags that get merged into the resolved profile.

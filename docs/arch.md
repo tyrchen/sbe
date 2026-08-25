@@ -98,10 +98,11 @@ that execute target artifacts, including cargo-nextest, use a private
 `CARGO_TARGET_DIR`. Node install commands keep `node_modules` writable and
 non-executable; explicit local-tool execution switches that built-in grant to
 read/execute without write. Yarn linker metadata selects only the required
-lock/PnP output files. Nested Node projects select exactly one lockfile root
-from bounded, no-follow workspace metadata; project-relocation flags are
-rejected before policy preparation. Bun mutations select `bun.lock` and add
-`yarn.lock` only for `--yarn`. Python
+lock/PnP output files. Nested Node projects discover the nearest matching
+workspace ancestor, including roots below the Git root, from bounded,
+no-follow metadata and add only manager-specific outputs there. Lockfile opt-out
+and project-relocation flags are honored before policy preparation. Bun
+mutations select `bun.lock` and add `yarn.lock` only for `--yarn`. Python
 environment installation and execution apply the same invocation-specific
 write-or-execute split to project `.venv` and `venv` roots.
 All persistent outputs and caches remain tainted untrusted data; the sandbox
@@ -120,7 +121,8 @@ rejected.
 
 The policy uses:
 
-- allow-most reads with explicit secret and shared-temp denials;
+- allow-most reads with explicit secret and shared-temp denials; secret rules
+  cover both configured and canonical paths so symlinks cannot bypass them;
 - deny-by-default writes with output-specific grants;
 - an executable allowlist plus explicit sensitive-binary denials;
 - only the exact authenticated proxy port in `Proxy` mode; and
