@@ -24,6 +24,12 @@ pub enum LandlockAbi {
     V5,
     /// 6.12+ — abstract-unix-socket / signal scoping.
     V6,
+    /// 6.15+ — audit logging flags.
+    V7,
+    /// 6.17+ — all-thread Landlock restriction.
+    V8,
+    /// 6.19+ — path-based Unix-socket connection mediation.
+    V9,
 }
 
 impl LandlockAbi {
@@ -42,6 +48,17 @@ impl LandlockAbi {
         self >= Self::V5
     }
 
+    /// Whether Landlock can isolate signals and abstract Unix sockets to the
+    /// current ruleset domain.
+    pub fn supports_scopes(self) -> bool {
+        self >= Self::V6
+    }
+
+    /// Whether filesystem Unix-socket connection resolution is mediated.
+    pub fn supports_unix_path_filter(self) -> bool {
+        self >= Self::V9
+    }
+
     /// Display string used in policy rendering.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -52,6 +69,9 @@ impl LandlockAbi {
             Self::V4 => "v4",
             Self::V5 => "v5",
             Self::V6 => "v6",
+            Self::V7 => "v7",
+            Self::V8 => "v8",
+            Self::V9 => "v9",
         }
     }
 }
@@ -65,7 +85,10 @@ impl From<i64> for LandlockAbi {
             3 => Self::V3,
             4 => Self::V4,
             5 => Self::V5,
-            _ => Self::V6,
+            6 => Self::V6,
+            7 => Self::V7,
+            8 => Self::V8,
+            _ => Self::V9,
         }
     }
 }
@@ -87,7 +110,11 @@ impl ProbeResult {
             fs_read: self.abi >= LandlockAbi::V1,
             exec_allowlist: self.abi >= LandlockAbi::V1,
             net_port_filter: self.abi.supports_net_port_filter(),
-            audit_stream: true,
+            // Access to /dev/kmsg alone does not prove that this ruleset's
+            // Landlock and SECCOMP_RET_ERRNO denials are emitted with a
+            // stable domain identifier. Keep the feature false until an
+            // end-to-end kernel probe verifies correlated records.
+            audit_stream: false,
         }
     }
 }
@@ -163,7 +190,7 @@ mod tests {
     fn test_should_order_abi_tiers() {
         assert!(LandlockAbi::V4 > LandlockAbi::V3);
         assert!(LandlockAbi::V1 > LandlockAbi::Unsupported);
-        assert!(LandlockAbi::V6 >= LandlockAbi::V4);
+        assert!(LandlockAbi::V9 >= LandlockAbi::V4);
     }
 
     #[test]
@@ -171,7 +198,14 @@ mod tests {
         assert!(!LandlockAbi::V1.supports_net_port_filter());
         assert!(!LandlockAbi::V3.supports_net_port_filter());
         assert!(LandlockAbi::V4.supports_net_port_filter());
-        assert!(LandlockAbi::V6.supports_net_port_filter());
+        assert!(LandlockAbi::V9.supports_net_port_filter());
+    }
+
+    #[test]
+    fn test_should_report_scope_capability() {
+        assert!(!LandlockAbi::V5.supports_scopes());
+        assert!(LandlockAbi::V6.supports_scopes());
+        assert!(LandlockAbi::V9.supports_scopes());
     }
 
     #[test]
@@ -180,6 +214,6 @@ mod tests {
         assert_eq!(LandlockAbi::from(-1), LandlockAbi::Unsupported);
         assert_eq!(LandlockAbi::from(1), LandlockAbi::V1);
         assert_eq!(LandlockAbi::from(4), LandlockAbi::V4);
-        assert_eq!(LandlockAbi::from(99), LandlockAbi::V6);
+        assert_eq!(LandlockAbi::from(99), LandlockAbi::V9);
     }
 }

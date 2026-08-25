@@ -9,8 +9,26 @@ use tracing_subscriber::EnvFilter;
 
 use crate::cli::{Cli, Commands};
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    #[cfg(target_os = "linux")]
+    if let Some(code) = sbe_core::maybe_run_launcher() {
+        return code;
+    }
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("sbe: failed to start runtime: {error}");
+            return ExitCode::from(125);
+        }
+    };
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> ExitCode {
     let cli = Cli::parse();
 
     // Determine log level

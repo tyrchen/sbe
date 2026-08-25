@@ -1,0 +1,4 @@
+Manifest-Version: 1.0
+Premain-Class: dev.sbe.ProxyAuthAgent
+Can-Redefine-Classes: false
+Can-Retransform-Classes: false

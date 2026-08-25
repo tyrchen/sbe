@@ -3,6 +3,45 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23
+
+### Security
+
+- Fail closed for empty domain allowlists and for strict Linux domain egress,
+  which Landlock's destination-port rules cannot enforce.
+- Clear ambient environment variables and file descriptors; add explicit
+  `--keep-env` and `--env` grants with redacted inspection output.
+- Treat auto-discovered project configuration as restrictive-only unless
+  `--trust-project-config` is supplied, and retain grant provenance.
+- Add a single-threaded Linux launcher, descriptor-based `openat2` path
+  resolution, data-read/execute separation, persistent W^X validation, and
+  isolated private temporary roots. Cargo intermediate artifacts and build
+  scripts use the stable private `build.build-dir` split while final artifacts
+  remain in `$PWD/target`.
+- Block keyring access, cross-process FD duplication, asynchronous `io_uring`
+  bypasses, and legacy/new mount APIs in the Linux seccomp layer.
+- Bound and authenticate the CONNECT proxy; validate IDNA names, ports and all
+  resolved addresses; reject special-use destinations; enforce DNS, connect,
+  header, idle and maximum-lifetime limits.
+- Escape and validate SBPL inputs, narrow macOS proxy/IPC access, and add direct
+  Keychain and unrelated-localhost denial coverage.
+- Pin workflow actions, minimize token permissions, and publish release
+  checksums, SPDX SBOMs and GitHub provenance attestations from an atomic draft.
+
+### Breaking changes
+
+- Linux domain-filtered profiles now refuse to run by default. The explicit
+  `--allow-insecure-linux-network` option enables the documented, bypassable
+  destination-port compatibility mode.
+- Project `.sbe.yaml` files cannot expand authority without
+  `--trust-project-config`; unknown fields and unsafe values are rejected.
+- Ambient credentials, agent sockets and arbitrary parent environment values
+  are no longer inherited.
+- Broad workspace writes, shared temporary-directory access and persistent
+  writable+executable cache combinations were removed from built-in profiles.
+- The setup action supports attested 0.4.0-or-newer release assets.
+
+---
 ## [sbexec-v0.3.3](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.2..sbexec-v0.3.3) - 2026-08-23
 
 ### Bug Fixes

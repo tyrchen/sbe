@@ -7,6 +7,7 @@
 
 use std::{
     collections::HashMap,
+    os::unix::fs::PermissionsExt,
     path::Path,
     sync::{
         Arc,
@@ -15,7 +16,18 @@ use std::{
 };
 
 use sbe_core::BackendInfo;
-use tokio::sync::Mutex;
+use tokio::{
+    io::{AsyncBufRead, AsyncBufReadExt},
+    sync::Mutex,
+};
+
+const MAX_AUDIT_RECORD_BYTES: usize = 16 * 1024;
+
+enum AuditRecord {
+    Line(Vec<u8>),
+    Dropped,
+    Eof,
+}
 
 /// Start the OS-appropriate audit stream and return its handle. Pass
 /// `log_path` to also append events to a file.
@@ -23,22 +35,91 @@ use tokio::sync::Mutex;
     not(any(target_os = "macos", target_os = "linux")),
     allow(unused_variables)
 )]
-pub async fn start(info: &BackendInfo, log_path: Option<&Path>) -> anyhow::Result<AuditorHandle> {
+pub async fn start(
+    info: &BackendInfo,
+    log_path: Option<&Path>,
+    pid: u32,
+) -> anyhow::Result<AuditorHandle> {
     #[cfg(target_os = "macos")]
     {
         let _ = info;
-        let logger = macos::MacosLogStream::new(log_path).await?;
+        let logger = macos::MacosLogStream::new(log_path, pid).await?;
         Ok(logger.start())
     }
     #[cfg(target_os = "linux")]
     {
-        let logger = linux::LinuxSeccompLog::new(log_path, info.kernel.clone()).await?;
+        let logger = linux::LinuxSeccompLog::new(log_path, info.kernel.clone(), pid).await?;
         Ok(logger.start())
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         anyhow::bail!("audit streaming is not supported on this platform");
     }
+}
+
+#[allow(clippy::disallowed_types)] // O_NOFOLLOW/O_CLOEXEC require Unix std OpenOptions.
+async fn open_audit_log(path: &Path) -> anyhow::Result<tokio::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        anyhow::bail!("audit log path is not a regular file: {}", path.display());
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(tokio::fs::File::from_std(file))
+}
+
+async fn read_audit_record<R>(reader: &mut R) -> std::io::Result<AuditRecord>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut output = Vec::new();
+    let mut exceeded = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return if output.is_empty() && !exceeded {
+                Ok(AuditRecord::Eof)
+            } else if exceeded {
+                Ok(AuditRecord::Dropped)
+            } else {
+                Ok(AuditRecord::Line(output))
+            };
+        }
+        let consumed = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if !exceeded {
+            if output.len().saturating_add(consumed) > MAX_AUDIT_RECORD_BYTES {
+                exceeded = true;
+                output.clear();
+            } else {
+                output.extend_from_slice(&available[..consumed]);
+            }
+        }
+        let complete = available[..consumed].last() == Some(&b'\n');
+        reader.consume(consumed);
+        if complete {
+            return if exceeded {
+                Ok(AuditRecord::Dropped)
+            } else {
+                Ok(AuditRecord::Line(output))
+            };
+        }
+    }
+}
+
+fn sanitize_event_field(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|character| character.escape_default())
+        .take(4096)
+        .collect()
 }
 
 /// Cross-platform view of a single sandbox violation.
@@ -76,7 +157,7 @@ impl AuditorHandle {
 #[cfg(target_os = "macos")]
 mod macos {
     use tokio::{
-        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        io::{AsyncWriteExt, BufReader},
         process::Command,
     };
     use tracing::debug;
@@ -88,18 +169,13 @@ mod macos {
         running: Arc<AtomicBool>,
         log_file: Option<tokio::fs::File>,
         violation_counts: Arc<Mutex<HashMap<String, u64>>>,
+        pid: u32,
     }
 
     impl MacosLogStream {
-        pub async fn new(log_path: Option<&Path>) -> anyhow::Result<Self> {
+        pub async fn new(log_path: Option<&Path>, pid: u32) -> anyhow::Result<Self> {
             let log_file = match log_path {
-                Some(p) => Some(
-                    tokio::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(p)
-                        .await?,
-                ),
+                Some(p) => Some(open_audit_log(p).await?),
                 None => None,
             };
 
@@ -107,6 +183,7 @@ mod macos {
                 running: Arc::new(AtomicBool::new(true)),
                 log_file,
                 violation_counts: Arc::new(Mutex::new(HashMap::new())),
+                pid,
             })
         }
 
@@ -128,14 +205,12 @@ mod macos {
         }
 
         async fn stream_logs(&mut self) -> anyhow::Result<()> {
+            let predicate = format!(
+                "process == \"sandboxd\" AND eventMessage CONTAINS[c] \"({})\"",
+                self.pid
+            );
             let mut child = Command::new("/usr/bin/log")
-                .args([
-                    "stream",
-                    "--style",
-                    "compact",
-                    "--predicate",
-                    "process == \"sandboxd\"",
-                ])
+                .args(["stream", "--style", "compact", "--predicate", &predicate])
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
                 .spawn()?;
@@ -144,15 +219,19 @@ mod macos {
                 .stdout
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("no stdout from log stream"))?;
-            let reader = BufReader::new(stdout);
-            let mut lines = reader.lines();
+            let mut reader = BufReader::new(stdout);
 
             while self.running.load(Ordering::Relaxed) {
                 let line = tokio::select! {
-                    result = lines.next_line() => {
+                    result = read_audit_record(&mut reader) => {
                         match result {
-                            Ok(Some(line)) => line,
-                            Ok(None) => break,
+                            Ok(AuditRecord::Line(line)) => String::from_utf8_lossy(&line).into_owned(),
+                            Ok(AuditRecord::Dropped) => {
+                                let mut counts = self.violation_counts.lock().await;
+                                *counts.entry("audit-record-dropped".to_owned()).or_insert(0) += 1;
+                                continue;
+                            }
+                            Ok(AuditRecord::Eof) => break,
                             Err(e) => {
                                 debug!(error = %e, "error reading log stream");
                                 break;
@@ -167,9 +246,10 @@ mod macos {
                     }
                 };
 
-                if let Some(event) = parse_macos_event(&line) {
-                    let formatted =
-                        format!("[sbe:audit] DENIED {} {}\n", event.operation, event.target);
+                if let Some(event) = parse_macos_event(&line, self.pid) {
+                    let operation = sanitize_event_field(&event.operation);
+                    let target = sanitize_event_field(&event.target);
+                    let formatted = format!("[sbe:audit] DENIED {operation} {target}\n");
                     eprint!("{formatted}");
 
                     if let Some(ref mut f) = self.log_file {
@@ -187,8 +267,8 @@ mod macos {
         }
     }
 
-    fn parse_macos_event(line: &str) -> Option<SandboxEvent> {
-        if !line.contains("deny") {
+    fn parse_macos_event(line: &str, pid: u32) -> Option<SandboxEvent> {
+        if !line.contains("deny") || !line.contains(&format!("({pid})")) {
             return None;
         }
 
@@ -218,9 +298,10 @@ mod macos {
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use anyhow::Context as _;
     use tokio::{
         fs::File,
-        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        io::{AsyncWriteExt, BufReader},
     };
     use tracing::debug;
 
@@ -230,29 +311,34 @@ mod linux {
     /// audit lines. Best-effort: requires CAP_SYSLOG on locked-down hosts.
     pub struct LinuxSeccompLog {
         running: Arc<AtomicBool>,
+        source: Option<File>,
         log_file: Option<tokio::fs::File>,
         kernel: String,
         violation_counts: Arc<Mutex<HashMap<String, u64>>>,
+        pid: u32,
     }
 
     impl LinuxSeccompLog {
-        pub async fn new(log_path: Option<&Path>, kernel: String) -> anyhow::Result<Self> {
+        pub async fn new(
+            log_path: Option<&Path>,
+            kernel: String,
+            pid: u32,
+        ) -> anyhow::Result<Self> {
+            let source = File::open("/dev/kmsg")
+                .await
+                .context("open /dev/kmsg for Linux audit")?;
             let log_file = match log_path {
-                Some(p) => Some(
-                    tokio::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(p)
-                        .await?,
-                ),
+                Some(p) => Some(open_audit_log(p).await?),
                 None => None,
             };
 
             Ok(Self {
                 running: Arc::new(AtomicBool::new(true)),
+                source: Some(source),
                 log_file,
                 kernel,
                 violation_counts: Arc::new(Mutex::new(HashMap::new())),
+                pid,
             })
         }
 
@@ -274,25 +360,22 @@ mod linux {
         }
 
         async fn stream_kmsg(&mut self) -> anyhow::Result<()> {
-            let file = match File::open("/dev/kmsg").await {
-                Ok(f) => f,
-                Err(e) => {
-                    debug!(error = %e, "cannot open /dev/kmsg — audit will be best-effort");
-                    eprintln!(
-                        "[sbe:audit] /dev/kmsg unavailable; Linux audit requires CAP_SYSLOG or \
-                         world-readable kmsg. Violations will still surface as EACCES/EPERM from \
-                         the sandboxed program."
-                    );
-                    return Ok(());
-                }
-            };
-            let mut lines = BufReader::new(file).lines();
+            let file = self
+                .source
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("Linux audit source already consumed"))?;
+            let mut reader = BufReader::new(file);
 
             while self.running.load(Ordering::Relaxed) {
                 let line = tokio::select! {
-                    result = lines.next_line() => match result {
-                        Ok(Some(line)) => line,
-                        Ok(None) => break,
+                    result = read_audit_record(&mut reader) => match result {
+                        Ok(AuditRecord::Line(line)) => String::from_utf8_lossy(&line).into_owned(),
+                        Ok(AuditRecord::Dropped) => {
+                            let mut counts = self.violation_counts.lock().await;
+                            *counts.entry("audit-record-dropped".to_owned()).or_insert(0) += 1;
+                            continue;
+                        }
+                        Ok(AuditRecord::Eof) => break,
                         Err(_) => break,
                     },
                     _ = tokio::time::sleep(std::time::Duration::from_millis(150)) => {
@@ -303,9 +386,10 @@ mod linux {
                     }
                 };
 
-                if let Some(event) = parse_kmsg_event(&line) {
-                    let formatted =
-                        format!("[sbe:audit] DENIED {} {}\n", event.operation, event.target);
+                if let Some(event) = parse_kmsg_event(&line, self.pid) {
+                    let operation = sanitize_event_field(&event.operation);
+                    let target = sanitize_event_field(&event.target);
+                    let formatted = format!("[sbe:audit] DENIED {operation} {target}\n");
                     eprint!("{formatted}");
 
                     if let Some(ref mut f) = self.log_file {
@@ -320,11 +404,13 @@ mod linux {
         }
     }
 
-    fn parse_kmsg_event(line: &str) -> Option<SandboxEvent> {
+    fn parse_kmsg_event(line: &str, pid: u32) -> Option<SandboxEvent> {
         // Kernel seccomp audit lines look like:
         //   "audit: type=1326 audit(...): auid=... syscall=44 comm=\"foo\" exe=\"...\""
         // We match on `audit(` and `seccomp` keywords.
-        if !line.contains("audit") {
+        if !line.contains("audit")
+            || (!line.contains(&format!("pid={pid}")) && !line.contains(&format!("ppid={pid}")))
+        {
             return None;
         }
         if line.contains("syscall=") {
@@ -348,5 +434,56 @@ mod linux {
             });
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::AsyncWriteExt as _;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn oversized_audit_record_is_dropped_without_desynchronizing() {
+        let (mut writer, reader) = tokio::io::duplex(MAX_AUDIT_RECORD_BYTES * 2);
+        tokio::spawn(async move {
+            writer
+                .write_all(&vec![b'x'; MAX_AUDIT_RECORD_BYTES + 1])
+                .await
+                .unwrap();
+            writer.write_all(b"\nvalid\n").await.unwrap();
+        });
+        let mut reader = tokio::io::BufReader::new(reader);
+        assert!(matches!(
+            read_audit_record(&mut reader).await.unwrap(),
+            AuditRecord::Dropped
+        ));
+        let AuditRecord::Line(line) = read_audit_record(&mut reader).await.unwrap() else {
+            panic!("expected line after dropped record");
+        };
+        assert_eq!(line, b"valid\n");
+    }
+
+    #[tokio::test]
+    async fn audit_log_is_private_and_refuses_symlinks() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("audit.log");
+        drop(open_audit_log(&log).await.unwrap());
+        assert_eq!(
+            tokio::fs::metadata(&log)
+                .await
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        let target = directory.path().join("target.log");
+        tokio::fs::write(&target, "sentinel").await.unwrap();
+        let link = directory.path().join("link.log");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(open_audit_log(&link).await.is_err());
+        assert_eq!(tokio::fs::read_to_string(target).await.unwrap(), "sentinel");
     }
 }

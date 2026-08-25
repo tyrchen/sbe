@@ -1,14 +1,28 @@
-use std::{collections::HashMap, path::Path, process::ExitCode};
+use std::{
+    collections::HashMap,
+    ffi::CString,
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::ffi::OsStrExt,
+    },
+    path::{Component, Path, PathBuf},
+    process::ExitCode,
+};
 
 use anyhow::Context;
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use sbe_core::{
     BackendOptions, Sandbox, SandboxBackend,
-    config::{expand_path, load_configs, resolve_profile},
+    config::{SandboxPath, expand_path, load_configs, resolve_profile},
     detect::{self, Ecosystem},
     error::CoreError,
-    profile::{DomainPattern, ProfileOverrides, SandboxProfile},
+    profile::{
+        DomainPattern, GrantKind, GrantOrigin, GrantRecord, NetworkMode, ProfileOverrides,
+        SandboxProfile,
+    },
 };
-use sbe_proxy::{ProxyServer, allowlist::DomainAllowlist};
+use sbe_proxy::{ProxyEndpoint, ProxyServer, allowlist::DomainAllowlist};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
@@ -17,6 +31,28 @@ use crate::cli::RunArgs;
 /// sbe exit codes for its own errors (matching docker run / env conventions).
 const EXIT_SBE_ERROR: u8 = 125;
 const EXIT_SANDBOX_FAILED: u8 = 126;
+
+const SAFE_PARENT_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "COLORTERM",
+    "TZ",
+    "JAVA_HOME",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "NVM_DIR",
+    "MIX_HOME",
+    "HEX_HOME",
+    "GRADLE_USER_HOME",
+];
 
 /// Execute a command inside the sandbox.
 pub async fn execute(args: &RunArgs) -> ExitCode {
@@ -32,6 +68,7 @@ pub async fn execute(args: &RunArgs) -> ExitCode {
 async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
     let pwd = std::env::current_dir().context("failed to get current directory")?;
     let home = dirs::home_dir().context("could not determine home directory")?;
+    reject_project_relocation(&args.command)?;
 
     // Determine ecosystem
     let command_name = &args.command[0];
@@ -41,17 +78,69 @@ async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
 
     // Build and resolve profile
     let mut profile = SandboxProfile::for_ecosystem(ecosystem, &home, &pwd);
-    let configs = load_configs(&pwd, args.config.as_deref()).await?;
-    resolve_profile(&mut profile, &configs, &home, &pwd);
+    if ecosystem == Ecosystem::Node {
+        configure_node_workspace(&mut profile, &args.command, &pwd)?;
+    }
+    let configs = load_configs(&pwd, args.config.as_deref(), args.trust_project_config).await?;
+    resolve_profile(&mut profile, &configs, &home, &pwd)?;
 
-    let overrides = build_overrides(args, &home, &pwd);
+    let overrides = build_overrides(args, &home, &pwd)?;
     let cli_allow_degraded = overrides.allow_degraded;
     profile.merge_overrides(&overrides);
+    for (name, value) in resolve_cli_environment(args)? {
+        profile.env.insert(name.clone(), value);
+        profile.grant_origins.push(GrantRecord {
+            kind: GrantKind::Environment,
+            value: name,
+            origin: GrantOrigin::Cli,
+        });
+    }
     profile.finalize();
+    enable_existing_dependency_execution(&mut profile, &args.command);
+
+    if !args.dry_run {
+        if cargo_uses_persistent_target(&args.command) {
+            ensure_child_directory(&pwd, c"target")?;
+        }
+        #[cfg(target_os = "linux")]
+        ensure_literal_write_targets(&profile, &args.command, &pwd)?;
+    }
+
+    // Give each invocation an isolated temporary tree. The handle remains
+    // alive until the child and proxy have stopped.
+    let runtime_temp = tempfile::Builder::new()
+        .prefix("sbe-")
+        .tempdir()
+        .context("failed to create private sandbox temporary directory")?;
+    let runtime_temp_path = tokio::fs::canonicalize(runtime_temp.path())
+        .await
+        .context("failed to resolve private sandbox temporary directory")?;
+    profile
+        .allow_write
+        .push(SandboxPath::dir(runtime_temp_path.clone()));
+    profile.grant_origins.push(GrantRecord {
+        kind: GrantKind::AllowWrite,
+        value: runtime_temp_path.to_string_lossy().into_owned(),
+        origin: GrantOrigin::Runtime,
+    });
+    profile
+        .allow_exec
+        .push(SandboxPath::dir(runtime_temp_path.clone()));
+    profile.grant_origins.push(GrantRecord {
+        kind: GrantKind::AllowExec,
+        value: runtime_temp_path.to_string_lossy().into_owned(),
+        origin: GrantOrigin::Runtime,
+    });
+    profile.ephemeral_write_exec.push(runtime_temp_path.clone());
+    // Normal execution performs the filesystem identity scan exactly once in
+    // the platform backend immediately before spawn. Inspection has no spawn,
+    // so its branch below runs the complete validation explicitly.
+    profile.validate_structural_security_invariants()?;
 
     // Construct backend (kernel probe runs once here).
     let backend_options = BackendOptions {
-        allow_degraded: cli_allow_degraded || profile.allow_degraded,
+        allow_degraded: cli_allow_degraded,
+        allow_insecure_network: args.allow_insecure_linux_network || cli_allow_degraded,
     };
     let backend = Sandbox::new_with_options(backend_options).map_err(|e| anyhow::anyhow!("{e}"))?;
     info!(
@@ -62,29 +151,78 @@ async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
 
     // Start proxy if needed
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let proxy_port = start_proxy_if_needed(&profile, shutdown_rx).await?;
+    let mut proxy = start_proxy_if_needed(&profile, shutdown_rx).await?;
+    let proxy_port = proxy.as_ref().map(|runtime| runtime.endpoint.port);
+    let extra_env = build_extra_env(
+        &mut profile,
+        proxy.as_ref().map(|runtime| &runtime.endpoint),
+        &runtime_temp_path,
+        &pwd,
+        &args.command,
+    )
+    .await?;
 
     // Dry run / inspect: print policy and exit
     if args.dry_run {
-        print_inspect_output(&profile, &backend, proxy_port);
+        profile.validate_security_invariants()?;
+        print_inspect_output(&profile, &backend, proxy_port, &extra_env)?;
         let _ = shutdown_tx.send(true);
+        if let Some(runtime) = proxy.take() {
+            await_proxy_shutdown(runtime).await?;
+        }
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Start audit logger if requested
-    let audit_handle = if args.audit || args.audit_log.is_some() {
-        Some(crate::audit::start(backend.info(), args.audit_log.as_deref()).await?)
+    let wants_audit = args.audit || args.audit_log.is_some();
+    if wants_audit && !backend.info().features.audit_stream {
+        anyhow::bail!("audit stream is unavailable on this host");
+    }
+    let (pid_tx, pid_rx) = if wants_audit {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        (Some(sender), Some(receiver))
+    } else {
+        (None, None)
+    };
+    let child = backend.run(&profile, proxy_port, &args.command, &extra_env, pid_tx);
+    tokio::pin!(child);
+    let mut early_status = None;
+    let audit_handle = if let Some(receiver) = pid_rx {
+        tokio::select! {
+            pid = receiver => {
+                let pid = pid.context("sandbox process exited before reporting its PID")?;
+                Some(crate::audit::start(backend.info(), args.audit_log.as_deref(), pid).await?)
+            }
+            result = &mut child => {
+                early_status = Some(result.map_err(|e| anyhow::anyhow!("{e}"))?);
+                None
+            }
+        }
     } else {
         None
     };
 
-    let extra_env = build_extra_env(&profile, proxy_port);
-    let status = backend
-        .run(&profile, proxy_port, &args.command, &extra_env)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let status = if let Some(status) = early_status {
+        status
+    } else if let Some(runtime) = proxy.as_mut() {
+        tokio::select! {
+            result = &mut child => result.map_err(|e| anyhow::anyhow!("{e}"))?,
+            proxy_result = &mut runtime.task => {
+                let detail = match proxy_result {
+                    Ok(Ok(())) => "proxy stopped before the sandboxed command".to_owned(),
+                    Ok(Err(error)) => format!("proxy failed: {error}"),
+                    Err(error) => format!("proxy task failed: {error}"),
+                };
+                anyhow::bail!(detail);
+            }
+        }
+    } else {
+        child.await.map_err(|e| anyhow::anyhow!("{e}"))?
+    };
 
     let _ = shutdown_tx.send(true);
+    if let Some(runtime) = proxy.take() {
+        await_proxy_shutdown(runtime).await?;
+    }
 
     if let Some(handle) = audit_handle {
         handle.stop_and_summarize().await;
@@ -101,10 +239,17 @@ async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
     };
 
     if matches!(code, 71 | 126) && !args.audit {
-        eprintln!(
-            "sbe: command exited with code {code} (likely a sandbox denial). Re-run with --audit \
-             to see details, or add allowExec/allowFetch to .sbe.yaml"
-        );
+        if backend.info().features.audit_stream {
+            eprintln!(
+                "sbe: command exited with code {code} (likely a sandbox denial). Re-run with \
+                 --audit to see details, or inspect the effective policy"
+            );
+        } else {
+            eprintln!(
+                "sbe: command exited with code {code} (likely a sandbox denial). Audit streaming \
+                 is unavailable on this host; inspect the effective policy and command error"
+            );
+        }
     }
 
     Ok(ExitCode::from(code))
@@ -132,46 +277,1301 @@ fn resolve_ecosystem(
 }
 
 /// Start the domain-filtering proxy if the profile requires it.
+struct ProxyRuntime {
+    endpoint: ProxyEndpoint,
+    task: tokio::task::JoinHandle<Result<(), sbe_proxy::error::ProxyError>>,
+}
+
 async fn start_proxy_if_needed(
     profile: &SandboxProfile,
     shutdown_rx: watch::Receiver<bool>,
-) -> anyhow::Result<Option<u16>> {
-    if !profile.enable_proxy || profile.allow_all_network || profile.allow_domains.is_empty() {
+) -> anyhow::Result<Option<ProxyRuntime>> {
+    if profile.network_mode != NetworkMode::Proxy {
         return Ok(None);
     }
 
     let domain_strings: Vec<String> = profile.allow_domains.iter().map(|d| d.0.clone()).collect();
-    let allowlist = DomainAllowlist::new(&domain_strings);
-    let (server, port) = ProxyServer::bind(allowlist, shutdown_rx).await?;
-    info!(port, "proxy started");
+    let allowlist = DomainAllowlist::new(&domain_strings)
+        .map_err(|error| anyhow::anyhow!("invalid proxy allowlist: {error}"))?;
+    let (server, endpoint) = ProxyServer::bind(allowlist, shutdown_rx).await?;
+    info!(port = endpoint.port, "proxy started");
+    let task = tokio::spawn(server.run());
+    Ok(Some(ProxyRuntime { endpoint, task }))
+}
 
-    tokio::spawn(async move {
-        if let Err(e) = server.run().await {
-            eprintln!("sbe: proxy error: {e}");
+async fn await_proxy_shutdown(runtime: ProxyRuntime) -> anyhow::Result<()> {
+    match runtime.task.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(anyhow::anyhow!("proxy failed during shutdown: {error}")),
+        Err(error) => Err(anyhow::anyhow!(
+            "proxy task failed during shutdown: {error}"
+        )),
+    }
+}
+
+async fn build_extra_env(
+    profile: &mut SandboxProfile,
+    proxy_endpoint: Option<&ProxyEndpoint>,
+    runtime_temp: &Path,
+    project_dir: &Path,
+    command: &[String],
+) -> anyhow::Result<HashMap<String, String>> {
+    let mut env = filter_parent_environment(std::env::vars());
+    let mut inherited: Vec<String> = env.keys().cloned().collect();
+    inherited.sort();
+    for name in inherited {
+        record_effective_environment(profile, &name, GrantOrigin::ParentEnvironment);
+    }
+    let temp = runtime_temp.to_string_lossy().into_owned();
+    insert_runtime_environment(profile, &mut env, "TMPDIR", temp.clone());
+    insert_runtime_environment(profile, &mut env, "TMP", temp.clone());
+    insert_runtime_environment(profile, &mut env, "TEMP", temp.clone());
+    insert_runtime_environment(profile, &mut env, "XDG_RUNTIME_DIR", temp.clone());
+    let profile_name = profile.name.clone();
+    match profile_name.as_str() {
+        "rust" => {
+            let target_dir = if cargo_executes_target(command) {
+                runtime_temp.join("cargo-target")
+            } else {
+                project_dir.join("target")
+            };
+            insert_runtime_environment(
+                profile,
+                &mut env,
+                "CARGO_TARGET_DIR",
+                target_dir.to_string_lossy().into_owned(),
+            );
+            insert_runtime_environment(
+                profile,
+                &mut env,
+                "CARGO_BUILD_BUILD_DIR",
+                runtime_temp
+                    .join("cargo-build")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
         }
+        "python" => {
+            insert_runtime_environment(
+                profile,
+                &mut env,
+                "PIP_CACHE_DIR",
+                runtime_temp
+                    .join("pip-cache")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            insert_runtime_environment(
+                profile,
+                &mut env,
+                "UV_CACHE_DIR",
+                runtime_temp.join("uv-cache").to_string_lossy().into_owned(),
+            );
+        }
+        "elixir" => {
+            insert_runtime_environment(
+                profile,
+                &mut env,
+                "MIX_BUILD_ROOT",
+                project_dir.join("_build").to_string_lossy().into_owned(),
+            );
+            insert_runtime_environment(
+                profile,
+                &mut env,
+                "MIX_DEPS_PATH",
+                project_dir.join("deps").to_string_lossy().into_owned(),
+            );
+            insert_runtime_environment(
+                profile,
+                &mut env,
+                "REBAR_CACHE_DIR",
+                runtime_temp
+                    .join("rebar-cache")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        "java" => {
+            insert_runtime_environment(
+                profile,
+                &mut env,
+                "GRADLE_USER_HOME",
+                runtime_temp
+                    .join("gradle-home")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            insert_runtime_environment(
+                profile,
+                &mut env,
+                "COURSIER_CACHE",
+                runtime_temp
+                    .join("coursier-cache")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            let sbt_root = runtime_temp.join("sbt");
+            insert_runtime_environment(
+                profile,
+                &mut env,
+                "SBT_OPTS",
+                format!(
+                    "-Dsbt.global.base={} -Dsbt.boot.directory={} -Dsbt.ivy.home={}",
+                    sbt_root.join("global").display(),
+                    sbt_root.join("boot").display(),
+                    sbt_root.join("ivy2").display(),
+                ),
+            );
+        }
+        _ => {}
+    }
+    if let Some(endpoint) = proxy_endpoint {
+        let proxy_url = endpoint.url();
+        insert_runtime_environment(profile, &mut env, "HTTP_PROXY", proxy_url.clone());
+        insert_runtime_environment(profile, &mut env, "HTTPS_PROXY", proxy_url.clone());
+        insert_runtime_environment(profile, &mut env, "http_proxy", proxy_url.clone());
+        insert_runtime_environment(profile, &mut env, "https_proxy", proxy_url);
+        insert_runtime_environment(profile, &mut env, "NO_PROXY", String::new());
+        insert_runtime_environment(profile, &mut env, "no_proxy", String::new());
+        if profile.name == "java" {
+            let agent_path = install_java_proxy_agent(runtime_temp).await?;
+            for (name, value) in endpoint.java_environment(&agent_path, &temp) {
+                insert_runtime_environment(profile, &mut env, name, value);
+            }
+        }
+    }
+    let profile_environment: Vec<(String, String)> = profile
+        .env
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    for (name, value) in profile_environment {
+        env.insert(name.clone(), value);
+        let origin = profile
+            .grant_origins
+            .iter()
+            .rev()
+            .find(|record| {
+                record.kind == GrantKind::Environment
+                    && record.value == name
+                    && !matches!(
+                        record.origin,
+                        GrantOrigin::ParentEnvironment | GrantOrigin::Runtime
+                    )
+            })
+            .map(|record| record.origin.clone())
+            .unwrap_or(GrantOrigin::Runtime);
+        record_effective_environment(profile, &name, origin);
+    }
+    Ok(env)
+}
+
+async fn install_java_proxy_agent(runtime_temp: &Path) -> anyhow::Result<String> {
+    const AGENT_B64: &str =
+        include_str!("../assets/java-proxy-agent/java-proxy-auth-agent.jar.b64");
+
+    let path = runtime_temp.join("java-proxy-auth-agent.jar");
+    let path_text = path
+        .to_str()
+        .context("private Java proxy agent path is not valid UTF-8")?;
+    if path_text.chars().any(|character| {
+        character.is_control() || character.is_ascii_whitespace() || "'\"\\".contains(character)
+    }) {
+        anyhow::bail!("private Java proxy agent path contains unsupported option characters");
+    }
+
+    let jar = BASE64_STANDARD
+        .decode(AGENT_B64.trim())
+        .context("embedded Java proxy authentication agent is corrupt")?;
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o400)
+        .open(&path)
+        .await
+        .context("failed to create private Java proxy authentication agent")?;
+    file.write_all(&jar)
+        .await
+        .context("failed to write private Java proxy authentication agent")?;
+    file.sync_all()
+        .await
+        .context("failed to persist private Java proxy authentication agent")?;
+    Ok(path_text.to_owned())
+}
+
+fn insert_runtime_environment(
+    profile: &mut SandboxProfile,
+    environment: &mut HashMap<String, String>,
+    name: &str,
+    value: String,
+) {
+    environment.insert(name.to_owned(), value);
+    record_effective_environment(profile, name, GrantOrigin::Runtime);
+}
+
+fn record_effective_environment(profile: &mut SandboxProfile, name: &str, origin: GrantOrigin) {
+    profile.grant_origins.push(GrantRecord {
+        kind: GrantKind::Environment,
+        value: name.to_owned(),
+        origin,
+    });
+}
+
+fn filter_parent_environment<I>(variables: I) -> HashMap<String, String>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    variables
+        .into_iter()
+        .filter(|(name, _)| SAFE_PARENT_ENV.contains(&name.as_str()))
+        .collect()
+}
+
+fn command_is(command: &[String], expected: &str) -> bool {
+    Path::new(command.first().map_or("", String::as_str))
+        .file_name()
+        .is_some_and(|name| name == expected)
+}
+
+fn reject_project_relocation(command: &[String]) -> anyhow::Result<()> {
+    let Some(option) = project_relocation_option(command) else {
+        return Ok(());
+    };
+    anyhow::bail!(
+        "project relocation option '{option}' is unsupported because sandbox grants are anchored \
+         to the current directory; change directory before invoking sbe"
+    )
+}
+
+fn project_relocation_option(command: &[String]) -> Option<&str> {
+    let program = Path::new(command.first()?.as_str())
+        .file_name()
+        .and_then(|name| name.to_str())?;
+    let options: &[&str] = match program {
+        "cargo" => &["-C"],
+        "npm" => &["--prefix"],
+        "yarn" | "bun" => &["--cwd"],
+        "pnpm" => &["--dir", "-C"],
+        "uv" => &["--directory", "--project"],
+        "poetry" | "pdm" => &["--directory", "--project", "-C", "-P", "-p"],
+        _ => return None,
+    };
+    command
+        .iter()
+        .skip(1)
+        .take_while(|argument| argument.as_str() != "--")
+        .find_map(|argument| {
+            options.iter().copied().find(|option| {
+                argument == *option
+                    || argument.strip_prefix(*option).is_some_and(|suffix| {
+                        suffix.starts_with('=') || (!option.starts_with("--") && !suffix.is_empty())
+                    })
+            })
+        })
+}
+
+fn command_has_flag(command: &[String], flags: &[&str]) -> bool {
+    command
+        .iter()
+        .skip(1)
+        .take_while(|argument| argument.as_str() != "--")
+        .any(|argument| flags.contains(&argument.as_str()))
+}
+
+#[cfg(target_os = "linux")]
+fn command_option_equals(command: &[String], option: &str, expected: &str) -> bool {
+    let mut arguments = command
+        .iter()
+        .skip(1)
+        .take_while(|argument| argument.as_str() != "--")
+        .peekable();
+    while let Some(argument) = arguments.next() {
+        if argument
+            .strip_prefix(option)
+            .and_then(|suffix| suffix.strip_prefix('='))
+            .is_some_and(|value| value.eq_ignore_ascii_case(expected))
+        {
+            return true;
+        }
+        if argument == option
+            && arguments
+                .peek()
+                .is_some_and(|value| value.eq_ignore_ascii_case(expected))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn configure_node_workspace(
+    profile: &mut SandboxProfile,
+    command: &[String],
+    project_dir: &Path,
+) -> anyhow::Result<()> {
+    let program = command
+        .first()
+        .and_then(|program| Path::new(program).file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let manager = match program {
+        "npm" | "npx" => "npm",
+        "yarn" => "yarn",
+        "pnpm" => "pnpm",
+        "bun" => "bun",
+        _ => return Ok(()),
+    };
+    let workspace_root = discover_node_workspace_root(project_dir, manager)?;
+    if workspace_root == project_dir {
+        return Ok(());
+    }
+
+    let mut grants = vec![SandboxPath::dir(workspace_root.join("node_modules"))];
+    match manager {
+        "npm" => grants.push(SandboxPath::file(workspace_root.join("package-lock.json"))),
+        "yarn" => grants.extend([
+            SandboxPath::file(workspace_root.join("yarn.lock")),
+            SandboxPath::dir(workspace_root.join(".yarn")),
+            SandboxPath::file(workspace_root.join(".pnp.cjs")),
+            SandboxPath::file(workspace_root.join(".pnp.loader.mjs")),
+        ]),
+        "pnpm" => grants.push(SandboxPath::file(workspace_root.join("pnpm-lock.yaml"))),
+        "bun" => {
+            grants.push(SandboxPath::file(workspace_root.join("bun.lock")));
+            if command_has_flag(command, &["--yarn"]) {
+                grants.push(SandboxPath::file(workspace_root.join("yarn.lock")));
+            }
+        }
+        _ => return Ok(()),
+    }
+
+    let mut insertion = profile
+        .first_user_allow_write
+        .min(profile.allow_write.len());
+    for grant in grants {
+        if profile
+            .allow_write
+            .iter()
+            .any(|existing| existing == &grant)
+        {
+            continue;
+        }
+        profile.grant_origins.push(GrantRecord {
+            kind: GrantKind::AllowWrite,
+            value: grant.path.to_string_lossy().into_owned(),
+            origin: GrantOrigin::BuiltIn,
+        });
+        profile.allow_write.insert(insertion, grant);
+        insertion += 1;
+    }
+    profile.first_user_allow_write = insertion;
+    Ok(())
+}
+
+/// Return the package manager's top-level subcommand. Options (and the values
+/// of known value-taking global options) are skipped so an option value or a
+/// nested command cannot accidentally select a write policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ParsedTopLevel<'a> {
+    Command(&'a str),
+    NoCommand,
+    Ambiguous,
+}
+
+impl ParsedTopLevel<'_> {
+    fn is_command(self, candidates: &[&str]) -> bool {
+        matches!(self, Self::Command(command) if candidates.contains(&command))
+    }
+}
+
+fn top_level_subcommand(command: &[String]) -> ParsedTopLevel<'_> {
+    let Some(program) = command
+        .first()
+        .and_then(|program| Path::new(program).file_name())
+    else {
+        return ParsedTopLevel::NoCommand;
+    };
+    let program = program.to_str().unwrap_or_default();
+    let mut arguments = command.iter().skip(1).peekable();
+    while let Some(argument) = arguments.next() {
+        let argument = argument.as_str();
+        if argument == "--" {
+            return ParsedTopLevel::NoCommand;
+        }
+        if program == "cargo" && argument.starts_with('+') {
+            continue;
+        }
+        if !argument.starts_with('-') || argument == "-" {
+            return ParsedTopLevel::Command(argument);
+        }
+        if option_takes_value(program, argument) {
+            if !option_has_attached_value(argument) {
+                arguments.next();
+            }
+            continue;
+        }
+        if option_is_known_boolean(program, argument) {
+            continue;
+        }
+        // Unknown options are deliberately ambiguous. Guessing that they are
+        // boolean could mistake their value for a mutating subcommand and
+        // create a file the user never requested.
+        return ParsedTopLevel::Ambiguous;
+    }
+    ParsedTopLevel::NoCommand
+}
+
+fn option_takes_value(program: &str, option: &str) -> bool {
+    let option = option.split_once('=').map_or(option, |(name, _)| name);
+    let option = if program == "cargo" && option.len() > 2 {
+        option
+            .get(..2)
+            .filter(|prefix| matches!(*prefix, "-C" | "-Z"))
+            .unwrap_or(option)
+    } else {
+        option
+    };
+    match program {
+        "cargo" => matches!(
+            option,
+            "--color" | "--config" | "--explain" | "--target-dir" | "-C" | "-Z"
+        ),
+        "npm" => matches!(
+            option,
+            "--cache"
+                | "--location"
+                | "--loglevel"
+                | "--prefix"
+                | "--registry"
+                | "--userconfig"
+                | "--workspace"
+        ),
+        "yarn" => matches!(
+            option,
+            "--cache-folder"
+                | "--cwd"
+                | "--modules-folder"
+                | "--mutex"
+                | "--network-concurrency"
+                | "--network-timeout"
+                | "--registry"
+                | "--use-yarnrc"
+        ),
+        "pnpm" => matches!(
+            option,
+            "--cache-dir"
+                | "--config-dir"
+                | "--dir"
+                | "--global-bin-dir"
+                | "--global-dir"
+                | "--state-dir"
+                | "--store-dir"
+                | "--virtual-store-dir"
+        ),
+        "uv" => matches!(
+            option,
+            "--color" | "--config-file" | "--directory" | "--project" | "--python"
+        ),
+        "poetry" | "pdm" => {
+            matches!(option, "--directory" | "--project" | "-C" | "-P" | "-p")
+        }
+        _ => false,
+    }
+}
+
+fn option_has_attached_value(option: &str) -> bool {
+    option.contains('=')
+        || (option.len() > 2 && (option.starts_with("-C") || option.starts_with("-Z")))
+}
+
+fn option_is_known_boolean(program: &str, option: &str) -> bool {
+    match program {
+        "cargo" => matches!(
+            option,
+            "--frozen"
+                | "--help"
+                | "--list"
+                | "--locked"
+                | "--offline"
+                | "--quiet"
+                | "--verbose"
+                | "--version"
+                | "-V"
+                | "-h"
+                | "-q"
+                | "-v"
+                | "-vv"
+        ),
+        "npm" | "pnpm" | "bun" => matches!(
+            option,
+            "--global"
+                | "--help"
+                | "--json"
+                | "--silent"
+                | "--version"
+                | "--workspaces"
+                | "-g"
+                | "-h"
+                | "-v"
+        ),
+        "yarn" => matches!(
+            option,
+            "--help"
+                | "--immutable"
+                | "--immutable-cache"
+                | "--inline-builds"
+                | "--json"
+                | "--silent"
+                | "--version"
+                | "-h"
+                | "-v"
+        ),
+        "uv" | "poetry" | "pdm" => matches!(
+            option,
+            "--help" | "--no-ansi" | "--quiet" | "--verbose" | "--version" | "-h" | "-q" | "-v"
+        ),
+        _ => false,
+    }
+}
+
+fn cargo_executes_target(command: &[String]) -> bool {
+    command_is(command, "cargo")
+        && top_level_subcommand(command).is_command(&["bench", "nextest", "run", "test", "r", "t"])
+}
+
+fn cargo_uses_persistent_target(command: &[String]) -> bool {
+    command_is(command, "cargo")
+        && top_level_subcommand(command)
+            .is_command(&["build", "check", "doc", "install", "rustc", "b", "c", "d"])
+}
+
+/// Installed dependency trees are mutable during package-manager operations,
+/// but commands that explicitly run project tools need the opposite side of
+/// the W^X boundary. Replace only matching built-in write grants with
+/// read/execute grants. User-supplied write grants remain intact and will
+/// still trip the persistent W^X lint instead of being silently weakened.
+fn enable_existing_dependency_execution(profile: &mut SandboxProfile, command: &[String]) {
+    let root_names: &[&str] = match profile.name.as_str() {
+        "node" if node_command_executes_dependencies(command) => &["node_modules"],
+        "python" if python_command_executes_environment(command) => &[".venv", "venv"],
+        _ => return,
+    };
+
+    replace_builtin_write_roots_with_execute(profile, root_names);
+}
+
+fn replace_builtin_write_roots_with_execute(profile: &mut SandboxProfile, root_names: &[&str]) {
+    if root_names.is_empty() {
+        return;
+    }
+
+    let built_in_boundary = profile
+        .first_user_allow_write
+        .min(profile.allow_write.len());
+    let mut dependency_roots = Vec::new();
+    let mut retained = Vec::with_capacity(profile.allow_write.len());
+    for (index, grant) in profile.allow_write.drain(..).enumerate() {
+        if index < built_in_boundary
+            && grant
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| root_names.contains(&name))
+        {
+            dependency_roots.push(grant.path);
+        } else {
+            retained.push(grant);
+        }
+    }
+    profile.allow_write = retained;
+    profile.first_user_allow_write = built_in_boundary.saturating_sub(dependency_roots.len());
+
+    profile.grant_origins.retain(|record| {
+        record.kind != GrantKind::AllowWrite
+            || record.origin != GrantOrigin::BuiltIn
+            || !dependency_roots
+                .iter()
+                .any(|root| record.value == root.to_string_lossy())
     });
 
-    Ok(Some(port))
+    for root in dependency_roots {
+        // A higher-precedence deny must continue to win. Landlock cannot
+        // subtract a denied child from a directory execute rule, so skip the
+        // complete runtime grant on any overlap.
+        if profile
+            .deny_exec
+            .iter()
+            .any(|denied| paths_overlap(&root, &denied.path))
+            || profile
+                .allow_exec
+                .iter()
+                .any(|allowed| allowed.path == root)
+        {
+            continue;
+        }
+        profile.allow_exec.push(SandboxPath::dir(root.clone()));
+        profile.grant_origins.push(GrantRecord {
+            kind: GrantKind::AllowExec,
+            value: root.to_string_lossy().into_owned(),
+            origin: GrantOrigin::Runtime,
+        });
+    }
 }
 
-fn build_extra_env(profile: &SandboxProfile, proxy_port: Option<u16>) -> HashMap<String, String> {
-    let mut env = HashMap::new();
-    if let Some(port) = proxy_port {
-        let proxy_url = format!("http://127.0.0.1:{port}");
-        env.insert("HTTP_PROXY".to_owned(), proxy_url.clone());
-        env.insert("HTTPS_PROXY".to_owned(), proxy_url.clone());
-        env.insert("http_proxy".to_owned(), proxy_url.clone());
-        env.insert("https_proxy".to_owned(), proxy_url);
-        env.insert("NO_PROXY".to_owned(), "localhost,127.0.0.1".to_owned());
-        env.insert("no_proxy".to_owned(), "localhost,127.0.0.1".to_owned());
+fn python_command_executes_environment(command: &[String]) -> bool {
+    let program = Path::new(command.first().map_or("", String::as_str))
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let subcommand = top_level_subcommand(command);
+    match program {
+        "pip" | "pip3" | "virtualenv" => false,
+        "uv" => subcommand.is_command(&["run"]),
+        "poetry" => subcommand.is_command(&["run", "shell"]),
+        "pdm" | "rye" => subcommand.is_command(&["run"]),
+        "python" | "python3"
+            if command.windows(2).any(|arguments| {
+                arguments[0] == "-m" && matches!(arguments[1].as_str(), "pip" | "venv")
+            }) =>
+        {
+            false
+        }
+        // Direct virtualenv entry points such as `.venv/bin/pytest`, an
+        // activated `pytest` found through PATH, and ordinary Python scripts
+        // all execute an already-installed environment rather than mutate it.
+        _ => true,
     }
-    for (k, v) in &profile.env {
-        env.insert(k.clone(), v.clone());
-    }
-    env
 }
 
-fn print_inspect_output(profile: &SandboxProfile, backend: &Sandbox, proxy_port: Option<u16>) {
+fn node_command_executes_dependencies(command: &[String]) -> bool {
+    let subcommand = top_level_subcommand(command);
+    if command_is(command, "npx") {
+        return !matches!(
+            subcommand,
+            ParsedTopLevel::NoCommand | ParsedTopLevel::Ambiguous
+        );
+    }
+    if command_is(command, "npm") {
+        return subcommand.is_command(&[
+            "exec",
+            "explore",
+            "restart",
+            "run",
+            "run-script",
+            "start",
+            "stop",
+            "t",
+            "test",
+            "tst",
+            "x",
+        ]);
+    }
+    if command_is(command, "pnpm") {
+        return subcommand.is_command(&["exec", "restart", "run", "start", "stop", "test"]);
+    }
+    if command_is(command, "bun") {
+        return subcommand.is_command(&["exec", "restart", "run", "start", "stop", "test", "x"]);
+    }
+    command_is(command, "yarn")
+        && subcommand.is_command(&["exec", "node", "restart", "run", "start", "stop", "test"])
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
+}
+
+/// Atomically create or verify a direct child directory without following a
+/// final-component symlink. The parent descriptor fixes the target directory
+/// even if another process renames a path component concurrently.
+fn ensure_child_directory(parent: &Path, name: &std::ffi::CStr) -> anyhow::Result<()> {
+    let parent =
+        CString::new(parent.as_os_str().as_bytes()).context("project directory contains NUL")?;
+    // SAFETY: both C strings are NUL-terminated and remain alive for each
+    // syscall; successful descriptors are immediately owned and closed.
+    let parent_fd = unsafe {
+        libc::open(
+            parent.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if parent_fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("open project directory safely");
+    }
+    let parent_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(parent_fd) };
+    let created = unsafe { libc::mkdirat(parent_fd.as_raw_fd(), name.as_ptr(), 0o700) };
+    if created < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(error).context("create dedicated build output directory");
+        }
+    }
+    let child_fd = unsafe {
+        libc::openat(
+            parent_fd.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if child_fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("build output must be a real directory, not a symlink");
+    }
+    drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(child_fd) });
+    Ok(())
+}
+
+/// Landlock can grant writes to an existing file inode, but creating one
+/// requires directory-wide `MakeReg`. Pre-create only the built-in outputs
+/// selected for the invoked package-manager operation plus user-requested
+/// literal outputs. This avoids creating mutually exclusive files as a side
+/// effect of an unrelated or read-only command.
+#[cfg(target_os = "linux")]
+fn ensure_literal_write_targets(
+    profile: &SandboxProfile,
+    command: &[String],
+    project_dir: &Path,
+) -> anyhow::Result<()> {
+    use sbe_core::config::PathKind;
+    use std::os::fd::OwnedFd;
+
+    reject_project_relocation(command)?;
+    let program = command
+        .first()
+        .and_then(|program| Path::new(program).file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let refuses_lockfile_creation = command_has_flag(
+        command,
+        &["--frozen", "--frozen-lockfile", "--immutable", "--locked"],
+    ) || (program == "bun"
+        && command_has_flag(command, &["--no-save"]))
+        || (program == "npm"
+            && (command_has_flag(command, &["--no-package-lock"])
+                || command_option_equals(command, "--package-lock", "false")));
+    let manager_is_informational = matches!(program, "yarn" | "bun")
+        && command_has_flag(command, &["--help", "--version", "-h", "-v"]);
+    let subcommand = top_level_subcommand(command);
+    let built_in_outputs = if refuses_lockfile_creation || manager_is_informational {
+        Vec::new()
+    } else {
+        match program {
+            "cargo"
+                if subcommand.is_command(&[
+                    "bench",
+                    "build",
+                    "check",
+                    "doc",
+                    "fetch",
+                    "generate-lockfile",
+                    "metadata",
+                    "run",
+                    "test",
+                    "tree",
+                    "update",
+                    "b",
+                    "c",
+                    "d",
+                    "r",
+                    "t",
+                ]) =>
+            {
+                vec![project_dir.join("Cargo.lock")]
+            }
+            "npm"
+                if subcommand.is_command(&[
+                    "add",
+                    "dedupe",
+                    "i",
+                    "install",
+                    "r",
+                    "remove",
+                    "rm",
+                    "un",
+                    "uninstall",
+                    "unlink",
+                    "up",
+                    "update",
+                ]) =>
+            {
+                vec![
+                    selected_node_output_root(profile, project_dir, "package-lock.json")
+                        .join("package-lock.json"),
+                ]
+            }
+            "yarn"
+                if subcommand == ParsedTopLevel::NoCommand
+                    || subcommand.is_command(&["add", "dedupe", "install", "remove", "up"]) =>
+            {
+                let output_root = selected_node_output_root(profile, project_dir, "yarn.lock");
+                let (uses_pnp, uses_esm_loader) = yarn_pnp_configuration(&output_root)?;
+                let mut outputs = vec![output_root.join("yarn.lock")];
+                if uses_pnp {
+                    outputs.push(output_root.join(".pnp.cjs"));
+                }
+                if uses_esm_loader {
+                    outputs.push(output_root.join(".pnp.loader.mjs"));
+                }
+                outputs
+            }
+            "pnpm"
+                if subcommand.is_command(&[
+                    "add",
+                    "dedupe",
+                    "i",
+                    "import",
+                    "install",
+                    "remove",
+                    "rm",
+                    "uninstall",
+                    "up",
+                    "update",
+                ]) =>
+            {
+                vec![
+                    selected_node_output_root(profile, project_dir, "pnpm-lock.yaml")
+                        .join("pnpm-lock.yaml"),
+                ]
+            }
+            "bun"
+                if subcommand.is_command(&[
+                    "add",
+                    "i",
+                    "install",
+                    "remove",
+                    "rm",
+                    "uninstall",
+                    "update",
+                ]) =>
+            {
+                let output_root = selected_node_output_root(profile, project_dir, "bun.lock");
+                let mut outputs = vec![output_root.join("bun.lock")];
+                if command_has_flag(command, &["--yarn"]) {
+                    outputs.push(output_root.join("yarn.lock"));
+                }
+                outputs
+            }
+            "uv" if subcommand.is_command(&["add", "lock", "remove", "run", "sync", "tree"]) => {
+                vec![project_dir.join("uv.lock")]
+            }
+            "poetry" if subcommand.is_command(&["add", "install", "lock", "remove", "update"]) => {
+                vec![project_dir.join("poetry.lock")]
+            }
+            "pdm"
+                if subcommand
+                    .is_command(&["add", "install", "lock", "remove", "run", "sync", "update"]) =>
+            {
+                vec![project_dir.join("pdm.lock")]
+            }
+            "mix"
+                if subcommand.is_command(&[
+                    "deps.get",
+                    "deps.update",
+                    "local.hex",
+                    "local.rebar",
+                ]) =>
+            {
+                vec![project_dir.join("mix.lock")]
+            }
+            _ => Vec::new(),
+        }
+    };
+
+    for (index, target) in profile.allow_write.iter().enumerate() {
+        if target.kind != PathKind::Literal {
+            continue;
+        }
+        if index < profile.first_user_allow_write && !built_in_outputs.contains(&target.path) {
+            continue;
+        }
+        let parent = target
+            .path
+            .parent()
+            .context("literal write target has no parent directory")?;
+        let name = target
+            .path
+            .file_name()
+            .context("literal write target has no file name")?;
+        let parent_fd = open_directory_no_symlinks(parent)?;
+        let name = CString::new(name.as_bytes()).context("literal write target contains NUL")?;
+        let flags = libc::O_WRONLY
+            | libc::O_CREAT
+            | libc::O_EXCL
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK;
+        let fd = unsafe { libc::openat(parent_fd.as_raw_fd(), name.as_ptr(), flags, 0o666) };
+        let fd = if fd >= 0 {
+            fd
+        } else {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(error).with_context(|| {
+                    format!(
+                        "create literal write target safely: {}",
+                        target.path.display()
+                    )
+                });
+            }
+            let existing_flags =
+                libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+            let existing =
+                unsafe { libc::openat(parent_fd.as_raw_fd(), name.as_ptr(), existing_flags) };
+            if existing < 0 {
+                return Err(std::io::Error::last_os_error()).with_context(|| {
+                    format!(
+                        "open literal write target safely: {}",
+                        target.path.display()
+                    )
+                });
+            }
+            existing
+        };
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd.as_raw_fd(), &mut metadata) } != 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!("inspect literal write target: {}", target.path.display())
+            });
+        }
+        if metadata.st_mode & libc::S_IFMT != libc::S_IFREG {
+            anyhow::bail!(
+                "literal write target is not a regular file: {}",
+                target.path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn selected_node_output_root(
+    profile: &SandboxProfile,
+    project_dir: &Path,
+    lockfile: &str,
+) -> PathBuf {
+    let mut candidates: Vec<PathBuf> = profile.allow_write[..profile
+        .first_user_allow_write
+        .min(profile.allow_write.len())]
+        .iter()
+        .filter(|target| target.kind == sbe_core::config::PathKind::Literal)
+        .filter(|target| target.path.file_name().is_some_and(|name| name == lockfile))
+        .filter_map(|target| target.path.parent().map(Path::to_path_buf))
+        .filter(|root| project_dir.starts_with(root))
+        .collect();
+    candidates.sort_by_key(|root| std::cmp::Reverse(root.components().count()));
+    candidates.dedup();
+
+    for root in candidates {
+        if root != project_dir {
+            return root;
+        }
+    }
+    project_dir.to_path_buf()
+}
+
+fn discover_node_workspace_root(project_dir: &Path, program: &str) -> anyhow::Result<PathBuf> {
+    if !matches!(program, "npm" | "yarn" | "pnpm" | "bun") {
+        return Ok(project_dir.to_path_buf());
+    }
+    let git_boundary = project_git_boundary(project_dir)?;
+    if git_boundary.as_deref() == Some(project_dir) {
+        return Ok(project_dir.to_path_buf());
+    }
+    let mut candidate = project_dir.parent();
+    while let Some(root) = candidate {
+        if node_workspace_contains(root, project_dir, program)? {
+            return Ok(root.to_path_buf());
+        }
+        if git_boundary.as_deref() == Some(root) {
+            break;
+        }
+        candidate = root.parent();
+    }
+    Ok(project_dir.to_path_buf())
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "workspace discovery inspects .git without following a project-controlled symlink"
+)]
+fn project_git_boundary(project_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
+    for ancestor in project_dir.ancestors() {
+        match std::fs::symlink_metadata(ancestor.join(".git")) {
+            Ok(_) => return Ok(Some(ancestor.to_path_buf())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("inspect Git workspace boundary: {}", ancestor.display())
+                });
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn node_workspace_contains(root: &Path, project_dir: &Path, program: &str) -> anyhow::Result<bool> {
+    let relative = project_dir
+        .strip_prefix(root)
+        .context("Node workspace candidate is not an ancestor of the project")?;
+    if relative.as_os_str().is_empty() {
+        return Ok(true);
+    }
+
+    let mut patterns = Vec::new();
+    if program != "pnpm"
+        && let Some(contents) = read_bounded_project_file(&root.join("package.json"))?
+    {
+        let package: serde_json::Value = serde_json::from_slice(&contents).with_context(|| {
+            format!("parse workspace metadata: {}/package.json", root.display())
+        })?;
+        if let Some(workspaces) = package.get("workspaces") {
+            let values = match workspaces {
+                serde_json::Value::Array(values) => values,
+                serde_json::Value::Object(mapping) => mapping
+                    .get("packages")
+                    .and_then(serde_json::Value::as_array)
+                    .context("package.json workspaces.packages must be an array")?,
+                _ => anyhow::bail!("package.json workspaces must be an array or mapping"),
+            };
+            for value in values {
+                patterns.push(
+                    value
+                        .as_str()
+                        .context("package.json workspace pattern must be a string")?
+                        .to_owned(),
+                );
+            }
+        }
+    }
+
+    if program == "pnpm"
+        && let Some(contents) = read_bounded_project_file(&root.join("pnpm-workspace.yaml"))?
+    {
+        let workspace: serde_yaml::Value = serde_yaml::from_slice(&contents)
+            .context("parse pnpm-workspace.yaml for output policy")?;
+        let values = workspace
+            .as_mapping()
+            .and_then(|mapping| mapping.get(serde_yaml::Value::String("packages".to_owned())))
+            .and_then(serde_yaml::Value::as_sequence)
+            .context("pnpm-workspace.yaml packages must be an array")?;
+        for value in values {
+            patterns.push(
+                value
+                    .as_str()
+                    .context("pnpm workspace pattern must be a string")?
+                    .to_owned(),
+            );
+        }
+    }
+
+    let relative = relative
+        .to_str()
+        .context("Node workspace path is not valid UTF-8")?;
+    let mut included = false;
+    for pattern in patterns {
+        let (exclude, pattern) = pattern
+            .strip_prefix('!')
+            .map_or((false, pattern.as_str()), |pattern| (true, pattern));
+        if workspace_glob_matches_prefix(pattern.trim_matches('/'), relative) {
+            included = !exclude;
+        }
+    }
+    Ok(included)
+}
+
+fn workspace_glob_matches_prefix(pattern: &str, path: &str) -> bool {
+    fn matches(pattern: &[&str], path: &[&str]) -> bool {
+        let Some((component, remaining_pattern)) = pattern.split_first() else {
+            return true;
+        };
+        if *component == "**" {
+            return matches(remaining_pattern, path)
+                || path
+                    .split_first()
+                    .is_some_and(|(_, remaining_path)| matches(pattern, remaining_path));
+        }
+        path.split_first()
+            .is_some_and(|(path_component, remaining_path)| {
+                workspace_component_matches(component, path_component)
+                    && matches(remaining_pattern, remaining_path)
+            })
+    }
+
+    let pattern: Vec<&str> = pattern.split('/').filter(|part| !part.is_empty()).collect();
+    let path: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    !pattern.is_empty() && matches(&pattern, &path)
+}
+
+fn workspace_component_matches(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let value = value.as_bytes();
+    let mut matched = vec![false; value.len() + 1];
+    matched[0] = true;
+    for token in pattern {
+        let mut next = vec![false; value.len() + 1];
+        match token {
+            b'*' => {
+                next[0] = matched[0];
+                for index in 1..=value.len() {
+                    next[index] = matched[index] || next[index - 1];
+                }
+            }
+            b'?' => {
+                next[1..].copy_from_slice(&matched[..value.len()]);
+            }
+            literal => {
+                for index in 1..=value.len() {
+                    next[index] = matched[index - 1] && value[index - 1] == *literal;
+                }
+            }
+        }
+        matched = next;
+    }
+    matched[value.len()]
+}
+
+/// Determine which Yarn linker outputs are required without executing Yarn or
+/// following project-controlled symlinks. Yarn Berry uses PnP by default when
+/// a `.yarnrc.yml` is present; `packageManager: yarn@2+` is the other explicit
+/// modern-Yarn signal. Classic/unspecified Yarn remains lockfile-only so SBE
+/// does not create an unrelated empty `.pnp.cjs`.
+#[cfg(target_os = "linux")]
+fn yarn_pnp_configuration(project_dir: &Path) -> anyhow::Result<(bool, bool)> {
+    if let Some(contents) = read_bounded_project_file(&project_dir.join(".yarnrc.yml"))? {
+        let config: serde_yaml::Value =
+            serde_yaml::from_slice(&contents).context("parse .yarnrc.yml for output policy")?;
+        let mapping = if config.is_null() {
+            None
+        } else {
+            Some(
+                config
+                    .as_mapping()
+                    .context(".yarnrc.yml must contain a mapping")?,
+            )
+        };
+        let linker = mapping
+            .and_then(|mapping| mapping.get(serde_yaml::Value::String("nodeLinker".to_owned())))
+            .and_then(serde_yaml::Value::as_str);
+        let uses_pnp = match linker {
+            None | Some("pnp") => true,
+            Some("node-modules" | "pnpm") => false,
+            Some(other) => anyhow::bail!("unsupported Yarn nodeLinker value '{other}'"),
+        };
+        let uses_esm_loader = uses_pnp
+            && mapping
+                .and_then(|mapping| {
+                    mapping.get(serde_yaml::Value::String("pnpEnableEsmLoader".to_owned()))
+                })
+                .and_then(serde_yaml::Value::as_bool)
+                .unwrap_or(false);
+        return Ok((uses_pnp, uses_esm_loader));
+    }
+
+    let Some(contents) = read_bounded_project_file(&project_dir.join("package.json"))? else {
+        return Ok((false, false));
+    };
+    let package: serde_json::Value =
+        serde_json::from_slice(&contents).context("parse package.json for Yarn output policy")?;
+    let modern_yarn = package
+        .get("packageManager")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|manager| manager.strip_prefix("yarn@"))
+        .is_some_and(|version| {
+            version == "berry"
+                || version
+                    .split('.')
+                    .next()
+                    .and_then(|major| major.parse::<u64>().ok())
+                    .is_some_and(|major| major >= 2)
+        });
+    Ok((modern_yarn, false))
+}
+
+#[allow(
+    clippy::disallowed_types,
+    reason = "bounded synchronous policy metadata reads use O_NOFOLLOW before sandbox launch"
+)]
+fn read_bounded_project_file(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    use std::{fs::OpenOptions, io::Read, os::unix::fs::OpenOptionsExt};
+
+    const MAX_PROJECT_METADATA_BYTES: u64 = 256 * 1024;
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("open project metadata safely: {}", path.display()));
+        }
+    };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect project metadata: {}", path.display()))?;
+    if !metadata.is_file() {
+        anyhow::bail!("project metadata is not a regular file: {}", path.display());
+    }
+    if metadata.len() > MAX_PROJECT_METADATA_BYTES {
+        anyhow::bail!("project metadata is too large: {}", path.display());
+    }
+    let mut contents = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_PROJECT_METADATA_BYTES + 1)
+        .read_to_end(&mut contents)
+        .with_context(|| format!("read project metadata: {}", path.display()))?;
+    if contents.len() as u64 > MAX_PROJECT_METADATA_BYTES {
+        anyhow::bail!(
+            "project metadata grew beyond the size limit: {}",
+            path.display()
+        );
+    }
+    Ok(Some(contents))
+}
+
+#[cfg(target_os = "linux")]
+fn open_directory_no_symlinks(path: &Path) -> anyhow::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::OwnedFd;
+
+    if !path.is_absolute() {
+        anyhow::bail!("literal write parent is not absolute: {}", path.display());
+    }
+    let root_fd = unsafe { libc::open(c"/".as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    if root_fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("open filesystem root");
+    }
+    let root_fd = unsafe { OwnedFd::from_raw_fd(root_fd) };
+    if path == Path::new("/") {
+        return Ok(root_fd);
+    }
+    let relative = path.strip_prefix("/").expect("absolute path has root");
+    let relative = CString::new(relative.as_os_str().as_bytes())
+        .context("literal write parent contains NUL")?;
+    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+    how.flags = (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64;
+    how.resolve = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS;
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            root_fd.as_raw_fd(),
+            relative.as_ptr(),
+            &how,
+            std::mem::size_of::<libc::open_how>(),
+        ) as libc::c_int
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("open literal write parent safely: {}", path.display()));
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn print_inspect_output(
+    profile: &SandboxProfile,
+    backend: &Sandbox,
+    proxy_port: Option<u16>,
+    effective_environment: &HashMap<String, String>,
+) -> anyhow::Result<()> {
     eprintln!("--- Backend ---");
     eprintln!("name:    {}", backend.name());
     eprintln!("kernel:  {}", backend.info().kernel);
@@ -184,55 +1584,154 @@ fn print_inspect_output(profile: &SandboxProfile, backend: &Sandbox, proxy_port:
     eprintln!("  audit_stream   : {}", f.audit_stream);
     eprintln!();
     eprintln!("--- Resolved profile ---");
-    if let Ok(yaml) = serde_yaml::to_string(profile) {
-        eprintln!("{yaml}");
+    let mut redacted = profile.clone();
+    for value in redacted.env.values_mut() {
+        *value = "<redacted>".to_owned();
     }
-    println!("{}", backend.render_policy(profile, proxy_port));
+    let yaml = serde_yaml::to_string(&redacted).context("serialize resolved profile")?;
+    eprintln!("{yaml}");
+    eprintln!("effectiveEnvironment:");
+    let mut names: Vec<&String> = effective_environment.keys().collect();
+    names.sort();
+    for name in names {
+        let origin = profile
+            .grant_origins
+            .iter()
+            .rev()
+            .find(|record| record.kind == GrantKind::Environment && record.value == *name)
+            .map(|record| record.origin.clone())
+            .unwrap_or(GrantOrigin::Runtime);
+        eprintln!(
+            "  - name: {}\n    value: <redacted>\n    origin: {}",
+            serde_json::to_string(name)?,
+            serde_json::to_string(&origin)?
+        );
+    }
+    println!("{}", backend.render_policy(profile, proxy_port)?);
+    Ok(())
 }
 
-fn build_overrides(args: &RunArgs, home: &Path, pwd: &Path) -> ProfileOverrides {
-    ProfileOverrides {
+fn resolve_cli_environment(args: &RunArgs) -> anyhow::Result<HashMap<String, String>> {
+    const RESERVED: &[&str] = &[
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "XDG_RUNTIME_DIR",
+        "CARGO_TARGET_DIR",
+        "CARGO_BUILD_TARGET_DIR",
+        "CARGO_BUILD_BUILD_DIR",
+        "PIP_CACHE_DIR",
+        "UV_CACHE_DIR",
+        "MIX_BUILD_ROOT",
+        "MIX_DEPS_PATH",
+        "REBAR_CACHE_DIR",
+        "GRADLE_USER_HOME",
+        "COURSIER_CACHE",
+        "SBT_OPTS",
+        "JAVA_TOOL_OPTIONS",
+        "SBE_PROXY_TOKEN",
+    ];
+    let mut env = HashMap::new();
+    for name in &args.keep_env {
+        validate_env_name(name)?;
+        if RESERVED.contains(&name.as_str()) {
+            anyhow::bail!("environment variable '{name}' is reserved by sbe");
+        }
+        if let Ok(value) = std::env::var(name) {
+            env.insert(name.clone(), value);
+        }
+    }
+    for assignment in &args.env {
+        let (name, value) = assignment
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--env requires NAME=VALUE"))?;
+        validate_env_name(name)?;
+        if RESERVED.contains(&name) {
+            anyhow::bail!("environment variable '{name}' is reserved by sbe");
+        }
+        if value.contains('\0') {
+            anyhow::bail!("environment variable '{name}' contains NUL");
+        }
+        env.insert(name.to_owned(), value.to_owned());
+    }
+    Ok(env)
+}
+
+fn validate_env_name(name: &str) -> anyhow::Result<()> {
+    let mut bytes = name.bytes();
+    if !matches!(bytes.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
+        || !bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        anyhow::bail!("invalid environment variable name '{name}'");
+    }
+    Ok(())
+}
+
+fn build_overrides(args: &RunArgs, home: &Path, pwd: &Path) -> anyhow::Result<ProfileOverrides> {
+    Ok(ProfileOverrides {
         allow_write: args
             .allow_write
             .iter()
-            .map(|p| expand_path(&p.to_string_lossy(), home, pwd))
-            .collect(),
+            .map(|path| expand_cli_path(path, home, pwd))
+            .collect::<anyhow::Result<_>>()?,
         deny_read: args
             .deny_read
             .iter()
-            .map(|p| expand_path(&p.to_string_lossy(), home, pwd))
-            .collect(),
+            .map(|path| expand_cli_path(path, home, pwd))
+            .collect::<anyhow::Result<_>>()?,
         allow_read: Vec::new(),
         allow_domains: args
             .allow_domain
             .iter()
-            .map(|d| DomainPattern(d.clone()))
-            .collect(),
+            .map(|domain| DomainPattern::new(domain).map_err(anyhow::Error::msg))
+            .collect::<anyhow::Result<_>>()?,
         deny_domains: args
             .deny_domain
             .iter()
-            .map(|d| DomainPattern(d.clone()))
-            .collect(),
+            .map(|domain| DomainPattern::new(domain).map_err(anyhow::Error::msg))
+            .collect::<anyhow::Result<_>>()?,
         allow_exec: args
             .allow_exec
             .iter()
-            .map(|p| expand_path(&p.to_string_lossy(), home, pwd))
-            .collect(),
+            .map(|path| expand_cli_path(path, home, pwd))
+            .collect::<anyhow::Result<_>>()?,
         deny_exec: args
             .deny_exec
             .iter()
-            .map(|p| expand_path(&p.to_string_lossy(), home, pwd))
-            .collect(),
+            .map(|path| expand_cli_path(path, home, pwd))
+            .collect::<anyhow::Result<_>>()?,
         allow_fetch: args
             .allow_fetch
             .iter()
-            .map(|d| DomainPattern(d.clone()))
-            .collect(),
+            .map(|domain| DomainPattern::new(domain).map_err(anyhow::Error::msg))
+            .collect::<anyhow::Result<_>>()?,
         allow_all_network: args.allow_all_network,
         no_proxy: args.no_proxy,
         allow_degraded: args.allow_degraded,
         env: Default::default(),
+    })
+}
+
+fn expand_cli_path(path: &Path, home: &Path, pwd: &Path) -> anyhow::Result<SandboxPath> {
+    let raw = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("sandbox path is not valid UTF-8: {path:?}"))?;
+    if raw.contains('\0') || raw.chars().any(char::is_control) {
+        anyhow::bail!("sandbox path contains a control character: {path:?}");
     }
+    if path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        anyhow::bail!("sandbox path must not contain '..': {path:?}");
+    }
+    Ok(expand_path(raw, home, pwd))
 }
 
 /// Print available profiles and their defaults (for `sbe profiles` command).
@@ -271,4 +1770,825 @@ pub fn print_profiles() -> anyhow::Result<()> {
 #[allow(dead_code)]
 fn _core_error_compile_check(err: CoreError) -> CoreError {
     err
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ambient_credentials_are_not_inherited() {
+        let inherited = filter_parent_environment([
+            ("PATH".to_owned(), "/usr/bin".to_owned()),
+            ("LANG".to_owned(), "C.UTF-8".to_owned()),
+            ("GITHUB_TOKEN".to_owned(), "sentinel".to_owned()),
+            ("AWS_SECRET_ACCESS_KEY".to_owned(), "sentinel".to_owned()),
+            ("SSH_AUTH_SOCK".to_owned(), "/tmp/agent".to_owned()),
+            ("NPM_TOKEN".to_owned(), "sentinel".to_owned()),
+        ]);
+        assert_eq!(inherited.len(), 2);
+        assert_eq!(inherited.get("PATH").map(String::as_str), Some("/usr/bin"));
+        assert!(!inherited.values().any(|value| value == "sentinel"));
+    }
+
+    #[tokio::test]
+    async fn java_runtime_isolates_sbt_state() {
+        let project = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let mut profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Java, Path::new("/home/test"), project.path());
+
+        let environment = build_extra_env(&mut profile, None, runtime.path(), project.path(), &[])
+            .await
+            .unwrap();
+        let sbt_options = environment.get("SBT_OPTS").unwrap();
+
+        assert!(sbt_options.contains("-Dsbt.boot.directory="));
+        assert!(sbt_options.contains("-Dsbt.ivy.home="));
+    }
+
+    #[tokio::test]
+    async fn rust_runtime_places_executable_artifacts_in_private_temp() {
+        let project = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let mut profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Rust, Path::new("/home/test"), project.path());
+
+        let environment = build_extra_env(
+            &mut profile,
+            None,
+            runtime.path(),
+            project.path(),
+            &["cargo".to_owned(), "test".to_owned()],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            environment.get("CARGO_TARGET_DIR").map(String::as_str),
+            runtime.path().join("cargo-target").to_str()
+        );
+        assert_ne!(
+            environment.get("CARGO_TARGET_DIR").map(String::as_str),
+            project.path().join("target").to_str()
+        );
+
+        let build_environment = build_extra_env(
+            &mut profile,
+            None,
+            runtime.path(),
+            project.path(),
+            &["cargo".to_owned(), "build".to_owned()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            build_environment
+                .get("CARGO_TARGET_DIR")
+                .map(String::as_str),
+            project.path().join("target").to_str()
+        );
+        assert!(cargo_uses_persistent_target(&[
+            "cargo".to_owned(),
+            "build".to_owned()
+        ]));
+        assert!(!cargo_uses_persistent_target(&[
+            "cargo".to_owned(),
+            "test".to_owned()
+        ]));
+
+        let nextest_environment = build_extra_env(
+            &mut profile,
+            None,
+            runtime.path(),
+            project.path(),
+            &["cargo".to_owned(), "nextest".to_owned(), "run".to_owned()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            nextest_environment
+                .get("CARGO_TARGET_DIR")
+                .map(String::as_str),
+            runtime.path().join("cargo-target").to_str()
+        );
+        assert!(cargo_executes_target(&[
+            "cargo".to_owned(),
+            "nextest".to_owned(),
+            "run".to_owned(),
+        ]));
+    }
+
+    #[test]
+    fn node_tool_commands_switch_builtin_dependencies_from_write_to_execute() {
+        let project_directory = tempfile::tempdir().unwrap();
+        let project = project_directory.path();
+        let base_profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Node, Path::new("/Users/test"), project);
+        for command in [
+            vec!["npm".to_owned(), "test".to_owned()],
+            vec!["npm".to_owned(), "exec".to_owned(), "eslint".to_owned()],
+            vec!["npx".to_owned(), "eslint".to_owned()],
+            vec!["bun".to_owned(), "run".to_owned(), "test".to_owned()],
+        ] {
+            let mut profile = base_profile.clone();
+            enable_existing_dependency_execution(&mut profile, &command);
+
+            let dependencies = project.join("node_modules");
+            assert!(
+                !profile
+                    .allow_write
+                    .iter()
+                    .any(|grant| grant.path == dependencies),
+                "{command:?} retained a writable dependency tree"
+            );
+            assert!(
+                profile
+                    .allow_exec
+                    .iter()
+                    .any(|grant| grant.path == dependencies),
+                "{command:?} did not authorize installed tools"
+            );
+            profile.validate_security_invariants().unwrap();
+        }
+
+        let mut install_profile = base_profile.clone();
+        enable_existing_dependency_execution(
+            &mut install_profile,
+            &["npm".to_owned(), "install".to_owned()],
+        );
+        assert!(
+            install_profile
+                .allow_write
+                .iter()
+                .any(|grant| grant.path == project.join("node_modules"))
+        );
+        assert!(
+            !install_profile
+                .allow_exec
+                .iter()
+                .any(|grant| grant.path == project.join("node_modules"))
+        );
+
+        let mut denied_profile = base_profile;
+        denied_profile.deny_exec.push(SandboxPath::file(
+            project.join("node_modules/eslint/bin/eslint.js"),
+        ));
+        enable_existing_dependency_execution(
+            &mut denied_profile,
+            &["npm".to_owned(), "test".to_owned()],
+        );
+        assert!(
+            !denied_profile
+                .allow_exec
+                .iter()
+                .any(|grant| grant.path == project.join("node_modules")),
+            "a higher-precedence executable denial must not be re-authorized"
+        );
+    }
+
+    #[test]
+    fn python_run_commands_switch_builtin_virtualenvs_from_write_to_execute() {
+        let project_directory = tempfile::tempdir().unwrap();
+        let project = project_directory.path();
+        let base_profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Python, Path::new("/Users/test"), project);
+        for command in [
+            vec!["uv".to_owned(), "run".to_owned(), "pytest".to_owned()],
+            vec!["poetry".to_owned(), "run".to_owned(), "pytest".to_owned()],
+            vec![
+                project
+                    .join(".venv/bin/pytest")
+                    .to_string_lossy()
+                    .into_owned(),
+            ],
+            vec!["pytest".to_owned()],
+        ] {
+            let mut profile = base_profile.clone();
+            enable_existing_dependency_execution(&mut profile, &command);
+
+            for environment in [project.join(".venv"), project.join("venv")] {
+                assert!(
+                    !profile
+                        .allow_write
+                        .iter()
+                        .any(|grant| grant.path == environment),
+                    "{command:?} retained a writable virtualenv"
+                );
+                assert!(
+                    profile
+                        .allow_exec
+                        .iter()
+                        .any(|grant| grant.path == environment),
+                    "{command:?} did not authorize the existing virtualenv"
+                );
+            }
+            profile.validate_security_invariants().unwrap();
+        }
+
+        for command in [
+            vec!["uv".to_owned(), "sync".to_owned()],
+            vec!["pip".to_owned(), "install".to_owned(), "pytest".to_owned()],
+            vec!["poetry".to_owned(), "install".to_owned()],
+            vec![
+                "python".to_owned(),
+                "-m".to_owned(),
+                "venv".to_owned(),
+                ".venv".to_owned(),
+            ],
+        ] {
+            let mut profile = base_profile.clone();
+            enable_existing_dependency_execution(&mut profile, &command);
+            assert!(
+                profile
+                    .allow_write
+                    .iter()
+                    .any(|grant| grant.path == project.join(".venv")),
+                "{command:?} lost the writable virtualenv required for installation"
+            );
+            assert!(
+                !profile
+                    .allow_exec
+                    .iter()
+                    .any(|grant| grant.path == project.join(".venv"))
+            );
+        }
+
+        let mut explicitly_writable_profile = base_profile.clone();
+        explicitly_writable_profile
+            .allow_write
+            .push(SandboxPath::dir(project.join(".venv")));
+        enable_existing_dependency_execution(
+            &mut explicitly_writable_profile,
+            &["pytest".to_owned()],
+        );
+        assert!(
+            explicitly_writable_profile
+                .allow_write
+                .iter()
+                .any(|grant| grant.path == project.join(".venv")),
+            "a user-supplied write grant must not be silently removed"
+        );
+        assert!(
+            explicitly_writable_profile
+                .validate_security_invariants()
+                .is_err(),
+            "a user-supplied write grant must still conflict with runtime execution"
+        );
+
+        let mut denied_profile = base_profile;
+        denied_profile
+            .deny_exec
+            .push(SandboxPath::file(project.join(".venv/bin/pytest")));
+        enable_existing_dependency_execution(&mut denied_profile, &["pytest".to_owned()]);
+        assert!(
+            !denied_profile
+                .allow_exec
+                .iter()
+                .any(|grant| grant.path == project.join(".venv")),
+            "a higher-precedence virtualenv executable denial must not be re-authorized"
+        );
+    }
+
+    #[test]
+    fn top_level_command_parsing_ignores_option_values_and_nested_commands() {
+        assert_eq!(
+            top_level_subcommand(&[
+                "cargo".to_owned(),
+                "+stable".to_owned(),
+                "--color".to_owned(),
+                "always".to_owned(),
+                "build".to_owned(),
+            ]),
+            ParsedTopLevel::Command("build")
+        );
+        assert!(cargo_uses_persistent_target(&[
+            "cargo".to_owned(),
+            "build".to_owned(),
+            "--package".to_owned(),
+            "test".to_owned(),
+        ]));
+        assert!(!cargo_executes_target(&[
+            "cargo".to_owned(),
+            "build".to_owned(),
+            "--package".to_owned(),
+            "test".to_owned(),
+        ]));
+        assert!(cargo_executes_target(&[
+            "cargo".to_owned(),
+            "test".to_owned(),
+            "--package".to_owned(),
+            "build".to_owned(),
+        ]));
+        assert_eq!(
+            top_level_subcommand(&["poetry".to_owned(), "run".to_owned(), "install".to_owned(),]),
+            ParsedTopLevel::Command("run")
+        );
+        assert_eq!(
+            top_level_subcommand(&[
+                "npm".to_owned(),
+                "--future-option".to_owned(),
+                "install".to_owned(),
+                "view".to_owned(),
+            ]),
+            ParsedTopLevel::Ambiguous
+        );
+    }
+
+    #[test]
+    fn project_relocation_options_are_rejected_before_policy_preparation() {
+        for command in [
+            vec!["npm", "--prefix", "subproject", "install"],
+            vec!["npm", "install", "--prefix=subproject"],
+            vec!["yarn", "--cwd", "subproject", "install"],
+            vec!["pnpm", "-Csubproject", "install"],
+            vec!["bun", "--cwd=subproject", "install"],
+            vec!["uv", "--project", "subproject", "sync"],
+            vec!["poetry", "-P", "subproject", "install"],
+            vec!["cargo", "-Csubproject", "build"],
+        ] {
+            let command: Vec<String> = command.into_iter().map(str::to_owned).collect();
+            assert!(
+                reject_project_relocation(&command).is_err(),
+                "relocating command was accepted: {command:?}"
+            );
+        }
+        assert!(
+            reject_project_relocation(&[
+                "npm".to_owned(),
+                "install".to_owned(),
+                "--".to_owned(),
+                "--prefix".to_owned(),
+                "payload".to_owned(),
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn cli_paths_reject_parent_traversal() {
+        assert!(
+            expand_cli_path(
+                Path::new("$PWD/output/../.ssh/"),
+                Path::new("/home/test"),
+                Path::new("/work/project"),
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn java_proxy_agent_is_private_and_refuses_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let runtime = tempfile::tempdir().unwrap();
+        let path = install_java_proxy_agent(runtime.path()).await.unwrap();
+        let metadata = tokio::fs::metadata(&path).await.unwrap();
+        let bytes = tokio::fs::read(&path).await.unwrap();
+
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o400);
+        assert!(bytes.starts_with(b"PK\x03\x04"));
+        assert!(install_java_proxy_agent(runtime.path()).await.is_err());
+    }
+
+    #[test]
+    fn dedicated_output_directory_refuses_symlinks() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), project.path().join("target")).unwrap();
+        assert!(ensure_child_directory(project.path(), c"target").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous filesystem setup is isolated to this launcher helper unit test"
+    )]
+    fn literal_write_targets_only_create_the_selected_managers_lockfile() {
+        let project = tempfile::tempdir().unwrap();
+        let profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Rust, Path::new("/home/test"), project.path());
+        let lockfile = project.path().join("Cargo.lock");
+        ensure_literal_write_targets(
+            &profile,
+            &["/usr/bin/cargo".to_owned(), "build".to_owned()],
+            project.path(),
+        )
+        .unwrap();
+        assert!(lockfile.is_file());
+
+        let profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Node, Path::new("/home/test"), project.path());
+        ensure_literal_write_targets(
+            &profile,
+            &["npm".to_owned(), "install".to_owned()],
+            project.path(),
+        )
+        .unwrap();
+        assert!(project.path().join("package-lock.json").is_file());
+        assert!(!project.path().join("yarn.lock").exists());
+        assert!(!project.path().join("pnpm-lock.yaml").exists());
+        assert!(!project.path().join("bun.lock").exists());
+        assert!(!project.path().join(".pnp.cjs").exists());
+
+        let bun_project = tempfile::tempdir().unwrap();
+        let bun_profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Node,
+            Path::new("/home/test"),
+            bun_project.path(),
+        );
+        ensure_literal_write_targets(
+            &bun_profile,
+            &["bun".to_owned(), "install".to_owned()],
+            bun_project.path(),
+        )
+        .unwrap();
+        assert!(bun_project.path().join("bun.lock").is_file());
+        assert!(!bun_project.path().join("package-lock.json").exists());
+        assert!(!bun_project.path().join("yarn.lock").exists());
+        assert!(!bun_project.path().join("pnpm-lock.yaml").exists());
+
+        let bun_yarn_project = tempfile::tempdir().unwrap();
+        let bun_yarn_profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Node,
+            Path::new("/home/test"),
+            bun_yarn_project.path(),
+        );
+        ensure_literal_write_targets(
+            &bun_yarn_profile,
+            &["bun".to_owned(), "install".to_owned(), "--yarn".to_owned()],
+            bun_yarn_project.path(),
+        )
+        .unwrap();
+        assert!(bun_yarn_project.path().join("bun.lock").is_file());
+        assert!(bun_yarn_project.path().join("yarn.lock").is_file());
+        assert!(!bun_yarn_project.path().join("package-lock.json").exists());
+        assert!(!bun_yarn_project.path().join("pnpm-lock.yaml").exists());
+
+        let frozen_bun_project = tempfile::tempdir().unwrap();
+        let frozen_bun_profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Node,
+            Path::new("/home/test"),
+            frozen_bun_project.path(),
+        );
+        ensure_literal_write_targets(
+            &frozen_bun_profile,
+            &[
+                "bun".to_owned(),
+                "install".to_owned(),
+                "--frozen-lockfile".to_owned(),
+            ],
+            frozen_bun_project.path(),
+        )
+        .unwrap();
+        assert!(!frozen_bun_project.path().join("bun.lock").exists());
+
+        let informational_bun_project = tempfile::tempdir().unwrap();
+        let informational_bun_profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Node,
+            Path::new("/home/test"),
+            informational_bun_project.path(),
+        );
+        ensure_literal_write_targets(
+            &informational_bun_profile,
+            &["bun".to_owned(), "--help".to_owned(), "install".to_owned()],
+            informational_bun_project.path(),
+        )
+        .unwrap();
+        assert!(!informational_bun_project.path().join("bun.lock").exists());
+
+        let read_only_project = tempfile::tempdir().unwrap();
+        let profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Node,
+            Path::new("/home/test"),
+            read_only_project.path(),
+        );
+        ensure_literal_write_targets(
+            &profile,
+            &["npm".to_owned(), "--version".to_owned()],
+            read_only_project.path(),
+        )
+        .unwrap();
+        assert!(!read_only_project.path().join("package-lock.json").exists());
+
+        let relocated_project = tempfile::tempdir().unwrap();
+        let relocated_profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Node,
+            Path::new("/home/test"),
+            relocated_project.path(),
+        );
+        assert!(
+            ensure_literal_write_targets(
+                &relocated_profile,
+                &[
+                    "npm".to_owned(),
+                    "--prefix".to_owned(),
+                    "subproject".to_owned(),
+                    "install".to_owned(),
+                ],
+                relocated_project.path(),
+            )
+            .is_err()
+        );
+        assert!(!relocated_project.path().join("package-lock.json").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous filesystem setup is isolated to this launcher helper unit test"
+    )]
+    fn literal_write_targets_select_one_node_workspace_root() {
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repository.path().join(".git")).unwrap();
+        let workspace = repository.path().join("frontend");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(
+            workspace.join("package.json"),
+            r#"{"name":"workspace","workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        let member = workspace.join("packages/app");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(member.join("package.json"), r#"{"name":"app"}"#).unwrap();
+        let mut profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Node, Path::new("/home/test"), &member);
+        configure_node_workspace(
+            &mut profile,
+            &["npm".to_owned(), "install".to_owned()],
+            &member,
+        )
+        .unwrap();
+        ensure_literal_write_targets(&profile, &["npm".to_owned(), "install".to_owned()], &member)
+            .unwrap();
+        assert!(workspace.join("package-lock.json").is_file());
+        assert!(!member.join("package-lock.json").exists());
+        assert!(!repository.path().join("package-lock.json").exists());
+        assert!(
+            profile
+                .allow_write
+                .contains(&SandboxPath::dir(workspace.join("node_modules")))
+        );
+        assert!(
+            !profile
+                .allow_write
+                .contains(&SandboxPath::file(workspace.join("yarn.lock")))
+        );
+        assert!(
+            !profile
+                .allow_write
+                .contains(&SandboxPath::dir(repository.path().join("node_modules")))
+        );
+
+        let standalone_repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir(standalone_repository.path().join(".git")).unwrap();
+        std::fs::write(
+            standalone_repository.path().join("package.json"),
+            r#"{"name":"unrelated-root"}"#,
+        )
+        .unwrap();
+        let standalone = standalone_repository.path().join("nested");
+        std::fs::create_dir(&standalone).unwrap();
+        std::fs::write(standalone.join("package.json"), r#"{"name":"standalone"}"#).unwrap();
+        let mut standalone_profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Node, Path::new("/home/test"), &standalone);
+        configure_node_workspace(
+            &mut standalone_profile,
+            &["npm".to_owned(), "install".to_owned()],
+            &standalone,
+        )
+        .unwrap();
+        ensure_literal_write_targets(
+            &standalone_profile,
+            &["npm".to_owned(), "install".to_owned()],
+            &standalone,
+        )
+        .unwrap();
+        assert!(standalone.join("package-lock.json").is_file());
+        assert!(
+            !standalone_repository
+                .path()
+                .join("package-lock.json")
+                .exists()
+        );
+
+        assert!(workspace_glob_matches_prefix(
+            "packages/*",
+            "packages/app/src"
+        ));
+        assert!(!workspace_glob_matches_prefix("examples/*", "packages/app"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous filesystem setup is isolated to this launcher helper unit test"
+    )]
+    fn literal_write_targets_handle_aliases_defaults_and_nested_commands() {
+        let npm_project = tempfile::tempdir().unwrap();
+        let npm_profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Node,
+            Path::new("/home/test"),
+            npm_project.path(),
+        );
+        ensure_literal_write_targets(
+            &npm_profile,
+            &["npm".to_owned(), "i".to_owned()],
+            npm_project.path(),
+        )
+        .unwrap();
+        assert!(npm_project.path().join("package-lock.json").is_file());
+
+        for command in [
+            vec!["npm", "install", "--no-package-lock"],
+            vec!["npm", "install", "--package-lock=false"],
+            vec!["npm", "install", "--package-lock", "false"],
+        ] {
+            let no_lock_project = tempfile::tempdir().unwrap();
+            let no_lock_profile = SandboxProfile::for_ecosystem(
+                Ecosystem::Node,
+                Path::new("/home/test"),
+                no_lock_project.path(),
+            );
+            let command: Vec<String> = command.into_iter().map(str::to_owned).collect();
+            ensure_literal_write_targets(&no_lock_profile, &command, no_lock_project.path())
+                .unwrap();
+            assert!(!no_lock_project.path().join("package-lock.json").exists());
+        }
+
+        let yarn_project = tempfile::tempdir().unwrap();
+        let yarn_profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Node,
+            Path::new("/home/test"),
+            yarn_project.path(),
+        );
+        ensure_literal_write_targets(&yarn_profile, &["yarn".to_owned()], yarn_project.path())
+            .unwrap();
+        assert!(yarn_project.path().join("yarn.lock").is_file());
+        assert!(!yarn_project.path().join(".pnp.cjs").exists());
+
+        let modern_yarn_project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            modern_yarn_project.path().join("package.json"),
+            r#"{"name":"modern","packageManager":"yarn@4.9.2"}"#,
+        )
+        .unwrap();
+        let modern_yarn_profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Node,
+            Path::new("/home/test"),
+            modern_yarn_project.path(),
+        );
+        ensure_literal_write_targets(
+            &modern_yarn_profile,
+            &["yarn".to_owned(), "install".to_owned()],
+            modern_yarn_project.path(),
+        )
+        .unwrap();
+        assert!(modern_yarn_project.path().join("yarn.lock").is_file());
+        assert!(modern_yarn_project.path().join(".pnp.cjs").is_file());
+        assert!(!modern_yarn_project.path().join(".pnp.loader.mjs").exists());
+
+        let esm_yarn_project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            esm_yarn_project.path().join(".yarnrc.yml"),
+            "pnpEnableEsmLoader: true\n",
+        )
+        .unwrap();
+        let esm_yarn_profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Node,
+            Path::new("/home/test"),
+            esm_yarn_project.path(),
+        );
+        ensure_literal_write_targets(
+            &esm_yarn_profile,
+            &["yarn".to_owned()],
+            esm_yarn_project.path(),
+        )
+        .unwrap();
+        assert!(esm_yarn_project.path().join(".pnp.cjs").is_file());
+        assert!(esm_yarn_project.path().join(".pnp.loader.mjs").is_file());
+
+        let node_modules_yarn_project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            node_modules_yarn_project.path().join(".yarnrc.yml"),
+            "nodeLinker: node-modules\n",
+        )
+        .unwrap();
+        let node_modules_yarn_profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Node,
+            Path::new("/home/test"),
+            node_modules_yarn_project.path(),
+        );
+        ensure_literal_write_targets(
+            &node_modules_yarn_profile,
+            &["yarn".to_owned(), "install".to_owned()],
+            node_modules_yarn_project.path(),
+        )
+        .unwrap();
+        assert!(node_modules_yarn_project.path().join("yarn.lock").is_file());
+        assert!(!node_modules_yarn_project.path().join(".pnp.cjs").exists());
+
+        let yarn_info_project = tempfile::tempdir().unwrap();
+        let yarn_info_profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Node,
+            Path::new("/home/test"),
+            yarn_info_project.path(),
+        );
+        ensure_literal_write_targets(
+            &yarn_info_profile,
+            &["yarn".to_owned(), "--version".to_owned()],
+            yarn_info_project.path(),
+        )
+        .unwrap();
+        assert!(!yarn_info_project.path().join("yarn.lock").exists());
+
+        let read_only_node = tempfile::tempdir().unwrap();
+        let node_profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Node,
+            Path::new("/home/test"),
+            read_only_node.path(),
+        );
+        ensure_literal_write_targets(
+            &node_profile,
+            &["npm".to_owned(), "view".to_owned(), "install".to_owned()],
+            read_only_node.path(),
+        )
+        .unwrap();
+        assert!(!read_only_node.path().join("package-lock.json").exists());
+        ensure_literal_write_targets(
+            &node_profile,
+            &[
+                "npm".to_owned(),
+                "--future-option".to_owned(),
+                "install".to_owned(),
+                "view".to_owned(),
+            ],
+            read_only_node.path(),
+        )
+        .unwrap();
+        assert!(!read_only_node.path().join("package-lock.json").exists());
+
+        let python_project = tempfile::tempdir().unwrap();
+        let python_profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Python,
+            Path::new("/home/test"),
+            python_project.path(),
+        );
+        ensure_literal_write_targets(
+            &python_profile,
+            &["uv".to_owned(), "pip".to_owned(), "install".to_owned()],
+            python_project.path(),
+        )
+        .unwrap();
+        ensure_literal_write_targets(
+            &python_profile,
+            &["poetry".to_owned(), "run".to_owned(), "install".to_owned()],
+            python_project.path(),
+        )
+        .unwrap();
+        assert!(!python_project.path().join("uv.lock").exists());
+        assert!(!python_project.path().join("poetry.lock").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous filesystem setup is isolated to this launcher helper unit test"
+    )]
+    fn literal_write_targets_refuse_symlinked_parents_and_files() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), project.path().join("redirect")).unwrap();
+        let mut profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Rust, Path::new("/home/test"), project.path());
+        profile.allow_write = vec![SandboxPath::file(project.path().join("redirect/lock"))];
+        profile.first_user_allow_write = 0;
+        assert!(
+            ensure_literal_write_targets(
+                &profile,
+                &["cargo".to_owned(), "build".to_owned()],
+                project.path(),
+            )
+            .is_err()
+        );
+
+        let target = project.path().join("real-lock");
+        std::fs::write(&target, "sentinel").unwrap();
+        let link = project.path().join("Cargo.lock");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        profile.allow_write = vec![SandboxPath::file(link)];
+        assert!(
+            ensure_literal_write_targets(
+                &profile,
+                &["cargo".to_owned(), "build".to_owned()],
+                project.path(),
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "sentinel");
+    }
 }

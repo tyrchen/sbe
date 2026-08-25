@@ -4,3 +4,4 @@
 - [sbe Design](sbe-design.md) — Architecture: crate layout, SBPL generation, proxy design, per-ecosystem profiles, security model
 - [sbe Implementation Plan](sbe-impl-plan.md) — 3-phase roadmap: core sandbox → network proxy → audit & polish
 - [Cross-Platform Backend Design](cross-platform-backend-design.md) — `SandboxBackend` trait, macOS/Linux parity matrix, Landlock+seccomp port, per-OS profile defaults, phased migration
+- [Security Hardening Design](security-hardening-design.md) — Threat model, prioritized security findings, process/network/filesystem hardening, supply-chain controls, and adversarial acceptance tests

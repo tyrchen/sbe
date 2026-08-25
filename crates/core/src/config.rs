@@ -1,18 +1,20 @@
 use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
+    collections::{HashMap, HashSet},
+    io::Read,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    path::{Component, Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
     error::CoreError,
-    profile::{DomainPattern, SandboxProfile},
+    profile::{DomainPattern, GrantKind, GrantOrigin, GrantRecord, SandboxProfile},
 };
 
 /// Top-level configuration file structure (`.sbe.yaml` or `~/.config/sbe/config.yaml`).
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SbeConfig {
     /// Profile overrides keyed by profile name.
     #[serde(default)]
@@ -21,7 +23,7 @@ pub struct SbeConfig {
 
 /// A single profile configuration block from the YAML file.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProfileConfig {
     /// Base profile to extend from.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -39,6 +41,10 @@ pub struct ProfileConfig {
 
     #[serde(default)]
     pub allow_domains: Vec<String>,
+
+    /// Remove domains from grants established by lower-precedence sources.
+    #[serde(default)]
+    pub deny_domains: Vec<String>,
 
     #[serde(default)]
     pub deny_exec: Vec<String>,
@@ -71,24 +77,81 @@ pub struct ProfileConfig {
     pub env: HashMap<String, String>,
 }
 
+const MAX_CONFIG_BYTES: usize = 1024 * 1024;
+const MAX_PROFILES: usize = 128;
+const MAX_LIST_ITEMS: usize = 1024;
+const MAX_PATH_BYTES: usize = 4096;
+const MAX_ENV_VALUE_BYTES: usize = 8192;
+const MAX_ENV_VARS: usize = 128;
+
+const RESERVED_ENV: &[&str] = &[
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "XDG_RUNTIME_DIR",
+    "CARGO_TARGET_DIR",
+    "CARGO_BUILD_TARGET_DIR",
+    "CARGO_BUILD_BUILD_DIR",
+    "PIP_CACHE_DIR",
+    "UV_CACHE_DIR",
+    "MIX_BUILD_ROOT",
+    "MIX_DEPS_PATH",
+    "REBAR_CACHE_DIR",
+    "GRADLE_USER_HOME",
+    "COURSIER_CACHE",
+    "SBT_OPTS",
+    "JAVA_TOOL_OPTIONS",
+    "SBE_PROXY_TOKEN",
+];
+
+/// Trust provenance of a loaded configuration file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ConfigOrigin {
+    Global,
+    Project,
+    Explicit,
+}
+
+/// A configuration plus the provenance needed to enforce monotonic project
+/// policy and explain the final profile.
+#[derive(Debug, Clone)]
+pub struct LoadedConfig {
+    pub config: SbeConfig,
+    pub origin: ConfigOrigin,
+    pub path: PathBuf,
+    pub trusted: bool,
+}
+
 impl SbeConfig {
     /// Load config from a YAML file. Returns `Ok(None)` if the file does not exist.
     pub async fn load(path: &Path) -> Result<Option<Self>, CoreError> {
-        match tokio::fs::read_to_string(path).await {
-            Ok(contents) => {
-                let config: Self =
-                    serde_yaml::from_str(&contents).map_err(|e| CoreError::ConfigLoad {
-                        path: path.to_path_buf(),
-                        source: Box::new(e),
-                    })?;
-                Ok(Some(config))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(CoreError::ConfigLoad {
+        let owned_path = path.to_path_buf();
+        let contents = tokio::task::spawn_blocking(move || read_config_bytes(&owned_path))
+            .await
+            .map_err(|error| {
+                CoreError::Backend(format!("configuration reader failed: {error}"))
+            })??;
+        let Some(contents) = contents else {
+            return Ok(None);
+        };
+        let contents = String::from_utf8(contents).map_err(|error| CoreError::ConfigLoad {
+            path: path.to_path_buf(),
+            source: Box::new(error),
+        })?;
+        let config: Self =
+            serde_yaml::from_str(&contents).map_err(|error| CoreError::ConfigLoad {
                 path: path.to_path_buf(),
-                source: Box::new(e),
-            }),
-        }
+                source: Box::new(error),
+            })?;
+        config.validate(path)?;
+        Ok(Some(config))
     }
 
     /// Find the project config by walking up from `start` to the filesystem root,
@@ -114,39 +177,135 @@ impl SbeConfig {
     pub fn global_config_path() -> Option<PathBuf> {
         dirs::config_dir().map(|d| d.join("sbe/config.yaml"))
     }
+
+    fn validate(&self, path: &Path) -> Result<(), CoreError> {
+        if self.profiles.len() > MAX_PROFILES {
+            return Err(config_policy(path, "too many profiles"));
+        }
+        for (name, profile) in &self.profiles {
+            if name.is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
+                return Err(config_policy(
+                    path,
+                    format!("invalid profile name '{name}'"),
+                ));
+            }
+            profile.validate(path)?;
+        }
+        Ok(())
+    }
+}
+
+#[allow(clippy::disallowed_types)] // Unix flags require std OpenOptions in spawn_blocking.
+fn read_config_bytes(path: &Path) -> Result<Option<Vec<u8>>, CoreError> {
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(CoreError::ConfigLoad {
+                path: path.to_path_buf(),
+                source: Box::new(source),
+            });
+        }
+    };
+    let metadata = file.metadata().map_err(|source| CoreError::ConfigLoad {
+        path: path.to_path_buf(),
+        source: Box::new(source),
+    })?;
+    if !metadata.is_file() {
+        return Err(config_policy(path, "configuration is not a regular file"));
+    }
+    if metadata.len() > MAX_CONFIG_BYTES as u64 {
+        return Err(config_policy(
+            path,
+            format!(
+                "file is {} bytes; maximum is {MAX_CONFIG_BYTES}",
+                metadata.len()
+            ),
+        ));
+    }
+    let mut contents = Vec::new();
+    file.take(MAX_CONFIG_BYTES as u64 + 1)
+        .read_to_end(&mut contents)
+        .map_err(|source| CoreError::ConfigLoad {
+            path: path.to_path_buf(),
+            source: Box::new(source),
+        })?;
+    if contents.len() > MAX_CONFIG_BYTES {
+        return Err(config_policy(path, "configuration grew beyond 1 MiB"));
+    }
+    Ok(Some(contents))
 }
 
 impl ProfileConfig {
     /// Apply this config's overrides onto a `SandboxProfile`.
     ///
     /// Paths are expanded relative to `home` (for `~`) and `pwd` (for `./`).
-    pub fn apply_to(&self, profile: &mut SandboxProfile, home: &Path, pwd: &Path) {
+    pub fn apply_to(
+        &self,
+        profile: &mut SandboxProfile,
+        home: &Path,
+        pwd: &Path,
+        origin: &GrantOrigin,
+    ) -> Result<(), CoreError> {
+        if !self.allow_domains.is_empty()
+            || !self.deny_domains.is_empty()
+            || !self.allow_fetch.is_empty()
+            || self.allow_all_network.is_some()
+            || self.enable_proxy.is_some()
+        {
+            profile.network_origin = origin.clone();
+        }
         for p in &self.allow_write {
-            profile.allow_write.push(expand_path(p, home, pwd));
+            let path = expand_path(p, home, pwd);
+            record_path(profile, GrantKind::AllowWrite, &path, origin);
+            profile.allow_write.push(path);
         }
         for p in &self.deny_read {
-            profile.deny_read.push(expand_path(p, home, pwd));
+            let path = expand_path(p, home, pwd);
+            record_path(profile, GrantKind::DenyRead, &path, origin);
+            profile.deny_read.push(path);
         }
         for p in &self.allow_read {
-            profile.allow_read.push(expand_path(p, home, pwd));
+            let path = expand_path(p, home, pwd);
+            record_path(profile, GrantKind::AllowRead, &path, origin);
+            profile.allow_read.push(path);
         }
         for d in &self.allow_domains {
-            profile.allow_domains.push(DomainPattern(d.clone()));
+            let domain = DomainPattern::new(d).map_err(CoreError::ProfileLint)?;
+            profile.grant_origins.push(GrantRecord {
+                kind: GrantKind::AllowDomain,
+                value: domain.0.clone(),
+                origin: origin.clone(),
+            });
+            profile.allow_domains.push(domain);
         }
         for p in &self.deny_exec {
-            profile.deny_exec.push(expand_path(p, home, pwd));
+            profile.add_deny_exec(expand_path(p, home, pwd), origin.clone());
         }
         for p in &self.allow_exec {
-            profile.allow_exec.push(expand_path(p, home, pwd));
+            profile.add_allow_exec(expand_path(p, home, pwd), origin.clone());
         }
         for d in &self.allow_fetch {
-            profile.allow_fetch.push(DomainPattern(d.clone()));
+            let domain = DomainPattern::new(d).map_err(CoreError::ProfileLint)?;
+            profile.grant_origins.push(GrantRecord {
+                kind: GrantKind::AllowFetch,
+                value: domain.0.clone(),
+                origin: origin.clone(),
+            });
+            profile.allow_fetch.push(domain);
         }
+        let denied_domains = self
+            .deny_domains
+            .iter()
+            .map(|domain| DomainPattern::new(domain).map_err(CoreError::ProfileLint))
+            .collect::<Result<Vec<_>, _>>()?;
+        profile.remove_denied_domains(&denied_domains);
         if let Some(allow_all) = self.allow_all_network {
             profile.allow_all_network = allow_all;
-            if allow_all {
-                profile.enable_proxy = false;
-            }
         }
         if let Some(enable_proxy) = self.enable_proxy {
             profile.enable_proxy = enable_proxy;
@@ -156,7 +315,139 @@ impl ProfileConfig {
         }
         for (k, v) in &self.env {
             profile.env.insert(k.clone(), v.clone());
+            profile.grant_origins.push(GrantRecord {
+                kind: GrantKind::Environment,
+                value: k.clone(),
+                origin: origin.clone(),
+            });
         }
+        profile.recompute_network_mode();
+        Ok(())
+    }
+
+    fn validate(&self, path: &Path) -> Result<(), CoreError> {
+        if self.allow_degraded == Some(true) {
+            return Err(config_policy(
+                path,
+                "allowDegraded in configuration is no longer accepted; use the capability-specific CLI option --allow-insecure-linux-network for one trusted invocation",
+            ));
+        }
+        let lists = [
+            ("allowWrite", &self.allow_write),
+            ("denyRead", &self.deny_read),
+            ("allowRead", &self.allow_read),
+            ("allowDomains", &self.allow_domains),
+            ("denyDomains", &self.deny_domains),
+            ("denyExec", &self.deny_exec),
+            ("allowExec", &self.allow_exec),
+            ("allowFetch", &self.allow_fetch),
+        ];
+        for (name, values) in lists {
+            if values.len() > MAX_LIST_ITEMS {
+                return Err(config_policy(path, format!("{name} has too many entries")));
+            }
+            for value in values {
+                if value.is_empty()
+                    || value.len() > MAX_PATH_BYTES
+                    || value.contains('\0')
+                    || value.chars().any(char::is_control)
+                {
+                    return Err(config_policy(path, format!("invalid value in {name}")));
+                }
+            }
+        }
+        for (name, values) in [
+            ("allowWrite", &self.allow_write),
+            ("denyRead", &self.deny_read),
+            ("allowRead", &self.allow_read),
+            ("denyExec", &self.deny_exec),
+            ("allowExec", &self.allow_exec),
+        ] {
+            for value in values {
+                let without_directory_marker = value.strip_suffix('/').unwrap_or(value);
+                if Path::new(without_directory_marker)
+                    .components()
+                    .any(|component| component == Component::ParentDir)
+                {
+                    return Err(config_policy(
+                        path,
+                        format!("{name} path must not contain '..'"),
+                    ));
+                }
+            }
+        }
+        for domain in self
+            .allow_domains
+            .iter()
+            .chain(&self.deny_domains)
+            .chain(&self.allow_fetch)
+        {
+            DomainPattern::new(domain).map_err(|reason| config_policy(path, reason))?;
+        }
+        if self.env.len() > MAX_ENV_VARS {
+            return Err(config_policy(path, "too many environment variables"));
+        }
+        for (name, value) in &self.env {
+            if !is_valid_env_name(name) || RESERVED_ENV.contains(&name.as_str()) {
+                return Err(config_policy(
+                    path,
+                    format!("invalid or reserved environment variable '{name}'"),
+                ));
+            }
+            if value.len() > MAX_ENV_VALUE_BYTES || value.contains('\0') {
+                return Err(config_policy(
+                    path,
+                    format!("invalid value for environment variable '{name}'"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_untrusted_project(&self, path: &Path) -> Result<(), CoreError> {
+        let expands_authority = self.extends.is_some()
+            || !self.allow_write.is_empty()
+            || !self.allow_read.is_empty()
+            || !self.allow_domains.is_empty()
+            || !self.allow_exec.is_empty()
+            || !self.allow_fetch.is_empty()
+            || !self.env.is_empty()
+            || self.allow_all_network == Some(true)
+            || self.enable_proxy == Some(false)
+            || self.allow_degraded == Some(true);
+        if expands_authority {
+            return Err(config_policy(
+                path,
+                "project configuration may only add denyRead/denyExec or explicitly disable allowAllNetwork/allowDegraded; pass --trust-project-config to authorize expansion",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn record_path(
+    profile: &mut SandboxProfile,
+    kind: GrantKind,
+    path: &SandboxPath,
+    origin: &GrantOrigin,
+) {
+    profile.grant_origins.push(GrantRecord {
+        kind,
+        value: path.path.to_string_lossy().into_owned(),
+        origin: origin.clone(),
+    });
+}
+
+fn is_valid_env_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    matches!(bytes.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+fn config_policy(path: &Path, reason: impl Into<String>) -> CoreError {
+    CoreError::ConfigPolicy {
+        path: path.to_path_buf(),
+        reason: reason.into(),
     }
 }
 
@@ -270,49 +561,146 @@ pub fn expand_path(raw: &str, home: &Path, pwd: &Path) -> SandboxPath {
 pub async fn load_configs(
     pwd: &Path,
     explicit_config: Option<&Path>,
-) -> Result<Vec<SbeConfig>, CoreError> {
+    trust_project_config: bool,
+) -> Result<Vec<LoadedConfig>, CoreError> {
     let mut configs = Vec::new();
+    let explicit_path = explicit_config.map(|path| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            pwd.join(path)
+        }
+    });
 
     // Global config
     if let Some(global_path) = SbeConfig::global_config_path()
         && let Some(cfg) = SbeConfig::load(&global_path).await?
     {
-        configs.push(cfg);
+        configs.push(LoadedConfig {
+            config: cfg,
+            origin: ConfigOrigin::Global,
+            path: global_path,
+            trusted: true,
+        });
     }
 
     // Project config
-    if let Some(project_path) = SbeConfig::find_project_config(pwd)
-        && let Some(cfg) = SbeConfig::load(&project_path).await?
-    {
-        configs.push(cfg);
+    if let Some(project_path) = SbeConfig::find_project_config(pwd) {
+        let selected_explicitly = if let Some(explicit) = &explicit_path {
+            same_configuration_file(&project_path, explicit).await
+        } else {
+            false
+        };
+        if !selected_explicitly && let Some(cfg) = SbeConfig::load(&project_path).await? {
+            configs.push(LoadedConfig {
+                config: cfg,
+                origin: ConfigOrigin::Project,
+                path: project_path,
+                trusted: trust_project_config,
+            });
+        }
     }
 
     // Explicit config
-    if let Some(explicit) = explicit_config
-        && let Some(cfg) = SbeConfig::load(explicit).await?
+    if let Some(explicit) = explicit_path
+        && let Some(cfg) = SbeConfig::load(&explicit).await?
     {
-        configs.push(cfg);
+        configs.push(LoadedConfig {
+            config: cfg,
+            origin: ConfigOrigin::Explicit,
+            path: explicit,
+            trusted: true,
+        });
     }
 
     Ok(configs)
 }
 
+/// Compare file identities instead of spellings so relative paths and hard
+/// links cannot make one policy file appear as both an untrusted project
+/// source and a trusted explicit source. Any metadata error falls through to
+/// normal loading, which reports the appropriate path-specific error.
+async fn same_configuration_file(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    let (left_metadata, right_metadata) =
+        tokio::join!(tokio::fs::metadata(left), tokio::fs::metadata(right));
+    matches!(
+        (left_metadata, right_metadata),
+        (Ok(left), Ok(right)) if left.dev() == right.dev() && left.ino() == right.ino()
+    )
+}
+
 /// Resolve the final `SandboxProfile` by merging configs into the ecosystem default.
-pub fn resolve_profile(base: &mut SandboxProfile, configs: &[SbeConfig], home: &Path, pwd: &Path) {
+pub fn resolve_profile(
+    base: &mut SandboxProfile,
+    configs: &[LoadedConfig],
+    home: &Path,
+    pwd: &Path,
+) -> Result<(), CoreError> {
     let profile_name = base.name.clone();
 
-    for config in configs {
+    for loaded in configs {
+        let config = &loaded.config;
         // Apply matching profile config
         if let Some(pc) = config.profiles.get(&profile_name) {
-            // Handle extends
-            if let Some(base_name) = &pc.extends
-                && let Some(base_pc) = config.profiles.get(base_name)
-            {
-                base_pc.apply_to(base, home, pwd);
+            if loaded.origin == ConfigOrigin::Project && !loaded.trusted {
+                pc.validate_untrusted_project(&loaded.path)?;
             }
-            pc.apply_to(base, home, pwd);
+            let grant_origin = match &loaded.origin {
+                ConfigOrigin::Global => GrantOrigin::Global(loaded.path.clone()),
+                ConfigOrigin::Project => GrantOrigin::Project(loaded.path.clone()),
+                ConfigOrigin::Explicit => GrantOrigin::Explicit(loaded.path.clone()),
+            };
+            apply_profile_recursive(
+                &profile_name,
+                config,
+                base,
+                home,
+                pwd,
+                &grant_origin,
+                &mut HashSet::new(),
+            )?;
         }
     }
+    base.recompute_network_mode();
+    Ok(())
+}
+
+fn apply_profile_recursive(
+    name: &str,
+    config: &SbeConfig,
+    profile: &mut SandboxProfile,
+    home: &Path,
+    pwd: &Path,
+    origin: &GrantOrigin,
+    visiting: &mut HashSet<String>,
+) -> Result<(), CoreError> {
+    if !visiting.insert(name.to_owned()) {
+        return Err(CoreError::ProfileLint(format!(
+            "cyclic profile extends involving '{name}'"
+        )));
+    }
+    let pc = config
+        .profiles
+        .get(name)
+        .ok_or_else(|| CoreError::UnknownBaseProfile {
+            child: profile.name.clone(),
+            base: name.to_owned(),
+        })?;
+    if let Some(parent) = &pc.extends {
+        if !config.profiles.contains_key(parent) {
+            return Err(CoreError::UnknownBaseProfile {
+                child: name.to_owned(),
+                base: parent.clone(),
+            });
+        }
+        apply_profile_recursive(parent, config, profile, home, pwd, origin, visiting)?;
+    }
+    pc.apply_to(profile, home, pwd, origin)?;
+    visiting.remove(name);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -400,9 +788,227 @@ profiles:
         let original_write = profile.allow_write.len();
         let original_domains = profile.allow_domains.len();
 
-        pc.apply_to(&mut profile, &home, &pwd);
+        pc.apply_to(
+            &mut profile,
+            &home,
+            &pwd,
+            &GrantOrigin::Explicit(PathBuf::from("test.yaml")),
+        )
+        .unwrap();
 
         assert_eq!(profile.allow_write.len(), original_write + 1);
         assert_eq!(profile.allow_domains.len(), original_domains + 1);
+    }
+
+    #[test]
+    fn profile_config_denials_cover_wildcards_and_same_layer_fetches() {
+        let home = PathBuf::from("/Users/test");
+        let pwd = PathBuf::from("/Users/test/project");
+        let pc = ProfileConfig {
+            allow_domains: vec!["*.example.com".to_owned()],
+            deny_domains: vec!["bad.example.com".to_owned()],
+            allow_fetch: vec!["bad.example.com".to_owned()],
+            ..Default::default()
+        };
+        let mut profile =
+            SandboxProfile::for_ecosystem(crate::detect::Ecosystem::Node, &home, &pwd);
+
+        pc.apply_to(
+            &mut profile,
+            &home,
+            &pwd,
+            &GrantOrigin::Explicit(PathBuf::from("test.yaml")),
+        )
+        .unwrap();
+        profile.finalize();
+
+        assert!(profile.allow_fetch.is_empty());
+        assert!(
+            !profile
+                .allow_domains
+                .iter()
+                .any(|domain| domain.matches("bad.example.com"))
+        );
+    }
+
+    #[test]
+    fn test_should_reject_unknown_config_fields() {
+        let yaml = "profiles:\n  node:\n    allowNetwrok: true\n";
+        assert!(serde_yaml::from_str::<SbeConfig>(yaml).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_should_refuse_symlinked_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.yaml");
+        tokio::fs::write(&target, "profiles: {}\n").await.unwrap();
+        let link = directory.path().join(".sbe.yaml");
+        std::os::unix::fs::symlink(target, &link).unwrap();
+        assert!(SbeConfig::load(&link).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_should_reject_oversized_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("large.yaml");
+        tokio::fs::write(&path, vec![b' '; MAX_CONFIG_BYTES + 1])
+            .await
+            .unwrap();
+        assert!(SbeConfig::load(&path).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn explicit_project_config_is_loaded_once_as_trusted() {
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join(".sbe.yaml");
+        tokio::fs::write(
+            &path,
+            "profiles:\n  rust:\n    allowWrite:\n      - '$PWD/generated/'\n",
+        )
+        .await
+        .unwrap();
+
+        let configs = load_configs(project.path(), Some(Path::new(".sbe.yaml")), false)
+            .await
+            .unwrap();
+        let selected: Vec<_> = configs
+            .iter()
+            .filter(|config| config.path == path)
+            .collect();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].origin, ConfigOrigin::Explicit);
+        assert!(selected[0].trusted);
+    }
+
+    #[tokio::test]
+    async fn configuration_identity_recognizes_hard_links() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original.yaml");
+        let alias = directory.path().join("alias.yaml");
+        tokio::fs::write(&original, "profiles: {}\n").await.unwrap();
+        tokio::fs::hard_link(&original, &alias).await.unwrap();
+
+        assert!(same_configuration_file(&original, &alias).await);
+    }
+
+    #[test]
+    fn test_should_reject_reserved_environment_variable() {
+        let yaml = r#"
+profiles:
+  rust:
+    env:
+      HTTPS_PROXY: http://attacker.invalid
+"#;
+        let config: SbeConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.validate(Path::new("config.yaml")).is_err());
+    }
+
+    #[test]
+    fn test_should_reject_parent_traversal_in_policy_paths() {
+        let yaml = r#"
+profiles:
+  rust:
+    denyRead:
+      - "$PWD/output/../.ssh/"
+"#;
+        let config: SbeConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.validate(Path::new("config.yaml")).is_err());
+    }
+
+    #[test]
+    fn test_should_reject_untrusted_project_expansion() {
+        let home = PathBuf::from("/home/test");
+        let pwd = PathBuf::from("/work/project");
+        let mut config = SbeConfig::default();
+        config.profiles.insert(
+            "node".to_owned(),
+            ProfileConfig {
+                allow_all_network: Some(true),
+                allow_write: vec!["$HOME/".to_owned()],
+                ..ProfileConfig::default()
+            },
+        );
+        let loaded = LoadedConfig {
+            config,
+            origin: ConfigOrigin::Project,
+            path: pwd.join(".sbe.yaml"),
+            trusted: false,
+        };
+        let mut profile =
+            SandboxProfile::for_ecosystem(crate::detect::Ecosystem::Node, &home, &pwd);
+        assert!(resolve_profile(&mut profile, &[loaded], &home, &pwd).is_err());
+    }
+
+    #[test]
+    fn test_should_allow_untrusted_project_restrictions() {
+        let home = PathBuf::from("/home/test");
+        let pwd = PathBuf::from("/work/project");
+        let mut config = SbeConfig::default();
+        config.profiles.insert(
+            "node".to_owned(),
+            ProfileConfig {
+                deny_exec: vec!["/usr/bin/git".to_owned()],
+                deny_domains: vec!["registry.npmjs.org".to_owned()],
+                allow_all_network: Some(false),
+                ..ProfileConfig::default()
+            },
+        );
+        let loaded = LoadedConfig {
+            config,
+            origin: ConfigOrigin::Project,
+            path: pwd.join(".sbe.yaml"),
+            trusted: false,
+        };
+        let mut profile =
+            SandboxProfile::for_ecosystem(crate::detect::Ecosystem::Node, &home, &pwd);
+        resolve_profile(&mut profile, &[loaded], &home, &pwd).unwrap();
+        assert!(
+            profile
+                .deny_exec
+                .iter()
+                .any(|path| path.path == Path::new("/usr/bin/git"))
+        );
+        assert!(
+            !profile
+                .allow_exec
+                .iter()
+                .any(|path| path.path == Path::new("/usr/bin/git"))
+        );
+        assert!(
+            !profile
+                .allow_domains
+                .iter()
+                .any(|domain| domain.0 == "registry.npmjs.org")
+        );
+    }
+
+    #[test]
+    fn test_should_reject_cyclic_extends() {
+        let home = PathBuf::from("/home/test");
+        let pwd = PathBuf::from("/work/project");
+        let mut config = SbeConfig::default();
+        config.profiles.insert(
+            "node".to_owned(),
+            ProfileConfig {
+                extends: Some("base".to_owned()),
+                ..ProfileConfig::default()
+            },
+        );
+        config.profiles.insert(
+            "base".to_owned(),
+            ProfileConfig {
+                extends: Some("node".to_owned()),
+                ..ProfileConfig::default()
+            },
+        );
+        let loaded = LoadedConfig {
+            config,
+            origin: ConfigOrigin::Explicit,
+            path: pwd.join("policy.yaml"),
+            trusted: true,
+        };
+        let mut profile =
+            SandboxProfile::for_ecosystem(crate::detect::Ecosystem::Node, &home, &pwd);
+        assert!(resolve_profile(&mut profile, &[loaded], &home, &pwd).is_err());
     }
 }

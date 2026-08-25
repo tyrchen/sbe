@@ -1,8 +1,8 @@
 [package]
 name = "sbexec"
-description = "Run commands in a macOS sandbox with supply chain attack protection"
+description = "Run untrusted build commands in a least-privilege sandbox on macOS and Linux"
 categories = ["development-tools", "command-line-utilities"]
-keywords = ["sandbox", "security", "macos", "supply-chain"]
+keywords = ["sandbox", "security", "macos", "linux", "supply-chain"]
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -23,7 +23,10 @@ anyhow.workspace = true
 clap.workspace = true
 dirs.workspace = true
 serde_yaml.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+libc.workspace = true
+base64.workspace = true

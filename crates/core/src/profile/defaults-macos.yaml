@@ -7,6 +7,9 @@
 #   No trailing / means file   → SBPL literal (exact match)
 
 common:
+  allowRead:
+    - "$PWD/"
+
   denyRead:
     # SSH / GPG
     - "~/.ssh/"
@@ -49,6 +52,7 @@ common:
     - "/usr/bin/pbpaste"
 
   allowExec:
+    - "/usr/bin/true"
     # Shells
     - "/bin/sh"
     - "/bin/bash"
@@ -93,6 +97,8 @@ common:
     - "/bin/test"
     - "/bin/expr"
     - "/bin/dd"
+    - "/bin/sleep"
+    - "/usr/bin/sleep"
     # Git — used by husky, build scripts, mix deps.get, etc.
     # Network access is still proxy-controlled; git over HTTPS goes through proxy.
     - "/usr/bin/git"
@@ -126,14 +132,17 @@ common:
     - "/usr/local/bin/cmake"
     - "/opt/homebrew/bin/pkg-config"
     - "/usr/local/bin/pkg-config"
-    # Temp directories — build tools create wrapper scripts here
-    - "/private/tmp/"
-    - "/private/var/folders/"
-
 profiles:
   node:
     allowWrite:
-      - "$PWD/"
+      - "$PWD/node_modules/"
+      - "$PWD/package-lock.json"
+      - "$PWD/yarn.lock"
+      - "$PWD/pnpm-lock.yaml"
+      - "$PWD/bun.lock"
+      - "$PWD/.yarn/"
+      - "$PWD/.pnp.cjs"
+      - "$PWD/.pnp.loader.mjs"
       - "~/.npm/"
       - "~/.cache/yarn/"
       - "~/Library/Caches/Yarn/"
@@ -149,9 +158,10 @@ profiles:
       - "codeload.github.com"
       - "objects.githubusercontent.com"
     allowExec:
-      - "$PWD/node_modules/"
       - "/usr/local/bin/node"
       - "/opt/homebrew/bin/node"
+      # actions/setup-node installs into this non-system toolcache on hosted runners.
+      - "/Users/runner/hostedtoolcache/node/"
       - "~/.nvm/"
       - "~/.volta/"
       - "~/.fnm/"
@@ -164,12 +174,11 @@ profiles:
 
   rust:
     allowWrite:
-      - "$PWD/"
+      - "$PWD/target/"
+      - "$PWD/Cargo.lock"
       - "~/.cargo/registry/"
       - "~/.cargo/git/"
       # NOTE: ~/.cargo/bin/ is NOT writable — prevents trojaning cargo binaries
-      - "~/.rustup/"
-      - "~/Library/Caches/cargo-zigbuild/"
       - "~/.cache/zig/"
     allowDomains:
       - "crates.io"
@@ -208,23 +217,21 @@ profiles:
 
   python:
     allowWrite:
-      - "$PWD/"
+      - "$PWD/uv.lock"
+      - "$PWD/poetry.lock"
+      - "$PWD/pdm.lock"
       - "~/.cache/pip/"
       - "~/.cache/uv/"
       - "~/.local/lib/"
       # NOTE: ~/.local/bin/ is NOT writable — prevents trojaning user binaries
       - "$PWD/.venv/"
       - "$PWD/venv/"
-      # uv Python version downloads and tool installs
-      - "~/.local/share/uv/"
       # Poetry cache
       - "~/Library/Caches/pypoetry/"
       - "~/.cache/pypoetry/"
       # PDM cache
       - "~/.local/share/pdm/"
       - "~/Library/Caches/pdm/"
-      # Rye
-      - "~/.rye/"
     allowDomains:
       - "pypi.org"
       - "files.pythonhosted.org"
@@ -239,6 +246,10 @@ profiles:
       - "/usr/local/bin/python3"
       - "/usr/local/bin/pip3"
       - "/usr/local/bin/uv"
+      # actions/setup-python uses a fixed, non-relocatable macOS toolcache.
+      - "/Users/runner/hostedtoolcache/Python/"
+      # Toolcache launchers resolve into this fixed framework installation.
+      - "/Library/Frameworks/Python.framework/Versions/"
       # Version managers
       - "~/.pyenv/"
       - "~/.local/bin/"
@@ -246,15 +257,14 @@ profiles:
       - "~/.local/share/uv/"
       # Rye-managed Python
       - "~/.rye/"
-      # Virtual env binaries within project
-      - "$PWD/.venv/"
-      - "$PWD/venv/"
       # mise (polyglot version manager)
       - "~/.local/share/mise/"
 
   elixir:
     allowWrite:
-      - "$PWD/"
+      - "$PWD/deps/"
+      - "$PWD/_build/"
+      - "$PWD/mix.lock"
       - "~/.hex/"
       - "~/.mix/"
       - "~/.cache/rebar3/"
@@ -287,41 +297,22 @@ profiles:
       - "/usr/local/Cellar/erlang/"
       - "/usr/local/opt/elixir/"
       - "/usr/local/opt/erlang/"
-      # rebar3 downloads and runs plugins
-      - "~/.cache/rebar3/"
       # Version managers
       - "~/.asdf/"
       - "~/.kiex/"
       - "~/.local/share/mise/"
 
   java:
-    # JVM HTTP clients (Maven, Gradle, sbt's resolver) do NOT honour the
-    # standard HTTP_PROXY / HTTPS_PROXY env vars. With `enableProxy: true`
-    # SBPL would pin egress to `localhost:<proxy>` only, and the JVM's
-    # direct HTTPS to repo.maven.apache.org would be denied. Keep the
-    # proxy off so SBPL falls back to `(remote tcp "*:443")` — kernel
-    # allows HTTPS to any host on port 443, no domain filtering at the
-    # proxy layer. Linux's java profile uses the identical setting; the
-    # behaviour is consistent across platforms.
-    enableProxy: false
+    # SBE injects authenticated JVM proxy properties after allocating the
+    # per-run proxy port, so Maven/sbt HTTPS stays on the exact proxy route.
+    enableProxy: true
     allowWrite:
-      - "$PWD/"
       - "~/.m2/repository/"
-      - "~/.gradle/caches/"
-      - "~/.gradle/wrapper/"
-      - "~/.gradle/daemon/"
-      - "~/.gradle/native/"
-      - "~/.gradle/.tmp/"
-      - "~/.gradle/notifications/"
       - "$PWD/.gradle/"
       - "$PWD/build/"
       - "$PWD/target/"
       # Scala / sbt
-      - "~/.sbt/"
-      - "~/.ivy2/"
       # Coursier (Scala dependency manager)
-      - "~/.cache/coursier/"
-      - "~/Library/Caches/Coursier/"
     allowDomains:
       - "repo1.maven.org"
       - "repo.maven.apache.org"
@@ -343,6 +334,8 @@ profiles:
       - "/usr/libexec/java_home"
       - "/opt/homebrew/opt/openjdk/"
       - "/Library/Java/JavaVirtualMachines/"
+      # actions/setup-java installs Temurin distributions here on hosted runners.
+      - "/Users/runner/hostedtoolcache/Java_Temurin-Hotspot_jdk/"
       - "~/.sdkman/"
       # Gradle wrapper and daemon
       - "~/.gradle/"

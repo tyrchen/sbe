@@ -44,7 +44,10 @@ impl MacosSandbox {
                 fs_read: true,
                 exec_allowlist: true,
                 net_port_filter: true,
-                audit_stream: true,
+                // Modern macOS does not guarantee that Seatbelt denials are
+                // emitted to a process-correlatable public log stream. Merely
+                // finding `/usr/bin/log` is not evidence of that capability.
+                audit_stream: false,
             },
         };
         Ok(Self { info })
@@ -60,7 +63,11 @@ impl SandboxBackend for MacosSandbox {
         &self.info
     }
 
-    fn render_policy(&self, profile: &SandboxProfile, proxy_port: Option<u16>) -> String {
+    fn render_policy(
+        &self,
+        profile: &SandboxProfile,
+        proxy_port: Option<u16>,
+    ) -> Result<String, CoreError> {
         sbpl::generate(profile, proxy_port)
     }
 
@@ -70,8 +77,9 @@ impl SandboxBackend for MacosSandbox {
         proxy_port: Option<u16>,
         command: &[String],
         extra_env: &HashMap<String, String>,
+        pid_tx: Option<tokio::sync::oneshot::Sender<u32>>,
     ) -> impl std::future::Future<Output = Result<ExitStatus, CoreError>> + Send {
-        exec::run_sandboxed(profile, proxy_port, command, extra_env)
+        exec::run_sandboxed(profile, proxy_port, command, extra_env, pid_tx)
     }
 }
 

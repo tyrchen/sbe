@@ -14,6 +14,11 @@ pub enum CoreError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    /// A syntactically valid configuration violates SBE's trust or size
+    /// policy.
+    #[error("configuration policy rejected {path}: {reason}")]
+    ConfigPolicy { path: PathBuf, reason: String },
+
     /// An extended profile references a base that does not exist.
     #[error("profile '{child}' extends unknown profile '{base}'")]
     UnknownBaseProfile { child: String, base: String },
@@ -29,13 +34,10 @@ pub enum CoreError {
     #[error("sandbox backend unavailable: {reason}")]
     BackendUnavailable { reason: String },
 
-    /// The requested profile cannot be enforced on the current kernel and
-    /// `allowDegraded` was not set. Includes the missing capability name so
-    /// the user can either upgrade or opt-in.
-    #[error(
-        "sandbox backend cannot enforce '{capability}' on this kernel (use --allow-degraded to \
-         proceed without it): {detail}"
-    )]
+    /// The requested profile cannot be enforced on the current kernel.
+    /// `detail` names any narrowly scoped compatibility option, when one is
+    /// safe and available; there is no general-purpose degradation bypass.
+    #[error("sandbox backend cannot enforce '{capability}' on this kernel: {detail}")]
     BackendDegraded {
         capability: &'static str,
         detail: String,
