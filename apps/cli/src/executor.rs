@@ -677,6 +677,7 @@ fn is_sensitive_environment_name(name: &str) -> bool {
         "UV_CONFIG_FILE",
         "UV_DEFAULT_INDEX",
         "UV_EXTRA_INDEX_URL",
+        "UV_INDEX",
         "UV_INDEX_URL",
     ];
     const RESERVED: &[&str] = &[
@@ -833,6 +834,9 @@ fn apply_standard_profile(
                 conventional,
                 SandboxPath::dir(cache.selected.clone()),
             );
+        }
+        for config in cache.config_reads {
+            insert_builtin_path_grant(profile, GrantKind::AllowRead, SandboxPath::file(config));
         }
     }
     if profile.name == "python" && command_uses_pip(command) {
@@ -1375,6 +1379,7 @@ struct CacheReplacement {
     conventional: Vec<PathBuf>,
     selected: PathBuf,
     project_controlled: bool,
+    config_reads: Vec<PathBuf>,
 }
 
 fn effective_python_cache(
@@ -1402,29 +1407,25 @@ fn effective_python_cache(
     } else {
         None
     };
-    let (config_cache, config_project_controlled) = if command_cache.is_none()
+    let (config_cache, config_project_controlled, config_reads) = if command_cache.is_none()
         && environment_cache.is_none()
         && default_name == "pip"
     {
         (
             effective_pip_config_cache(profile, home, project_dir)?,
             false,
+            Vec::new(),
         )
     } else if command_cache.is_none() && environment_cache.is_none() && default_name == "pypoetry" {
-        effective_poetry_config_cache(profile, home, project_dir)?
+        let (cache, project_controlled) =
+            effective_poetry_config_cache(profile, home, project_dir)?;
+        (cache, project_controlled, Vec::new())
+    } else if command_cache.is_none() && environment_cache.is_none() && default_name == "uv" {
+        effective_uv_config_cache(profile, command, home, project_dir)?
     } else {
-        (None, false)
+        (None, false, Vec::new())
     };
-    let project_cache = if command_cache.is_none()
-        && environment_cache.is_none()
-        && config_cache.is_none()
-        && default_name == "uv"
-    {
-        effective_project_uv_cache(project_dir)?
-    } else {
-        None
-    };
-    let project_controlled = config_project_controlled || project_cache.is_some();
+    let project_controlled = config_project_controlled;
     let conventional = conventional_python_caches(home, default_name);
     let default_cache = effective_environment_path(profile, "XDG_CACHE_HOME")
         .map(|directory| directory.join(default_name))
@@ -1432,7 +1433,6 @@ fn effective_python_cache(
     let selected = command_cache
         .or(environment_cache)
         .or(config_cache)
-        .or(project_cache)
         .unwrap_or(default_cache);
     if selected.as_os_str().is_empty() {
         anyhow::bail!("{environment_name} must select a non-empty path");
@@ -1445,6 +1445,7 @@ fn effective_python_cache(
             project_dir.join(selected)
         },
         project_controlled,
+        config_reads,
     }))
 }
 
@@ -1464,6 +1465,56 @@ fn conventional_coursier_caches(home: &Path) -> Vec<PathBuf> {
     #[cfg(not(target_os = "macos"))]
     let paths = vec![xdg];
     paths
+}
+
+fn effective_uv_config_cache(
+    profile: &SandboxProfile,
+    command: &[String],
+    home: &Path,
+    project_dir: &Path,
+) -> anyhow::Result<(Option<PathBuf>, bool, Vec<PathBuf>)> {
+    let explicit = command_long_path_option(command, "--config-file")?
+        .or_else(|| profile.env.get("UV_CONFIG_FILE").map(PathBuf::from));
+    if let Some(path) = explicit {
+        let path = anchor_project_path(path, project_dir);
+        let Some(contents) = read_bounded_following_metadata_file(&path)? else {
+            anyhow::bail!(
+                "could not inspect explicit uv configuration: {}",
+                path.display()
+            );
+        };
+        let cache = uv_config_cache_path(&contents, &path, false)?;
+        return Ok((cache, false, vec![path]));
+    }
+
+    let no_config = command
+        .iter()
+        .skip(1)
+        .take_while(|argument| argument.as_str() != "--")
+        .any(|argument| argument == "--no-config")
+        || profile.env.contains_key("UV_NO_CONFIG")
+        || std::env::var_os("UV_NO_CONFIG").is_some();
+    if no_config {
+        return Ok((None, false, Vec::new()));
+    }
+
+    let user_config_root = effective_environment_path(profile, "XDG_CONFIG_HOME")
+        .map(|path| anchor_project_path(path, project_dir))
+        .unwrap_or_else(|| home.join(".config"));
+    let user_config = user_config_root.join("uv/uv.toml");
+    let mut reads = Vec::new();
+    let mut selected = if let Some(contents) = read_bounded_following_metadata_file(&user_config)? {
+        reads.push(user_config.clone());
+        uv_config_cache_path(&contents, &user_config, false)?
+    } else {
+        None
+    };
+
+    if let Some(project_cache) = effective_project_uv_cache(project_dir)? {
+        selected = Some(project_cache);
+        return Ok((selected, true, reads));
+    }
+    Ok((selected, false, reads))
 }
 
 fn effective_project_uv_cache(project_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
@@ -4910,6 +4961,10 @@ mod tests {
                     "https://user:sentinel@example.net/simple".to_owned(),
                 ),
                 (
+                    "UV_INDEX".to_owned(),
+                    "https://user:sentinel@example.edu/simple".to_owned(),
+                ),
+                (
                     "UV_DEFAULT_INDEX".to_owned(),
                     "https://user:sentinel@example.org/simple".to_owned(),
                 ),
@@ -5456,6 +5511,67 @@ mod tests {
             uv_command
                 .allow_write
                 .contains(&SandboxPath::dir(project.join("relative-uv-cache")))
+        );
+
+        let uv_user_config_root = root.path().join("uv-user-config");
+        let uv_user_cache = root.path().join("uv-user-cache");
+        std::fs::create_dir_all(uv_user_config_root.join("uv")).unwrap();
+        std::fs::write(
+            uv_user_config_root.join("uv/uv.toml"),
+            format!("cache-dir = '{}'\n", uv_user_cache.display()),
+        )
+        .unwrap();
+        let mut uv_user_config = SandboxProfile::for_ecosystem(Ecosystem::Python, &home, &project);
+        uv_user_config.env.insert(
+            "XDG_CONFIG_HOME".to_owned(),
+            uv_user_config_root.to_string_lossy().into_owned(),
+        );
+        apply_standard_profile(
+            &mut uv_user_config,
+            &["uv".to_owned(), "sync".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap();
+        assert!(
+            uv_user_config
+                .allow_write
+                .contains(&SandboxPath::dir(uv_user_cache))
+        );
+        assert!(
+            uv_user_config
+                .allow_read
+                .contains(&SandboxPath::file(uv_user_config_root.join("uv/uv.toml")))
+        );
+
+        let explicit_uv_config = root.path().join("explicit-uv.toml");
+        let explicit_uv_cache = root.path().join("explicit-uv-cache");
+        std::fs::write(
+            &explicit_uv_config,
+            format!("cache-dir = '{}'\n", explicit_uv_cache.display()),
+        )
+        .unwrap();
+        let mut uv_explicit = SandboxProfile::for_ecosystem(Ecosystem::Python, &home, &project);
+        uv_explicit.env.insert(
+            "UV_CONFIG_FILE".to_owned(),
+            explicit_uv_config.to_string_lossy().into_owned(),
+        );
+        apply_standard_profile(
+            &mut uv_explicit,
+            &["uv".to_owned(), "sync".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap();
+        assert!(
+            uv_explicit
+                .allow_write
+                .contains(&SandboxPath::dir(explicit_uv_cache))
+        );
+        assert!(
+            uv_explicit
+                .allow_read
+                .contains(&SandboxPath::file(explicit_uv_config))
         );
 
         let project_uv_cache = root.path().join("project-uv-cache");

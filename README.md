@@ -227,13 +227,15 @@ external project-selected cache/store requires explicit `--allow-write`
 approval.
 For uv and pip, command `--cache-dir` overrides `UV_CACHE_DIR` or
 `PIP_CACHE_DIR`. uv then reads project `uv.toml`, or `[tool.uv]` in
-`pyproject.toml` when no `uv.toml` exists; an external project-selected cache
-requires explicit `--allow-write` approval. pip reads its legacy/current user
-configuration for `cache-dir`; each effective existing user configuration file
-receives an exact read grant. The XDG or conventional platform cache is the
-final fallback, and the effective cache replaces only that tool's default
-writable grant. Without overrides, macOS uses `~/Library/Caches/{pip,uv}` and
-Linux uses the XDG cache home.
+`pyproject.toml` when no `uv.toml` exists, followed by its XDG user `uv.toml`.
+An explicit `--config-file` or restored `UV_CONFIG_FILE` replaces discovery.
+Selected user/explicit files receive exact read grants; an external
+project-selected cache requires explicit `--allow-write` approval. pip reads
+its legacy/current user configuration for `cache-dir`; each effective existing
+user configuration file receives an exact read grant. The XDG or conventional
+platform cache is the final fallback, and the effective cache replaces only
+that tool's default writable grant. Without overrides, macOS uses
+`~/Library/Caches/{pip,uv}` and Linux uses the XDG cache home.
 Poetry similarly follows command `--cache-dir`, `POETRY_CACHE_DIR`, project
 `poetry.toml`, global `config.toml`, then `XDG_CACHE_HOME`. Its effective global
 configuration receives an exact read grant, while an external project-selected

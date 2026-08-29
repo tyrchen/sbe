@@ -152,6 +152,8 @@ All notable changes to this project will be documented in this file. See [conven
   conventional Coursier cache grants with an inherited `COURSIER_CACHE`.
 - Filter credential-bearing pip/uv index URLs and Git global/system
   configuration locators from ambient standard-mode inheritance.
+- Filter the credential-bearing `UV_INDEX` input and resolve cache directories
+  from explicit, project, and XDG user uv configuration with exact file grants.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23
