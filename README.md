@@ -217,6 +217,9 @@ For pnpm, `--store-dir`, its configuration environment, project `.npmrc`, and
 user `.npmrc` similarly select the store. Relative paths are anchored to the
 selected project. An external project-selected cache/store requires explicit
 `--allow-write` approval.
+For uv and pip, command `--cache-dir` overrides `UV_CACHE_DIR` or
+`PIP_CACHE_DIR`, then `XDG_CACHE_HOME` and the conventional cache. The effective
+cache replaces only that tool's default writable grant.
 An external Cargo target can be selected with an inherited `CARGO_TARGET_DIR`
 or a direct `--config build.target-dir='path'` override, or granted explicitly
 with matching `--allow-write` and `--allow-exec` paths. Cargo `--config` file

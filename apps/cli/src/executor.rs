@@ -658,6 +658,7 @@ fn is_sensitive_environment_name(name: &str) -> bool {
         "PASSWD",
         "PGPASSFILE",
         "PGPASSWORD",
+        "PIP_CONFIG_FILE",
         "PRIVATE_KEY",
         "REDISCLI_AUTH",
         "SECRET",
@@ -665,6 +666,7 @@ fn is_sensitive_environment_name(name: &str) -> bool {
         "SSH_AUTH_SOCK",
         "SYSTEM_ACCESSTOKEN",
         "TOKEN",
+        "UV_CONFIG_FILE",
     ];
     const RESERVED: &[&str] = &[
         "HTTP_PROXY",
@@ -782,6 +784,13 @@ fn apply_standard_profile(
             return Err(external_write_approval_error(&pnpm_store.path, &resolved));
         }
         replace_builtin_write_path(profile, &conventional, SandboxPath::dir(pnpm_store.path));
+    }
+    if let Some(cache) = effective_python_cache(profile, command, home, project_dir)? {
+        replace_builtin_write_path(
+            profile,
+            &cache.conventional,
+            SandboxPath::dir(cache.selected),
+        );
     }
 
     if profile.name == "java" {
@@ -1185,6 +1194,90 @@ fn effective_pnpm_store(
         },
         project_controlled,
     }))
+}
+
+struct CacheReplacement {
+    conventional: PathBuf,
+    selected: PathBuf,
+}
+
+fn effective_python_cache(
+    profile: &SandboxProfile,
+    command: &[String],
+    home: &Path,
+    project_dir: &Path,
+) -> anyhow::Result<Option<CacheReplacement>> {
+    if profile.name != "python" {
+        return Ok(None);
+    }
+    let (environment_name, default_name) =
+        if command_is(command, "uv") || command_is(command, "uvx") {
+            ("UV_CACHE_DIR", "uv")
+        } else if command_uses_pip(command) {
+            ("PIP_CACHE_DIR", "pip")
+        } else {
+            return Ok(None);
+        };
+    let command_cache = command_long_path_option(command, "--cache-dir")?;
+    let environment_cache = if command_cache.is_none() {
+        effective_environment_path(profile, environment_name)
+    } else {
+        None
+    };
+    let conventional = home.join(".cache").join(default_name);
+    let default_cache = effective_environment_path(profile, "XDG_CACHE_HOME")
+        .map(|directory| directory.join(default_name))
+        .unwrap_or_else(|| conventional.clone());
+    let selected = command_cache.or(environment_cache).unwrap_or(default_cache);
+    if selected.as_os_str().is_empty() {
+        anyhow::bail!("{environment_name} must select a non-empty path");
+    }
+    Ok(Some(CacheReplacement {
+        conventional,
+        selected: if selected.is_absolute() {
+            selected
+        } else {
+            project_dir.join(selected)
+        },
+    }))
+}
+
+fn command_long_path_option(command: &[String], option: &str) -> anyhow::Result<Option<PathBuf>> {
+    let mut selected = None;
+    let mut arguments = command
+        .iter()
+        .skip(1)
+        .take_while(|argument| argument.as_str() != "--");
+    while let Some(argument) = arguments.next() {
+        let value = if argument == option {
+            Some(
+                arguments
+                    .next()
+                    .map(String::as_str)
+                    .with_context(|| format!("{option} requires a value"))?,
+            )
+        } else {
+            argument
+                .strip_prefix(option)
+                .and_then(|suffix| suffix.strip_prefix('='))
+        };
+        if let Some(value) = value {
+            if value.is_empty() || value.chars().any(char::is_control) {
+                anyhow::bail!("{option} must select a non-empty unambiguous path");
+            }
+            selected = Some(PathBuf::from(value));
+        }
+    }
+    Ok(selected)
+}
+
+fn command_uses_pip(command: &[String]) -> bool {
+    command_is(command, "pip")
+        || command_is(command, "pip3")
+        || ((command_is(command, "python") || command_is(command, "python3"))
+            && command
+                .windows(2)
+                .any(|arguments| arguments[0] == "-m" && arguments[1] == "pip"))
 }
 
 fn project_cache_is_approved(
@@ -4260,6 +4353,14 @@ mod tests {
                     "/tmp/custom-npmrc".to_owned(),
                 ),
                 ("NETRC".to_owned(), "/tmp/custom-netrc".to_owned()),
+                (
+                    "PIP_CONFIG_FILE".to_owned(),
+                    "/tmp/custom-pip.conf".to_owned(),
+                ),
+                (
+                    "UV_CONFIG_FILE".to_owned(),
+                    "/tmp/custom-uv.toml".to_owned(),
+                ),
                 ("KRB5CCNAME".to_owned(), "FILE:/tmp/krb5cc".to_owned()),
                 (
                     "KRB5_CLIENT_KTNAME".to_owned(),
@@ -4576,6 +4677,93 @@ mod tests {
                 .iter()
                 .any(|allowed| paths_overlap(&allowed.path, &output)),
             "an inferred output grant must not override an explicit execute denial"
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the unit test creates isolated Python home and project fixtures"
+    )]
+    fn standard_python_profile_uses_the_effective_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+
+        let uv_environment_cache = root.path().join("uv-environment-cache");
+        let mut uv_environment = SandboxProfile::for_ecosystem(Ecosystem::Python, &home, &project);
+        uv_environment.env.insert(
+            "UV_CACHE_DIR".to_owned(),
+            uv_environment_cache.to_string_lossy().into_owned(),
+        );
+        apply_standard_profile(
+            &mut uv_environment,
+            &["uv".to_owned(), "sync".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap();
+        assert!(
+            uv_environment
+                .allow_write
+                .contains(&SandboxPath::dir(uv_environment_cache))
+        );
+        assert!(
+            !uv_environment
+                .allow_write
+                .contains(&SandboxPath::dir(home.join(".cache/uv")))
+        );
+
+        let mut uv_command = SandboxProfile::for_ecosystem(Ecosystem::Python, &home, &project);
+        uv_command.env.insert(
+            "UV_CACHE_DIR".to_owned(),
+            root.path()
+                .join("ignored-uv-cache")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        apply_standard_profile(
+            &mut uv_command,
+            &[
+                "uv".to_owned(),
+                "sync".to_owned(),
+                "--cache-dir=relative-uv-cache".to_owned(),
+            ],
+            &home,
+            &project,
+        )
+        .unwrap();
+        assert!(
+            uv_command
+                .allow_write
+                .contains(&SandboxPath::dir(project.join("relative-uv-cache")))
+        );
+
+        let pip_cache = root.path().join("pip-environment-cache");
+        let mut pip = SandboxProfile::for_ecosystem(Ecosystem::Python, &home, &project);
+        pip.env.insert(
+            "PIP_CACHE_DIR".to_owned(),
+            pip_cache.to_string_lossy().into_owned(),
+        );
+        apply_standard_profile(
+            &mut pip,
+            &[
+                "python".to_owned(),
+                "-m".to_owned(),
+                "pip".to_owned(),
+                "install".to_owned(),
+                "build".to_owned(),
+            ],
+            &home,
+            &project,
+        )
+        .unwrap();
+        assert!(pip.allow_write.contains(&SandboxPath::dir(pip_cache)));
+        assert!(
+            !pip.allow_write
+                .contains(&SandboxPath::dir(home.join(".cache/pip")))
         );
     }
 

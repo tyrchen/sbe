@@ -244,6 +244,10 @@ pnpm's `--store-dir`, configuration environment, project `.npmrc`, and user
 the corresponding default writable grant; relative paths are anchored to the
 command project. A repository-selected external path requires `--allow-write`.
 
+For uv and pip commands, `--cache-dir` overrides the corresponding
+`UV_CACHE_DIR` or `PIP_CACHE_DIR`, followed by `XDG_CACHE_HOME` and the
+conventional cache. The selected cache replaces only that tool's default grant.
+
 For Gradle commands, the conventional cache grant follows Gradle's effective
 user home: `--gradle-user-home`, every accepted `-g` form including `-g/path`,
 inherited `GRADLE_USER_HOME`, then `~/.gradle`. Relative selections are anchored
@@ -474,6 +478,8 @@ feature switches, terminal settings, and tool paths. It removes:
   withheld because they commonly contain registry authentication tokens, as
   are Kerberos ticket-cache/keytab locators `KRB5CCNAME`, `KRB5_KTNAME`, and
   `KRB5_CLIENT_KTNAME`, plus the custom netrc locator `NETRC`;
+- Python package configuration locators `PIP_CONFIG_FILE` and
+  `UV_CONFIG_FILE`, because those files can contain authenticated indexes;
 - agent and credential socket variables;
 - dynamic-loader injection variables; and
 - SBE-reserved proxy, runtime, and policy variables.
