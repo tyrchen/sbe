@@ -625,7 +625,34 @@ fn apply_standard_profile(
         .into_iter()
         .filter(|output| resolves_within(output, project_dir))
     {
+        // The Linux backend must open an executable directory before it
+        // installs Landlock. Keep the narrower write grant alongside the
+        // workspace grant so a missing output root is created safely before
+        // its execute rule is compiled.
+        insert_builtin_path_grant(
+            profile,
+            GrantKind::AllowWrite,
+            SandboxPath::dir(output.clone()),
+        );
         insert_builtin_path_grant(profile, GrantKind::AllowExec, SandboxPath::dir(output));
+    }
+
+    if profile.name == "java" {
+        // Standard mode uses the package manager's ordinary persistent
+        // caches. Strict mode redirects these into the private runtime root.
+        for cache in [
+            home.join(".sbt"),
+            home.join(".ivy2/cache"),
+            home.join(".cache/coursier"),
+        ] {
+            insert_builtin_path_grant(profile, GrantKind::AllowWrite, SandboxPath::dir(cache));
+        }
+        #[cfg(target_os = "macos")]
+        insert_builtin_path_grant(
+            profile,
+            GrantKind::AllowWrite,
+            SandboxPath::dir(home.join("Library/Caches/Coursier")),
+        );
     }
 
     for name in ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"] {
@@ -2271,6 +2298,11 @@ mod tests {
                 .allow_exec
                 .contains(&SandboxPath::dir(project.path().join("target")))
         );
+        assert!(
+            profile
+                .allow_write
+                .contains(&SandboxPath::dir(project.path().join("target")))
+        );
         assert!(!profile.deny_read.iter().any(|grant| {
             grant.path.parent() == Some(project.path())
                 && grant.path.file_name().is_some_and(|name| name == ".env")
@@ -2353,6 +2385,30 @@ mod tests {
         );
 
         assert!(profile.deny_read.contains(&SandboxPath::file(denied)));
+    }
+
+    #[test]
+    fn standard_java_profile_uses_normal_persistent_caches() {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mut profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Java, home.path(), project.path());
+
+        apply_standard_profile(
+            &mut profile,
+            &["sbt".to_owned(), "compile".to_owned()],
+            home.path(),
+            project.path(),
+        );
+
+        for cache in [".sbt", ".ivy2/cache", ".cache/coursier"] {
+            assert!(
+                profile
+                    .allow_write
+                    .contains(&SandboxPath::dir(home.path().join(cache))),
+                "missing standard cache grant for {cache}"
+            );
+        }
     }
 
     #[test]

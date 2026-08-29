@@ -315,7 +315,8 @@ profiles:
       - "$PWD/build/"
       - "$PWD/target/"
       # Scala / sbt
-      # Coursier (Scala dependency manager)
+      # Standard mode grants the ordinary persistent caches at runtime. Strict
+      # mode redirects sbt, Ivy, and Coursier state into SBE's private root.
     allowDomains:
       - "repo1.maven.org"
       - "repo.maven.apache.org"

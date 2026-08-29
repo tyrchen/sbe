@@ -16,6 +16,8 @@ All notable changes to this project will be documented in this file. See [conven
 - Treat the selected workspace as readable input in standard mode, including
   `.env*`, so Linux can support general file creation without reimplementing
   each package manager; strict mode retains project secret-file denials.
+- Keep executable output roots installable before Linux Landlock enforcement
+  and let standard sbt builds use their ordinary persistent package caches.
 - Support globally configured sccache through ordinary executable/cache grants
   and local IPC; no sccache source or managed adapter is shipped by SBE.
 - Follow pre-existing tool and cache symlinks in standard mode while retaining
