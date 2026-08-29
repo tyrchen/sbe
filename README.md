@@ -239,6 +239,9 @@ Poetry similarly follows command `--cache-dir`, `POETRY_CACHE_DIR`, project
 configuration receives an exact read grant, while an external project-selected
 cache requires `--allow-write`. The selected `pypoetry` cache replaces both
 conventional macOS-compatible cache grants.
+Java/sbt commands likewise follow an inherited `COURSIER_CACHE`, replacing the
+conventional Coursier cache grants; relative paths are anchored to the selected
+project.
 An external Cargo target can be selected with an inherited `CARGO_TARGET_DIR`
 or a direct `--config build.target-dir='path'` override, or granted explicitly
 with matching `--allow-write` and `--allow-exec` paths. Cargo `--config` file

@@ -280,6 +280,10 @@ user home; its root and `init.d` remain immutable. The effective user-home root
 is readable so Gradle can load root-level properties, initialization scripts,
 and wrapper metadata without making those persistence-capable files writable.
 
+The standard Java profile follows an inherited `COURSIER_CACHE` and replaces
+its conventional writable cache grants. Relative selections are anchored to
+the command project.
+
 For Maven commands, `-D`/`--define maven.repo.local=path` on the actual command
 selects the writable local repository, followed in precedence by `MAVEN_ARGS`,
 project `.mvn/maven.config`, `MAVEN_OPTS`, project `.mvn/jvm.config`, and the
@@ -507,6 +511,9 @@ feature switches, terminal settings, and tool paths. It removes:
 - Python package configuration locators `PIP_CONFIG_FILE` and
   `UV_CONFIG_FILE`, and Poetry's `POETRY_CONFIG_DIR`, because those files or
   directories can contain authenticated indexes;
+- Git's environment-backed configuration transports `GIT_CONFIG_COUNT`,
+  `GIT_CONFIG_KEY_*`, `GIT_CONFIG_VALUE_*`, and `GIT_CONFIG_PARAMETERS`, because
+  they can carry authorization headers and other credentials directly;
 - agent and credential socket variables;
 - dynamic-loader injection variables; and
 - SBE-reserved proxy, runtime, and policy variables.

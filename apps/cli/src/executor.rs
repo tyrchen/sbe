@@ -643,6 +643,8 @@ fn is_sensitive_environment_name(name: &str) -> bool {
         "DOCKER_CONFIG",
         "GPG_AGENT_INFO",
         "GH_CONFIG_DIR",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
         "GNUPGHOME",
         "GOOGLE_APPLICATION_CREDENTIALS",
         "KUBECONFIG",
@@ -685,6 +687,8 @@ fn is_sensitive_environment_name(name: &str) -> bool {
     EXACT.contains(&upper.as_str())
         || RESERVED.contains(&upper.as_str())
         || upper.starts_with("DYLD_")
+        || upper.starts_with("GIT_CONFIG_KEY_")
+        || upper.starts_with("GIT_CONFIG_VALUE_")
         || upper.starts_with("TF_TOKEN_")
         || upper == "LD_PRELOAD"
         || upper == "LD_LIBRARY_PATH"
@@ -862,19 +866,25 @@ fn apply_standard_profile(
         }
         // Standard mode uses the package manager's ordinary persistent
         // caches. Strict mode redirects these into the private runtime root.
-        for cache in [
-            home.join(".sbt/boot"),
-            home.join(".ivy2/cache"),
-            home.join(".cache/coursier"),
-        ] {
+        for cache in [home.join(".sbt/boot"), home.join(".ivy2/cache")] {
             insert_builtin_path_grant(profile, GrantKind::AllowWrite, SandboxPath::dir(cache));
         }
-        #[cfg(target_os = "macos")]
-        insert_builtin_path_grant(
-            profile,
-            GrantKind::AllowWrite,
-            SandboxPath::dir(home.join("Library/Caches/Coursier")),
-        );
+        let selected_coursier = effective_environment_path(profile, "COURSIER_CACHE")
+            .map(|path| anchor_project_path(path, project_dir));
+        for conventional in conventional_coursier_caches(home) {
+            insert_builtin_path_grant(
+                profile,
+                GrantKind::AllowWrite,
+                SandboxPath::dir(conventional.clone()),
+            );
+            if let Some(selected) = &selected_coursier {
+                replace_builtin_write_path(
+                    profile,
+                    &conventional,
+                    SandboxPath::dir(selected.clone()),
+                );
+            }
+        }
 
         if let Some(gradle_home) = effective_gradle_user_home(profile, command, home, project_dir)?
         {
@@ -1438,6 +1448,15 @@ fn conventional_python_caches(home: &Path, name: &str) -> Vec<PathBuf> {
         return vec![xdg, home.join("Library/Caches/pypoetry")];
     }
     vec![xdg]
+}
+
+fn conventional_coursier_caches(home: &Path) -> Vec<PathBuf> {
+    let xdg = home.join(".cache/coursier");
+    #[cfg(target_os = "macos")]
+    let paths = vec![xdg, home.join("Library/Caches/Coursier")];
+    #[cfg(not(target_os = "macos"))]
+    let paths = vec![xdg];
+    paths
 }
 
 fn effective_project_uv_cache(project_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
@@ -4801,6 +4820,16 @@ mod tests {
                 ),
                 ("CI_JOB_JWT".to_owned(), "sentinel".to_owned()),
                 ("CI_JOB_JWT_V2".to_owned(), "sentinel".to_owned()),
+                ("GIT_CONFIG_COUNT".to_owned(), "1".to_owned()),
+                (
+                    "GIT_CONFIG_KEY_0".to_owned(),
+                    "http.https://example.com.extraHeader".to_owned(),
+                ),
+                ("GIT_CONFIG_VALUE_0".to_owned(), "sentinel".to_owned()),
+                (
+                    "GIT_CONFIG_PARAMETERS".to_owned(),
+                    "'http.extraHeader=Authorization: sentinel'".to_owned(),
+                ),
                 (
                     "AWS_SHARED_CREDENTIALS_FILE".to_owned(),
                     "/tmp/aws-credentials".to_owned(),
@@ -6203,6 +6232,33 @@ mod tests {
                 .contains(&SandboxPath::dir(home.path().join(".sbt"))),
             "the sbt global plugin/settings root must remain non-writable"
         );
+
+        let selected_coursier = runtime.path().join("selected-coursier");
+        let mut coursier_profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Java, home.path(), project.path());
+        coursier_profile.env.insert(
+            "COURSIER_CACHE".to_owned(),
+            selected_coursier.to_string_lossy().into_owned(),
+        );
+        apply_standard_profile(
+            &mut coursier_profile,
+            &["sbt".to_owned(), "compile".to_owned()],
+            home.path(),
+            project.path(),
+        )
+        .unwrap();
+        assert!(
+            coursier_profile
+                .allow_write
+                .contains(&SandboxPath::dir(selected_coursier))
+        );
+        for conventional in conventional_coursier_caches(home.path()) {
+            assert!(
+                !coursier_profile
+                    .allow_write
+                    .contains(&SandboxPath::dir(conventional))
+            );
+        }
 
         let environment = build_extra_env(
             &mut profile,

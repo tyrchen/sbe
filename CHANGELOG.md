@@ -148,6 +148,8 @@ All notable changes to this project will be documented in this file. See [conven
   global/project configured cache, and grant Gradle's selected project cache.
 - Accept both npm global-config environment spellings and resolve cache/store
   paths from the explicitly selected global npmrc after higher-priority layers.
+- Filter Git's environment-backed configuration transports and replace
+  conventional Coursier cache grants with an inherited `COURSIER_CACHE`.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23
