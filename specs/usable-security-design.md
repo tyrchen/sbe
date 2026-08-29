@@ -245,8 +245,11 @@ wrapper distributions, daemons, and toolchains are writable; the user-home root
 and `init.d` remain immutable.
 
 For Maven commands, `-D`/`--define maven.repo.local=path` selects the writable
-local repository and replaces the default `~/.m2/repository` write grant.
-Relative selections are anchored to the command project.
+local repository, followed in precedence by `MAVEN_OPTS`, project
+`.mvn/jvm.config`, and the default `~/.m2/repository`. Within JVM option sources
+the last property wins, matching Java. Relative selections are anchored to the
+command project; quoted, expanded, or otherwise ambiguous option values fail
+with guidance to use a direct unambiguous command property.
 
 It denies writes everywhere else. In particular, home-directory persistence,
 credentials, shell startup, SSH authorization, user service configuration, and

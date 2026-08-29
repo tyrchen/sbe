@@ -93,6 +93,9 @@ All notable changes to this project will be documented in this file. See [conven
   actionable `--target-dir` guidance.
 - Filter Docker client TLS-directory locators and derive Maven's writable local
   repository from the last `-D`/`--define maven.repo.local` property.
+- Resolve Maven repository overrides from `MAVEN_OPTS` and bounded, no-follow
+  project `.mvn/jvm.config` reads, preserving launcher and last-property
+  precedence while rejecting ambiguous option forms.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23

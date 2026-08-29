@@ -745,7 +745,9 @@ fn apply_standard_profile(
     }
 
     if profile.name == "java" {
-        if let Some(repository) = effective_maven_local_repository(command, home, project_dir)? {
+        if let Some(repository) =
+            effective_maven_local_repository(profile, command, home, project_dir)?
+        {
             replace_builtin_write_path(
                 profile,
                 &home.join(".m2/repository"),
@@ -901,6 +903,7 @@ fn effective_gradle_user_home(
 }
 
 fn effective_maven_local_repository(
+    profile: &SandboxProfile,
     command: &[String],
     home: &Path,
     project_dir: &Path,
@@ -908,13 +911,41 @@ fn effective_maven_local_repository(
     if !command_is(command, "mvn") && !command_is(command, "mvnw") {
         return Ok(None);
     }
-    let Some(value) = command_maven_property(command, "maven.repo.local") else {
+    let command_value = command_maven_property(command, "maven.repo.local").map(PathBuf::from);
+    let maven_opts_value = if command_value.is_none() {
+        let options = profile
+            .env
+            .get("MAVEN_OPTS")
+            .cloned()
+            .or_else(|| std::env::var("MAVEN_OPTS").ok());
+        options
+            .as_deref()
+            .map(|options| maven_options_local_repository(options, "MAVEN_OPTS"))
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    let project_value = if command_value.is_none() && maven_opts_value.is_none() {
+        let path = project_dir.join(".mvn/jvm.config");
+        read_bounded_project_file(&path)?
+            .map(|contents| {
+                let contents = std::str::from_utf8(&contents).with_context(|| {
+                    format!("Maven JVM config is not UTF-8: {}", path.display())
+                })?;
+                maven_options_local_repository(contents, ".mvn/jvm.config")
+            })
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    let Some(path) = command_value.or(maven_opts_value).or(project_value) else {
         return Ok(None);
     };
-    if value.is_empty() || value.chars().any(char::is_control) {
-        anyhow::bail!("maven.repo.local must be a non-empty path without control characters");
+    if path.as_os_str().is_empty() {
+        anyhow::bail!("maven.repo.local must be a non-empty path");
     }
-    let path = PathBuf::from(value);
     let path = if path.is_absolute() {
         path
     } else {
@@ -924,6 +955,33 @@ fn effective_maven_local_repository(
         return Ok(None);
     }
     Ok(Some(path))
+}
+
+fn maven_options_local_repository(options: &str, source: &str) -> anyhow::Result<Option<PathBuf>> {
+    let mut selected = None;
+    for token in options.split_whitespace() {
+        let Some(value) = token.strip_prefix("-Dmaven.repo.local=") else {
+            continue;
+        };
+        if value.is_empty()
+            || value.chars().any(|character| {
+                matches!(character, '$' | '`' | '\\' | '\'' | '"' | '*' | '?' | '[')
+            })
+        {
+            anyhow::bail!(
+                "{source} selects maven.repo.local in a form that sbe cannot resolve safely; use \
+                 -Dmaven.repo.local=/unambiguous/path"
+            );
+        }
+        selected = Some(PathBuf::from(value));
+    }
+    if selected.is_none() && options.contains("-Dmaven.repo.local") {
+        anyhow::bail!(
+            "{source} selects maven.repo.local in an unsupported form; use \
+             -Dmaven.repo.local=/unambiguous/path"
+        );
+    }
+    Ok(selected)
 }
 
 fn jvm_options_gradle_user_home(
@@ -3924,6 +3982,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the test creates an isolated Maven JVM configuration fixture"
+    )]
     async fn standard_java_profile_uses_normal_persistent_caches() {
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
@@ -4011,6 +4073,10 @@ mod tests {
 
         let custom_repository = tempfile::tempdir().unwrap();
         let mut maven = SandboxProfile::for_ecosystem(Ecosystem::Java, home.path(), project.path());
+        maven.env.insert(
+            "MAVEN_OPTS".to_owned(),
+            "-Dmaven.repo.local=/ignored-lower-precedence-repository".to_owned(),
+        );
         apply_standard_profile(
             &mut maven,
             &[
@@ -4032,6 +4098,61 @@ mod tests {
                 .allow_write
                 .contains(&SandboxPath::dir(home.path().join(".m2/repository"))),
             "the selected Maven repository must replace the default write grant"
+        );
+
+        let jvm_repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".mvn")).unwrap();
+        std::fs::write(
+            project.path().join(".mvn/jvm.config"),
+            format!("-Dmaven.repo.local={}\n", jvm_repository.path().display()),
+        )
+        .unwrap();
+        let mut jvm_config =
+            SandboxProfile::for_ecosystem(Ecosystem::Java, home.path(), project.path());
+        jvm_config
+            .env
+            .insert("MAVEN_OPTS".to_owned(), "-Xmx1g".to_owned());
+        apply_standard_profile(
+            &mut jvm_config,
+            &["mvn".to_owned(), "validate".to_owned()],
+            home.path(),
+            project.path(),
+        )
+        .unwrap();
+        assert!(
+            jvm_config
+                .allow_write
+                .contains(&SandboxPath::dir(jvm_repository.path().to_path_buf()))
+        );
+
+        let opts_repository = tempfile::tempdir().unwrap();
+        let mut maven_opts =
+            SandboxProfile::for_ecosystem(Ecosystem::Java, home.path(), project.path());
+        maven_opts.env.insert(
+            "MAVEN_OPTS".to_owned(),
+            format!(
+                "-Dmaven.repo.local={} -Dmaven.repo.local={}",
+                jvm_repository.path().display(),
+                opts_repository.path().display()
+            ),
+        );
+        apply_standard_profile(
+            &mut maven_opts,
+            &["mvn".to_owned(), "validate".to_owned()],
+            home.path(),
+            project.path(),
+        )
+        .unwrap();
+        assert!(
+            maven_opts
+                .allow_write
+                .contains(&SandboxPath::dir(opts_repository.path().to_path_buf()))
+        );
+        assert!(
+            !maven_opts
+                .allow_write
+                .contains(&SandboxPath::dir(jvm_repository.path().to_path_buf())),
+            "MAVEN_OPTS is appended after .mvn/jvm.config and its last property wins"
         );
     }
 
