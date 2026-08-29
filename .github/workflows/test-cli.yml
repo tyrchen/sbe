@@ -71,7 +71,7 @@ jobs:
       - name: sbe inspect renders deterministic policy (rust)
         run: |
           set -euo pipefail
-          out=$(sbe inspect -- cargo build 2>/dev/null)
+          out=$(sbe inspect -- cargo build 2>&1)
           test -n "$out"
           echo "$out" | head -40
           echo "$out" | grep -E "^securityMode: standard" >/dev/null

@@ -105,21 +105,13 @@ impl SandboxBackend for LinuxSandbox {
         pid_tx: Option<tokio::sync::oneshot::Sender<u32>>,
     ) -> impl std::future::Future<Output = Result<ExitStatus, CoreError>> + Send {
         let probe = self.probe.clone();
-        let options = self.options;
-        let security_mode = self.security_mode;
+        let options = exec::LauncherOptions::new(self.options, self.security_mode);
         let profile = profile.clone();
         let command = command.to_vec();
         let extra_env = extra_env.clone();
         async move {
             exec::run_sandboxed(
-                &profile,
-                proxy_port,
-                &command,
-                &extra_env,
-                &probe,
-                options,
-                security_mode,
-                pid_tx,
+                &profile, proxy_port, &command, &extra_env, &probe, options, pid_tx,
             )
             .await
         }

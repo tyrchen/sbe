@@ -44,8 +44,22 @@ struct LauncherPayload {
     proxy_port: Option<u16>,
     command: Vec<String>,
     environment: HashMap<String, String>,
-    options: BackendOptions,
+    options: LauncherOptions,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub(super) struct LauncherOptions {
+    backend: BackendOptions,
     security_mode: SecurityMode,
+}
+
+impl LauncherOptions {
+    pub(super) const fn new(backend: BackendOptions, security_mode: SecurityMode) -> Self {
+        Self {
+            backend,
+            security_mode,
+        }
+    }
 }
 
 /// Parent-side asynchronous wrapper: write a private bounded payload and
@@ -56,12 +70,11 @@ pub(super) async fn run_sandboxed(
     command: &[String],
     extra_env: &HashMap<String, String>,
     probe: &ProbeResult,
-    options: BackendOptions,
-    security_mode: SecurityMode,
+    options: LauncherOptions,
     pid_tx: Option<tokio::sync::oneshot::Sender<u32>>,
 ) -> Result<ExitStatus, CoreError> {
-    enforce_network_capability(profile, probe, options, security_mode)?;
-    if security_mode.is_strict() {
+    enforce_network_capability(profile, probe, options.backend, options.security_mode)?;
+    if options.security_mode.is_strict() {
         profile.validate_security_invariants()?;
     }
     if command.is_empty() {
@@ -79,7 +92,6 @@ pub(super) async fn run_sandboxed(
         command: command.to_vec(),
         environment: extra_env.clone(),
         options,
-        security_mode,
     };
     let encoded = serde_json::to_vec(&payload)
         .map_err(|error| CoreError::Backend(format!("serialize launcher policy: {error}")))?;
@@ -254,7 +266,7 @@ fn launcher_main(policy_fd: RawFd) -> Result<ExitCode, CoreError> {
     profile.first_user_allow_exec = payload.first_user_allow_exec;
     profile.first_user_allow_read = payload.first_user_allow_read;
     profile.ephemeral_write_exec = payload.ephemeral_write_exec;
-    if payload.security_mode.is_strict() {
+    if payload.options.security_mode.is_strict() {
         profile.validate_structural_security_invariants()?;
     }
 
@@ -262,22 +274,22 @@ fn launcher_main(policy_fd: RawFd) -> Result<ExitCode, CoreError> {
     enforce_network_capability(
         &profile,
         &live_probe,
-        payload.options,
-        payload.security_mode,
+        payload.options.backend,
+        payload.options.security_mode,
     )?;
     let compiled_landlock = landlock::compile(
         &profile,
         payload.proxy_port,
         &live_probe,
-        payload.options,
-        payload.security_mode,
+        payload.options.backend,
+        payload.options.security_mode,
     )?;
     let compiled_seccomp = seccomp::compile(
         &profile,
         payload.proxy_port,
         &live_probe,
-        payload.options,
-        payload.security_mode,
+        payload.options.backend,
+        payload.options.security_mode,
     )?;
 
     let program = payload
@@ -542,8 +554,7 @@ mod tests {
             proxy_port: None,
             command: vec!["/bin/true".to_owned()],
             environment: HashMap::new(),
-            options: BackendOptions::default(),
-            security_mode: SecurityMode::Standard,
+            options: LauncherOptions::new(BackendOptions::default(), SecurityMode::Standard),
         };
         let encoded = serde_json::to_vec(&payload).unwrap();
         let decoded: LauncherPayload = serde_json::from_slice(&encoded).unwrap();

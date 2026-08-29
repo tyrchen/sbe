@@ -864,6 +864,10 @@ fn root_owned_chain(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "standard mode snapshots an existing denied symlink referent before launch"
+)]
 fn build_forbidden_reads(
     profile: &SandboxProfile,
     security_mode: SecurityMode,
