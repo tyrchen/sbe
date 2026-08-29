@@ -318,6 +318,8 @@ Maven command properties, `MAVEN_ARGS`, project `.mvn/maven.config`,
 `MAVEN_OPTS`, and project `.mvn/jvm.config` can select a replacement for the
 default writable local repository. SBE follows Maven's source precedence,
 resolves relative paths from the project, and rejects ambiguous option forms.
+Repository-controlled Maven config can select an external local repository only
+when that target is explicitly approved with `--allow-write`.
 
 On macOS, secret read denials include both the configured pathname and its
 canonical target. A symlinked `~/.ssh`, `.aws`, or similar protected directory

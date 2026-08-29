@@ -750,10 +750,22 @@ fn apply_standard_profile(
         if let Some(repository) =
             effective_maven_local_repository(profile, command, home, project_dir)?
         {
+            if repository.project_controlled
+                && !project_maven_repository_is_approved(
+                    profile,
+                    &repository.path,
+                    home,
+                    project_dir,
+                )
+            {
+                let resolved = resolve_existing_ancestor(&repository.path)
+                    .unwrap_or_else(|| repository.path.clone());
+                return Err(external_write_approval_error(&repository.path, &resolved));
+            }
             replace_builtin_write_path(
                 profile,
                 &home.join(".m2/repository"),
-                SandboxPath::dir(repository),
+                SandboxPath::dir(repository.path),
             );
         }
         // Standard mode uses the package manager's ordinary persistent
@@ -902,12 +914,17 @@ fn effective_gradle_user_home(
     }))
 }
 
+struct MavenRepositorySelection {
+    path: PathBuf,
+    project_controlled: bool,
+}
+
 fn effective_maven_local_repository(
     profile: &SandboxProfile,
     command: &[String],
     home: &Path,
     project_dir: &Path,
-) -> anyhow::Result<Option<PathBuf>> {
+) -> anyhow::Result<Option<MavenRepositorySelection>> {
     if !command_is(command, "mvn") && !command_is(command, "mvnw") {
         return Ok(None);
     }
@@ -948,8 +965,9 @@ fn effective_maven_local_repository(
     } else {
         None
     };
-    let argument_value = command_value.or(maven_args_value).or(maven_config_value);
-    let maven_opts_value = if argument_value.is_none() {
+    let has_argument_value =
+        command_value.is_some() || maven_args_value.is_some() || maven_config_value.is_some();
+    let maven_opts_value = if !has_argument_value {
         let options = profile
             .env
             .get("MAVEN_OPTS")
@@ -963,7 +981,7 @@ fn effective_maven_local_repository(
     } else {
         None
     };
-    let project_jvm_value = if argument_value.is_none() && maven_opts_value.is_none() {
+    let project_jvm_value = if !has_argument_value && maven_opts_value.is_none() {
         let path = project_dir.join(".mvn/jvm.config");
         read_bounded_project_file(&path)?
             .map(|contents| {
@@ -977,21 +995,63 @@ fn effective_maven_local_repository(
     } else {
         None
     };
-    let Some(path) = argument_value.or(maven_opts_value).or(project_jvm_value) else {
+    let selected = command_value
+        .map(|path| MavenRepositorySelection {
+            path,
+            project_controlled: false,
+        })
+        .or_else(|| {
+            maven_args_value.map(|path| MavenRepositorySelection {
+                path,
+                project_controlled: false,
+            })
+        })
+        .or_else(|| {
+            maven_config_value.map(|path| MavenRepositorySelection {
+                path,
+                project_controlled: true,
+            })
+        })
+        .or_else(|| {
+            maven_opts_value.map(|path| MavenRepositorySelection {
+                path,
+                project_controlled: false,
+            })
+        })
+        .or_else(|| {
+            project_jvm_value.map(|path| MavenRepositorySelection {
+                path,
+                project_controlled: true,
+            })
+        });
+    let Some(mut selected) = selected else {
         return Ok(None);
     };
-    if path.as_os_str().is_empty() {
+    if selected.path.as_os_str().is_empty() {
         anyhow::bail!("maven.repo.local must be a non-empty path");
     }
-    let path = if path.is_absolute() {
-        path
-    } else {
-        project_dir.join(path)
-    };
-    if path == home.join(".m2/repository") {
+    if !selected.path.is_absolute() {
+        selected.path = project_dir.join(selected.path);
+    }
+    if selected.path == home.join(".m2/repository") {
         return Ok(None);
     }
-    Ok(Some(path))
+    Ok(Some(selected))
+}
+
+fn project_maven_repository_is_approved(
+    profile: &SandboxProfile,
+    repository: &Path,
+    home: &Path,
+    project_dir: &Path,
+) -> bool {
+    let resolved =
+        resolve_existing_ancestor(repository).unwrap_or_else(|| repository.to_path_buf());
+    let project =
+        resolve_existing_ancestor(project_dir).unwrap_or_else(|| project_dir.to_path_buf());
+    resolved.starts_with(project)
+        || repository.starts_with(home.join(".m2/repository"))
+        || explicit_write_covers(profile, &resolved)
 }
 
 fn maven_args_local_repository(arguments: &str, source: &str) -> anyhow::Result<Option<PathBuf>> {
@@ -4181,11 +4241,11 @@ mod tests {
             "the selected Maven repository must replace the default write grant"
         );
 
-        let jvm_repository = tempfile::tempdir().unwrap();
+        let jvm_repository = project.path().join("jvm-config-repository");
         std::fs::create_dir_all(project.path().join(".mvn")).unwrap();
         std::fs::write(
             project.path().join(".mvn/jvm.config"),
-            format!("-Dmaven.repo.local={}\n", jvm_repository.path().display()),
+            format!("-Dmaven.repo.local={}\n", jvm_repository.display()),
         )
         .unwrap();
         let mut jvm_config =
@@ -4203,7 +4263,7 @@ mod tests {
         assert!(
             jvm_config
                 .allow_write
-                .contains(&SandboxPath::dir(jvm_repository.path().to_path_buf()))
+                .contains(&SandboxPath::dir(jvm_repository.clone()))
         );
 
         let opts_repository = tempfile::tempdir().unwrap();
@@ -4213,7 +4273,7 @@ mod tests {
             "MAVEN_OPTS".to_owned(),
             format!(
                 "-Dmaven.repo.local={} -Dmaven.repo.local={}",
-                jvm_repository.path().display(),
+                jvm_repository.display(),
                 opts_repository.path().display()
             ),
         );
@@ -4232,17 +4292,14 @@ mod tests {
         assert!(
             !maven_opts
                 .allow_write
-                .contains(&SandboxPath::dir(jvm_repository.path().to_path_buf())),
+                .contains(&SandboxPath::dir(jvm_repository)),
             "MAVEN_OPTS is appended after .mvn/jvm.config and its last property wins"
         );
 
-        let config_repository = tempfile::tempdir().unwrap();
+        let config_repository = project.path().join("maven-config-repository");
         std::fs::write(
             project.path().join(".mvn/maven.config"),
-            format!(
-                "-Dmaven.repo.local={}\n",
-                config_repository.path().display()
-            ),
+            format!("-Dmaven.repo.local={}\n", config_repository.display()),
         )
         .unwrap();
         let mut maven_config =
@@ -4264,9 +4321,54 @@ mod tests {
         assert!(
             maven_config
                 .allow_write
-                .contains(&SandboxPath::dir(config_repository.path().to_path_buf())),
+                .contains(&SandboxPath::dir(config_repository.clone())),
             "project Maven arguments override JVM system-property sources"
         );
+
+        let external_project_repository = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join(".mvn/maven.config"),
+            format!(
+                "-Dmaven.repo.local={}\n",
+                external_project_repository.path().display()
+            ),
+        )
+        .unwrap();
+        let mut unapproved =
+            SandboxProfile::for_ecosystem(Ecosystem::Java, home.path(), project.path());
+        unapproved
+            .env
+            .insert("MAVEN_ARGS".to_owned(), "-B".to_owned());
+        unapproved
+            .env
+            .insert("MAVEN_OPTS".to_owned(), "-Xmx1g".to_owned());
+        let error = apply_standard_profile(
+            &mut unapproved,
+            &["mvn".to_owned(), "validate".to_owned()],
+            home.path(),
+            project.path(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("--allow-write"));
+
+        let mut approved =
+            SandboxProfile::for_ecosystem(Ecosystem::Java, home.path(), project.path());
+        approved
+            .env
+            .insert("MAVEN_ARGS".to_owned(), "-B".to_owned());
+        approved.allow_write.push(SandboxPath::dir(
+            external_project_repository.path().to_path_buf(),
+        ));
+        apply_standard_profile(
+            &mut approved,
+            &["mvn".to_owned(), "validate".to_owned()],
+            home.path(),
+            project.path(),
+        )
+        .unwrap();
+        assert!(approved.allow_write.contains(&SandboxPath::dir(
+            external_project_repository.path().to_path_buf()
+        )));
 
         let args_repository = tempfile::tempdir().unwrap();
         let mut maven_args =
@@ -4290,7 +4392,7 @@ mod tests {
         assert!(
             !maven_args
                 .allow_write
-                .contains(&SandboxPath::dir(config_repository.path().to_path_buf())),
+                .contains(&SandboxPath::dir(config_repository)),
             "MAVEN_ARGS is passed as CLI input and overrides project Maven arguments"
         );
 

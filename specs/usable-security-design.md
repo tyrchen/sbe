@@ -253,6 +253,11 @@ arguments and CLI user properties override project configuration and JVM system
 properties. Relative selections are anchored to the command project; quoted,
 expanded, or otherwise ambiguous option values fail with guidance to use a
 direct unambiguous command property.
+Because `.mvn/maven.config` and `.mvn/jvm.config` are repository-controlled,
+their selected repository may expand authority automatically only inside the
+workspace or conventional `~/.m2/repository` namespace. An external referent
+requires a matching explicit writable grant; command and host-environment
+sources continue to represent direct user intent.
 
 It denies writes everywhere else. In particular, home-directory persistence,
 credentials, shell startup, SSH authorization, user service configuration, and
