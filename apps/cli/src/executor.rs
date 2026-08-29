@@ -639,6 +639,8 @@ fn is_sensitive_environment_name(name: &str) -> bool {
             "_CREDENTIALS",
             "_DATABASE_URL",
             "_DATABASE_URI",
+            "_AUTH",
+            "_AUTHTOKEN",
         ]
         .iter()
         .any(|suffix| upper.ends_with(suffix))
@@ -2367,6 +2369,11 @@ mod tests {
                 ("MYSQL_PWD".to_owned(), "sentinel".to_owned()),
                 ("REDISCLI_AUTH".to_owned(), "sentinel".to_owned()),
                 ("MONGODB_URI".to_owned(), "sentinel".to_owned()),
+                ("NPM_CONFIG__AUTH".to_owned(), "sentinel".to_owned()),
+                (
+                    "NPM_CONFIG_//REGISTRY.NPMJS.ORG/:_AUTHTOKEN".to_owned(),
+                    "sentinel".to_owned(),
+                ),
                 (
                     "GOOGLE_APPLICATION_CREDENTIALS".to_owned(),
                     "/tmp/google-credentials.json".to_owned(),
