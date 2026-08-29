@@ -916,8 +916,19 @@ fn workspace_read_aliases(profile: &SandboxProfile, project_dir: &Path) -> Vec<S
     let project_referent =
         std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
     let mut pending = vec![project_dir.to_path_buf()];
+    let mut visited_directories = BTreeSet::new();
     let mut resolved_paths = BTreeSet::new();
     while let Some(directory) = pending.pop() {
+        let directory = match std::fs::canonicalize(&directory) {
+            Ok(directory) => directory,
+            Err(error) => {
+                warn!(path = %directory.display(), %error, "could not resolve source directory");
+                continue;
+            }
+        };
+        if !visited_directories.insert(directory.clone()) {
+            continue;
+        }
         let entries = match std::fs::read_dir(&directory) {
             Ok(entries) => entries,
             Err(error) => {
@@ -958,7 +969,11 @@ fn workspace_read_aliases(profile: &SandboxProfile, project_dir: &Path) -> Vec<S
                 {
                     continue;
                 }
-                resolved_paths.insert(resolved);
+                if resolved_paths.insert(resolved.clone())
+                    && std::fs::metadata(&resolved).is_ok_and(|metadata| metadata.is_dir())
+                {
+                    pending.push(resolved);
+                }
             } else if file_type.is_dir() {
                 pending.push(path);
             }
@@ -2574,11 +2589,14 @@ mod tests {
         let project = root.path().join("project");
         let source = project.join("src");
         let shared = root.path().join("shared");
+        let nested = root.path().join("nested");
         let protected = root.path().join(".aws");
         std::fs::create_dir_all(&source).unwrap();
         std::fs::create_dir_all(&shared).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
         std::fs::create_dir_all(&protected).unwrap();
         std::os::unix::fs::symlink("../../shared", source.join("shared")).unwrap();
+        std::os::unix::fs::symlink("../nested", shared.join("nested")).unwrap();
         std::os::unix::fs::symlink("../../.aws", source.join("credentials")).unwrap();
         let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, root.path(), &project);
 
@@ -2594,6 +2612,11 @@ mod tests {
             profile
                 .allow_read
                 .contains(&SandboxPath::dir(std::fs::canonicalize(shared).unwrap()))
+        );
+        assert!(
+            profile
+                .allow_read
+                .contains(&SandboxPath::dir(std::fs::canonicalize(nested).unwrap()))
         );
         assert!(
             !profile

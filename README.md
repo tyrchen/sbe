@@ -282,8 +282,10 @@ such as `~/.rustup` remain non-writable during ordinary builds in both modes.
 On Linux, standard grants follow an existing ordinary symlink to its opened
 referent and install the Landlock rule from that descriptor. Before launch it
 discovers source-tree symlinks outside generated dependency/output directories,
-so a link into an ordinary sibling checkout is readable without granting the
-sibling's parent. Magic links and protected referents remain rejected. Strict
+including nested links in an external source referent, so a link into an
+ordinary sibling checkout is readable without granting the sibling's parent.
+Canonical directory identities prevent traversal cycles. Magic links and
+protected referents remain rejected. Strict
 mode retains no-follow resolution except for immutable system aliases. Denied
 paths include their current canonical target. Strict mode also retains
 hard-link alias rejection; standard mode does not recursively scan historical

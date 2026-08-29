@@ -126,12 +126,13 @@ jobs:
           set -euo pipefail
           root="$RUNNER_TEMP/sbe-source-symlink"
           rm -rf "$root"
-          mkdir -p "$root/project/src" "$root/shared"
-          printf 'shared-source\n' >"$root/shared/value.txt"
+          mkdir -p "$root/project/src" "$root/shared" "$root/nested"
+          printf 'nested-shared-source\n' >"$root/nested/value.txt"
           ln -s ../../shared "$root/project/src/shared"
+          ln -s ../nested "$root/shared/nested"
           cd "$root/project"
-          out=$(sbe run --profile rust -- /bin/cat src/shared/value.txt)
-          test "$out" = shared-source
+          out=$(sbe run --profile rust -- /bin/cat src/shared/nested/value.txt)
+          test "$out" = nested-shared-source
 
       - name: explicit allow-all-network permits real sockets
         run: |

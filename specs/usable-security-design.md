@@ -325,7 +325,9 @@ file descriptor. It does not require `RESOLVE_NO_SYMLINKS` for ordinary grants.
 For the built-in workspace read grant, standard mode discovers symlinks in the
 source tree without descending into conventional generated dependency and
 output directories, then installs separate read rules for safe external
-referents. Referents overlapping protected read denials are omitted.
+referents. External directory referents are inspected for nested source links;
+canonical directory identities break cycles. Referents overlapping protected
+read denials are omitted.
 
 On macOS it resolves and validates the target before rendering both necessary
 SBPL spellings. Because the untrusted child has not started and cannot write
