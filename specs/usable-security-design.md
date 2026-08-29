@@ -317,6 +317,10 @@ Examples:
   offers a one-time or durable narrow approval; it does not tell the user to
   remove the symlink.
 - `$PWD/output -> ~/.ssh` is not authorized by the built-in workspace grant.
+- `~/.npm -> ~/.config/autostart` is not authorized by the built-in cache
+  grant; the user must explicitly grant the resolved target if that unusual
+  layout is intentional. A link into `~/.cache` or `~/Library/Caches` remains
+  inside the conventional cache envelope.
 - A source symlink into an ordinary sibling checkout is readable in standard
   mode, but a symlink into `~/.aws` remains denied.
 
@@ -366,7 +370,8 @@ feature switches, terminal settings, and tool paths. It removes:
 
 - names matching a maintained high-confidence secret pattern such as tokens,
   passwords, private keys, and cloud credentials;
-- known credential variables independent of spelling convention;
+- known credential variables independent of spelling convention, including
+  prefix-encoded forms such as Terraform's `TF_TOKEN_<host>`;
 - agent and credential socket variables;
 - dynamic-loader injection variables; and
 - SBE-reserved proxy, runtime, and policy variables.

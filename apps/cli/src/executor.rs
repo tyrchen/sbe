@@ -13,7 +13,7 @@ use anyhow::Context;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use sbe_core::{
     BackendOptions, Sandbox, SandboxBackend, SecurityMode,
-    config::{SandboxPath, expand_path, load_configs, resolve_profile},
+    config::{PathKind, SandboxPath, expand_path, load_configs, resolve_profile},
     detect::{self, Ecosystem},
     error::CoreError,
     profile::{
@@ -99,7 +99,7 @@ async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
         enable_existing_dependency_execution(&mut profile, &args.command);
     } else {
         apply_standard_profile(&mut profile, &args.command, &home, &pwd);
-        resolve_standard_path_aliases(&mut profile, &pwd);
+        resolve_standard_path_aliases(&mut profile, &home, &pwd)?;
     }
 
     if args.strict && !args.dry_run {
@@ -626,6 +626,7 @@ fn is_sensitive_environment_name(name: &str) -> bool {
     EXACT.contains(&upper.as_str())
         || RESERVED.contains(&upper.as_str())
         || upper.starts_with("DYLD_")
+        || upper.starts_with("TF_TOKEN_")
         || upper == "LD_PRELOAD"
         || upper == "LD_LIBRARY_PATH"
         || [
@@ -858,7 +859,12 @@ fn insert_builtin_path_grant(profile: &mut SandboxProfile, kind: GrantKind, gran
     clippy::disallowed_methods,
     reason = "standard mode snapshots pre-existing user tool and cache symlinks before launch"
 )]
-fn resolve_standard_path_aliases(profile: &mut SandboxProfile, project_dir: &Path) {
+fn resolve_standard_path_aliases(
+    profile: &mut SandboxProfile,
+    home: &Path,
+    project_dir: &Path,
+) -> anyhow::Result<()> {
+    validate_standard_write_aliases(profile, home, project_dir)?;
     let write_aliases = resolved_aliases(
         &profile.allow_write,
         profile.first_user_allow_write,
@@ -899,6 +905,110 @@ fn resolve_standard_path_aliases(profile: &mut SandboxProfile, project_dir: &Pat
             });
             profile.allow_read.push(alias);
         }
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "standard mode validates built-in write symlinks against the approved authority \
+              envelope"
+)]
+fn validate_standard_write_aliases(
+    profile: &SandboxProfile,
+    home: &Path,
+    project_dir: &Path,
+) -> anyhow::Result<()> {
+    let built_in_boundary = profile
+        .first_user_allow_write
+        .min(profile.allow_write.len());
+    let home_referent = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    let project_referent =
+        std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
+    let cache_envelopes = [
+        home_referent.join(".cache"),
+        home_referent.join("Library/Caches"),
+    ];
+    let built_in_envelopes: Vec<SandboxPath> = profile.allow_write[..built_in_boundary]
+        .iter()
+        .map(|grant| SandboxPath {
+            path: remap_to_referent(
+                &grant.path,
+                home,
+                &home_referent,
+                project_dir,
+                &project_referent,
+            ),
+            kind: grant.kind,
+        })
+        .collect();
+
+    for grant in &profile.allow_write[..built_in_boundary] {
+        let Ok(resolved) = std::fs::canonicalize(&grant.path) else {
+            continue;
+        };
+        let expected = remap_to_referent(
+            &grant.path,
+            home,
+            &home_referent,
+            project_dir,
+            &project_referent,
+        );
+        if resolved == expected
+            || resolved.starts_with(&project_referent)
+            || cache_envelopes
+                .iter()
+                .any(|envelope| resolved.starts_with(envelope))
+            || built_in_envelopes
+                .iter()
+                .any(|envelope| grant_covers(envelope, &resolved))
+            || profile.allow_write[built_in_boundary..]
+                .iter()
+                .filter_map(resolve_explicit_grant)
+                .any(|explicit| grant_covers(&explicit, &resolved))
+        {
+            continue;
+        }
+
+        anyhow::bail!(
+            "built-in writable path '{}' resolves outside the standard writable envelope to '{}'; \
+             approve that target explicitly with --allow-write '{}'",
+            grant.path.display(),
+            resolved.display(),
+            resolved.display()
+        );
+    }
+    Ok(())
+}
+
+fn remap_to_referent(
+    path: &Path,
+    home: &Path,
+    home_referent: &Path,
+    project_dir: &Path,
+    project_referent: &Path,
+) -> PathBuf {
+    if let Ok(relative) = path.strip_prefix(project_dir) {
+        project_referent.join(relative)
+    } else if let Ok(relative) = path.strip_prefix(home) {
+        home_referent.join(relative)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn resolve_explicit_grant(grant: &SandboxPath) -> Option<SandboxPath> {
+    Some(SandboxPath {
+        path: resolve_existing_ancestor(&grant.path)?,
+        kind: grant.kind,
+    })
+}
+
+fn grant_covers(grant: &SandboxPath, target: &Path) -> bool {
+    match grant.kind {
+        PathKind::Subpath => target.starts_with(&grant.path),
+        PathKind::Literal => target == grant.path,
+        PathKind::Regex => false,
     }
 }
 
@@ -2375,6 +2485,10 @@ mod tests {
                     "sentinel".to_owned(),
                 ),
                 (
+                    "TF_TOKEN_APP_TERRAFORM_IO".to_owned(),
+                    "sentinel".to_owned(),
+                ),
+                (
                     "GOOGLE_APPLICATION_CREDENTIALS".to_owned(),
                     "/tmp/google-credentials.json".to_owned(),
                 ),
@@ -2578,7 +2692,8 @@ mod tests {
             Path::new("/Users/test"),
             project.path(),
         );
-        resolve_standard_path_aliases(&mut profile, project.path());
+        resolve_standard_path_aliases(&mut profile, Path::new("/Users/test"), project.path())
+            .unwrap();
 
         assert!(
             profile
@@ -2597,6 +2712,83 @@ mod tests {
                 .iter()
                 .any(|grant| grant.path == external.path()),
             "generated output symlinks are not inferred as source read grants"
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the unit test builds and resolves isolated cache symlink fixtures"
+    )]
+    fn standard_profile_requires_approval_for_cache_symlinks_outside_the_envelope() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let project = root.path().join("project");
+        let persistence = home.join(".config/autostart");
+        std::fs::create_dir_all(&persistence).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::os::unix::fs::symlink(&persistence, home.join(".npm")).unwrap();
+
+        let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &project);
+        apply_standard_profile(
+            &mut profile,
+            &["npm".to_owned(), "install".to_owned()],
+            &home,
+            &project,
+        );
+        let error = resolve_standard_path_aliases(&mut profile, &home, &project).unwrap_err();
+        assert!(error.to_string().contains("--allow-write"));
+        assert!(
+            error
+                .to_string()
+                .contains(&persistence.display().to_string())
+        );
+
+        let mut approved = SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &project);
+        approved
+            .allow_write
+            .push(SandboxPath::dir(persistence.clone()));
+        apply_standard_profile(
+            &mut approved,
+            &["npm".to_owned(), "install".to_owned()],
+            &home,
+            &project,
+        );
+        resolve_standard_path_aliases(&mut approved, &home, &project).unwrap();
+        assert!(
+            approved
+                .allow_write
+                .contains(&SandboxPath::dir(persistence))
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the unit test builds and resolves an isolated cache symlink fixture"
+    )]
+    fn standard_profile_follows_cache_symlinks_within_the_cache_envelope() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let project = root.path().join("project");
+        let cache = home.join(".cache/npm");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::os::unix::fs::symlink(&cache, home.join(".npm")).unwrap();
+
+        let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &project);
+        apply_standard_profile(
+            &mut profile,
+            &["npm".to_owned(), "install".to_owned()],
+            &home,
+            &project,
+        );
+        resolve_standard_path_aliases(&mut profile, &home, &project).unwrap();
+
+        assert!(
+            profile
+                .allow_write
+                .contains(&SandboxPath::dir(std::fs::canonicalize(cache).unwrap()))
         );
     }
 
@@ -2627,7 +2819,7 @@ mod tests {
             root.path(),
             &project,
         );
-        resolve_standard_path_aliases(&mut profile, &project);
+        resolve_standard_path_aliases(&mut profile, root.path(), &project).unwrap();
 
         assert!(
             profile

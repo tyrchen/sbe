@@ -284,14 +284,16 @@ result tainted. Strict mode keeps the 0.4 W^X and hard-link checks. Toolchains
 such as `~/.rustup` remain non-writable during ordinary builds in both modes.
 
 On Linux, standard grants follow an existing ordinary symlink to its opened
-referent and install the Landlock rule from that descriptor. Before launch it
-discovers source-tree symlinks outside generated dependency/output directories,
-including nested links in an external source referent, so a link into an
-ordinary sibling checkout is readable without granting the sibling's parent.
-Canonical directory identities prevent traversal cycles. Magic links and
-protected referents remain rejected. Strict
-mode retains no-follow resolution except for immutable system aliases. Denied
-paths include their current canonical target. Strict mode also retains
+referent and install the Landlock rule from that descriptor. Built-in writable
+cache links must resolve within the workspace, a conventional cache namespace,
+or another declared writable root; an external referent fails with a copyable
+`--allow-write` approval. Before launch SBE discovers source-tree symlinks
+outside generated dependency/output directories, including nested links in an
+external source referent, so a link into an ordinary sibling checkout is
+readable without granting the sibling's parent. Canonical directory identities
+prevent traversal cycles. Magic links and protected referents remain rejected.
+Strict mode retains no-follow resolution except for immutable system aliases.
+Denied paths include their current canonical target. Strict mode also retains
 hard-link alias rejection; standard mode does not recursively scan historical
 caches before every launch.
 

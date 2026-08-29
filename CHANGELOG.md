@@ -22,7 +22,8 @@ All notable changes to this project will be documented in this file. See [conven
 - Support globally configured sccache through ordinary executable/cache grants
   and local IPC; no sccache source or managed adapter is shipped by SBE.
 - Follow pre-existing tool, cache, and source-tree symlinks in standard mode
-  while retaining strict no-follow behavior and protected-path denials.
+  when their referents stay inside the authorized envelope; external writable
+  cache referents require one narrow explicit grant.
 - Allow explicit top-level `cargo install` commands to manage their selected
   install root instead of reimplementing Cargo's transaction format.
 - Stop requiring `--allow-insecure-linux-network` for standard Linux builds;
@@ -37,7 +38,8 @@ All notable changes to this project will be documented in this file. See [conven
 - Keep standard-mode symlink referents subject to protected-path denials and
   filter high-confidence API-key, cloud, and database credential environment
   variables, including bare or standardized names such as `TOKEN`, `API_KEY`,
-  `PASSWORD`, `PGPASSWORD`, `MYSQL_PWD`, and npm `_authToken` forms.
+  `PASSWORD`, `PGPASSWORD`, `MYSQL_PWD`, Terraform `TF_TOKEN_*`, and npm
+  `_authToken` forms.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23
