@@ -1,5 +1,5 @@
-name: 'Setup sbe'
-description: 'Install the sbe CLI (sandbox-exec on macOS, Landlock + seccomp on Linux) and add it to PATH'
+name: 'Setup SBE'
+description: 'Install a verified SBE release on macOS or Linux and add it to PATH'
 author: 'Tyr Chen'
 branding:
   icon: 'shield'
@@ -7,7 +7,7 @@ branding:
 
 inputs:
   version:
-    description: 'attested sbe version to install (defaults to 0.4.1; accepts tag form or "latest")'
+    description: 'SBE version to install (defaults to 0.4.1; accepts v0.4.1, sbexec-v0.4.1, or latest)'
     required: false
     default: '0.4.1'
   github-token:
@@ -64,8 +64,9 @@ runs:
           tag="$(curl -fsSL \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/tyrchen/sbe/releases?per_page=30" \
-            | jq -r '[.[] | select(.tag_name | startswith("sbexec-v"))][0].tag_name')"
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/tyrchen/sbe/releases/latest" \
+            | jq -r '.tag_name')"
           if [[ -z "$tag" || "$tag" == "null" ]]; then
             echo "::error::Could not find any sbexec-v* release on tyrchen/sbe"
             exit 1

@@ -81,12 +81,14 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # Build SBE from the exact tagged checkout and locked dependency graph
-      # before the real release build. No older, unattested SBE binary enters
-      # the release job. On native targets the sandboxed build warms the upload
-      # action's cache; cross-musl targets use a host-native sandboxed check.
-      - name: Build tagged sbe (dogfood)
-        run: cargo install --path apps/cli --locked --force
+      # Bootstrap future releases with the latest audited SBE release. The
+      # setup action verifies both checksum and build provenance. On native
+      # targets the sandboxed build warms the upload action's cache;
+      # cross-musl targets use a host-native sandboxed check.
+      - name: Install sbe 0.4.1 (dogfood)
+        uses: tyrchen/sbe@5271cff35f898262b560492c4d2252adfb215053 # sbexec-v0.4.1
+        with:
+          version: '0.4.1'
       - name: Pre-build under sbe (dogfood)
         shell: bash
         env:
