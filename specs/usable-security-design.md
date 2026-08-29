@@ -511,9 +511,13 @@ feature switches, terminal settings, and tool paths. It removes:
 - Python package configuration locators `PIP_CONFIG_FILE` and
   `UV_CONFIG_FILE`, and Poetry's `POETRY_CONFIG_DIR`, because those files or
   directories can contain authenticated indexes;
+- pip and uv index URL inputs, including primary/default and additional index
+  variables, because URLs can embed registry usernames and tokens;
 - Git's environment-backed configuration transports `GIT_CONFIG_COUNT`,
   `GIT_CONFIG_KEY_*`, `GIT_CONFIG_VALUE_*`, and `GIT_CONFIG_PARAMETERS`, because
-  they can carry authorization headers and other credentials directly;
+  they can carry authorization headers and other credentials directly, plus
+  `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` because those locators can select
+  files containing the same values;
 - agent and credential socket variables;
 - dynamic-loader injection variables; and
 - SBE-reserved proxy, runtime, and policy variables.

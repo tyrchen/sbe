@@ -644,7 +644,9 @@ fn is_sensitive_environment_name(name: &str) -> bool {
         "GPG_AGENT_INFO",
         "GH_CONFIG_DIR",
         "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_GLOBAL",
         "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_SYSTEM",
         "GNUPGHOME",
         "GOOGLE_APPLICATION_CREDENTIALS",
         "KUBECONFIG",
@@ -662,6 +664,8 @@ fn is_sensitive_environment_name(name: &str) -> bool {
         "PGPASSFILE",
         "PGPASSWORD",
         "PIP_CONFIG_FILE",
+        "PIP_EXTRA_INDEX_URL",
+        "PIP_INDEX_URL",
         "POETRY_CONFIG_DIR",
         "PRIVATE_KEY",
         "REDISCLI_AUTH",
@@ -671,6 +675,9 @@ fn is_sensitive_environment_name(name: &str) -> bool {
         "SYSTEM_ACCESSTOKEN",
         "TOKEN",
         "UV_CONFIG_FILE",
+        "UV_DEFAULT_INDEX",
+        "UV_EXTRA_INDEX_URL",
+        "UV_INDEX_URL",
     ];
     const RESERVED: &[&str] = &[
         "HTTP_PROXY",
@@ -4822,6 +4829,14 @@ mod tests {
                 ("CI_JOB_JWT_V2".to_owned(), "sentinel".to_owned()),
                 ("GIT_CONFIG_COUNT".to_owned(), "1".to_owned()),
                 (
+                    "GIT_CONFIG_GLOBAL".to_owned(),
+                    "/tmp/global-gitconfig".to_owned(),
+                ),
+                (
+                    "GIT_CONFIG_SYSTEM".to_owned(),
+                    "/tmp/system-gitconfig".to_owned(),
+                ),
+                (
                     "GIT_CONFIG_KEY_0".to_owned(),
                     "http.https://example.com.extraHeader".to_owned(),
                 ),
@@ -4871,12 +4886,32 @@ mod tests {
                     "/tmp/custom-pip.conf".to_owned(),
                 ),
                 (
+                    "PIP_INDEX_URL".to_owned(),
+                    "https://user:sentinel@example.com/simple".to_owned(),
+                ),
+                (
+                    "PIP_EXTRA_INDEX_URL".to_owned(),
+                    "https://user:sentinel@example.net/simple".to_owned(),
+                ),
+                (
                     "POETRY_CONFIG_DIR".to_owned(),
                     "/tmp/custom-poetry".to_owned(),
                 ),
                 (
                     "UV_CONFIG_FILE".to_owned(),
                     "/tmp/custom-uv.toml".to_owned(),
+                ),
+                (
+                    "UV_INDEX_URL".to_owned(),
+                    "https://user:sentinel@example.com/simple".to_owned(),
+                ),
+                (
+                    "UV_EXTRA_INDEX_URL".to_owned(),
+                    "https://user:sentinel@example.net/simple".to_owned(),
+                ),
+                (
+                    "UV_DEFAULT_INDEX".to_owned(),
+                    "https://user:sentinel@example.org/simple".to_owned(),
                 ),
                 ("KRB5CCNAME".to_owned(), "FILE:/tmp/krb5cc".to_owned()),
                 (
