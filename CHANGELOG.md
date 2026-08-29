@@ -117,6 +117,9 @@ All notable changes to this project will be documented in this file. See [conven
 - Filter AzureRM client-certificate and OIDC-token file locators, and discover
   Node monorepo roots in standard mode so parent workspace inputs, lockfiles,
   and generated dependencies remain usable from a member package.
+- Pre-create missing Node workspace-root lockfiles on Linux, include that root
+  in bounded linked-dependency discovery, and relocate Cargo registry/Git cache
+  grants beneath the effective `CARGO_HOME` while retaining credential denials.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23

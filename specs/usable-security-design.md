@@ -272,6 +272,9 @@ When a Node command starts in a declared monorepo member, bounded no-follow
 metadata discovery promotes the matching workspace root to readable input and
 grants only its manager-specific lockfile/dependency outputs for write and
 execution; it does not make the whole parent workspace writable.
+On Linux, missing selected root lockfiles are created with the descriptor-bound
+no-follow helper before Landlock, and source-symlink discovery starts once at
+the workspace root so linked root dependencies receive safe referent grants.
 
 Recognizing `cargo install` as install intent is acceptable; parsing Cargo
 metadata and recreating Cargo's installation transaction is not. The package
@@ -283,6 +286,8 @@ with `--root` guidance rather than granting a repository-selected external
 location or reproducing Cargo's layered configuration. Inspection must say
 that the selected install root is writable and that the installed result is
 untrusted.
+Cargo's writable `registry` and `git` dependency caches follow the same
+effective `CARGO_HOME`, while its credential files stay denied.
 
 Path grants derived from environment variables use the same final precedence
 as the child environment: trusted configuration and explicit CLI environment

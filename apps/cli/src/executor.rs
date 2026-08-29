@@ -125,8 +125,8 @@ async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
         resolve_standard_path_aliases(&mut profile, &home, &pwd)?;
     }
 
-    if args.strict && !args.dry_run {
-        if cargo_uses_persistent_target(&args.command) {
+    if !args.dry_run {
+        if args.strict && cargo_uses_persistent_target(&args.command) {
             ensure_child_directory(&pwd, c"target")?;
         }
         #[cfg(target_os = "linux")]
@@ -809,6 +809,17 @@ fn apply_standard_profile(
     }
 
     if command_is(command, "cargo") {
+        let cargo_home = effective_cargo_home(profile, home, project_dir);
+        replace_builtin_write_path(
+            profile,
+            &home.join(".cargo/registry"),
+            SandboxPath::dir(cargo_home.join("registry")),
+        );
+        replace_builtin_write_path(
+            profile,
+            &home.join(".cargo/git"),
+            SandboxPath::dir(cargo_home.join("git")),
+        );
         let cargo_cli_target = command_option_value(command, "--target-dir").map(PathBuf::from);
         if let Some(path) = cargo_cli_target {
             let path = if path.is_absolute() {
@@ -862,8 +873,7 @@ fn apply_standard_profile(
         } else {
             None
         };
-        let cargo_home = effective_environment_path(profile, "CARGO_HOME")
-            .unwrap_or_else(|| home.join(".cargo"));
+        let cargo_home = effective_cargo_home(profile, home, project_dir);
         if explicit_root.is_none() && environment_root.is_none() && config_root.is_none() {
             reject_implicit_cargo_install_root(project_dir, &cargo_home)?;
         }
@@ -898,18 +908,22 @@ fn effective_environment_path(profile: &SandboxProfile, name: &str) -> Option<Pa
         .or_else(|| std::env::var_os(name).map(PathBuf::from))
 }
 
+fn effective_cargo_home(profile: &SandboxProfile, home: &Path, project_dir: &Path) -> PathBuf {
+    let cargo_home =
+        effective_environment_path(profile, "CARGO_HOME").unwrap_or_else(|| home.join(".cargo"));
+    if cargo_home.is_absolute() {
+        cargo_home
+    } else {
+        project_dir.join(cargo_home)
+    }
+}
+
 fn protect_effective_credential_paths(
     profile: &mut SandboxProfile,
     home: &Path,
     project_dir: &Path,
 ) {
-    let cargo_home =
-        effective_environment_path(profile, "CARGO_HOME").unwrap_or_else(|| home.join(".cargo"));
-    let cargo_home = if cargo_home.is_absolute() {
-        cargo_home
-    } else {
-        project_dir.join(cargo_home)
-    };
+    let cargo_home = effective_cargo_home(profile, home, project_dir);
     for name in ["credentials.toml", "credentials"] {
         insert_builtin_read_denial(profile, SandboxPath::file(cargo_home.join(name)));
     }
@@ -1441,7 +1455,8 @@ fn append_standard_workspace_read_aliases(
     profile: &mut SandboxProfile,
     project_dir: &Path,
 ) -> anyhow::Result<()> {
-    let read_aliases = workspace_read_aliases(profile, project_dir)?;
+    let scan_root = standard_workspace_read_root(profile, project_dir);
+    let read_aliases = workspace_read_aliases(profile, &scan_root)?;
     for alias in read_aliases {
         if !profile.allow_read.contains(&alias) {
             profile.grant_origins.push(GrantRecord {
@@ -1453,6 +1468,16 @@ fn append_standard_workspace_read_aliases(
         }
     }
     Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn standard_workspace_read_root(profile: &SandboxProfile, project_dir: &Path) -> PathBuf {
+    profile.allow_read[..profile.first_user_allow_read.min(profile.allow_read.len())]
+        .iter()
+        .filter(|grant| grant.kind == PathKind::Subpath && project_dir.starts_with(&grant.path))
+        .map(|grant| grant.path.clone())
+        .min_by_key(|path| path.components().count())
+        .unwrap_or_else(|| project_dir.to_path_buf())
 }
 
 #[allow(
@@ -4991,6 +5016,19 @@ mod tests {
                 .allow_exec
                 .contains(&SandboxPath::dir(install_root.path().join("bin")))
         );
+        let custom_cargo_home = home.path().join("ignored-cargo-home");
+        for cache in ["registry", "git"] {
+            assert!(
+                install_profile
+                    .allow_write
+                    .contains(&SandboxPath::dir(custom_cargo_home.join(cache)))
+            );
+            assert!(
+                !install_profile
+                    .allow_write
+                    .contains(&SandboxPath::dir(home.path().join(".cargo").join(cache)))
+            );
+        }
     }
 
     #[test]
@@ -5673,6 +5711,20 @@ mod tests {
                 .contains(&SandboxPath::dir(repository.path().to_path_buf())),
             "standard mode keeps root writes scoped to generated workspace outputs"
         );
+        assert_eq!(
+            standard_workspace_read_root(&profile, &member),
+            repository.path()
+        );
+        #[cfg(target_os = "linux")]
+        {
+            ensure_literal_write_targets(
+                &profile,
+                &["npm".to_owned(), "install".to_owned()],
+                &member,
+            )
+            .unwrap();
+            assert!(repository.path().join("package-lock.json").is_file());
+        }
     }
 
     #[cfg(target_os = "linux")]

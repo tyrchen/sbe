@@ -184,6 +184,8 @@ workspace metadata up to the Git boundary, including workspace roots between
 the current directory and repository root. Standard mode reads the discovered
 Node workspace root and grants executable generated dependency roots, while
 writes remain scoped to the active root's lockfile and dependency outputs.
+Linux pre-creates a selected missing root lockfile before Landlock enforcement
+and scans root-level linked dependencies with the same bounded symlink walk.
 `npm --no-package-lock` and
 `--package-lock=false` never create an empty lockfile. Package-manager options
 that relocate the project
@@ -207,6 +209,8 @@ selected install root from `--root`, `CARGO_INSTALL_ROOT`, a direct
 `--config install.root='path'`, or the Cargo-home default; the installed binary
 is not made trustworthy by SBE. An implicit `[install] root` in Cargo config is
 rejected with `--root` guidance instead of failing later inside the sandbox.
+Registry and Git dependency caches follow the effective `CARGO_HOME`; its two
+credential-file spellings remain denied.
 An external Cargo target can be selected with an inherited `CARGO_TARGET_DIR`
 or a direct `--config build.target-dir='path'` override, or granted explicitly
 with matching `--allow-write` and `--allow-exec` paths. Cargo `--config` file
