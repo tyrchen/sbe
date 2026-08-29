@@ -53,6 +53,9 @@ All notable changes to this project will be documented in this file. See [conven
   no-symlink walk, filter Azure Pipelines `SYSTEM_ACCESSTOKEN` and OIDC token-file
   variables, and bound Linux source-symlink discovery by entry and depth budgets
   without scanning macOS workspaces that do not need referent grants.
+- Preserve explicit execute denials when standard mode infers output grants,
+  filter custom AWS shared-credentials paths, and permit ordinary Unix-domain
+  build-service IPC in macOS standard mode while keeping strict mode isolated.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23

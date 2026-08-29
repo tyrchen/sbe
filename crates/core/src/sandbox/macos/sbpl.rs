@@ -220,6 +220,18 @@ fn section_network(
         }
     }
 
+    if !security_mode.is_strict() {
+        // Standard mode intentionally trusts ordinary same-user local build
+        // services. Keep IP traffic constrained by the mode-specific rules
+        // above while allowing pathname Unix-domain clients and servers.
+        writeln!(
+            sb,
+            "(allow network-bind network-inbound (local unix-socket))"
+        )
+        .ok();
+        writeln!(sb, "(allow network-outbound (remote unix-socket))").ok();
+    }
+
     writeln!(sb).ok();
     Ok(())
 }
@@ -357,6 +369,19 @@ mod tests {
         assert!(sbpl.contains("(remote tcp \"localhost:12345\")"));
         assert!(sbpl.contains("(remote ip \"localhost:*\")"));
         assert!(sbpl.contains("(allow network-inbound (local ip \"localhost:*\"))"));
+        assert!(sbpl.contains("(allow network-bind network-inbound (local unix-socket))"));
+        assert!(sbpl.contains("(allow network-outbound (remote unix-socket))"));
+    }
+
+    #[test]
+    fn strict_proxy_mode_does_not_allow_ambient_unix_sockets() {
+        let home = PathBuf::from("/Users/test");
+        let pwd = PathBuf::from("/Users/test/project");
+        let profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, &home, &pwd);
+        let sbpl = generate(&profile, Some(12345), SecurityMode::Strict).unwrap();
+
+        assert!(!sbpl.contains("(local unix-socket)"));
+        assert!(!sbpl.contains("(remote unix-socket)"));
     }
 
     #[test]

@@ -594,6 +594,7 @@ fn is_sensitive_environment_name(name: &str) -> bool {
         "API_KEY",
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
+        "AWS_SHARED_CREDENTIALS_FILE",
         "AWS_SESSION_TOKEN",
         "AWS_WEB_IDENTITY_TOKEN_FILE",
         "AZURE_CLIENT_SECRET",
@@ -647,6 +648,7 @@ fn is_sensitive_environment_name(name: &str) -> bool {
             "_PRIVATE_KEY",
             "_CREDENTIAL",
             "_CREDENTIALS",
+            "_CREDENTIALS_FILE",
             "_DATABASE_URL",
             "_DATABASE_URI",
             "_AUTH",
@@ -868,6 +870,17 @@ fn resolves_within(path: &Path, root: &Path) -> bool {
 }
 
 fn insert_builtin_path_grant(profile: &mut SandboxProfile, kind: GrantKind, grant: SandboxPath) {
+    // Post-finalization compatibility grants must not undo a higher-precedence
+    // execute denial. Landlock cannot subtract a denied child from an allowed
+    // directory, so any overlap suppresses the complete inferred grant.
+    if kind == GrantKind::AllowExec
+        && profile
+            .deny_exec
+            .iter()
+            .any(|denied| paths_overlap(&grant.path, &denied.path))
+    {
+        return;
+    }
     let paths = match kind {
         GrantKind::AllowWrite => &mut profile.allow_write,
         GrantKind::AllowExec => &mut profile.allow_exec,
@@ -2591,6 +2604,10 @@ mod tests {
                 ("GITHUB_TOKEN".to_owned(), "sentinel".to_owned()),
                 ("AWS_SECRET_ACCESS_KEY".to_owned(), "sentinel".to_owned()),
                 (
+                    "AWS_SHARED_CREDENTIALS_FILE".to_owned(),
+                    "/tmp/aws-credentials".to_owned(),
+                ),
+                (
                     "AWS_WEB_IDENTITY_TOKEN_FILE".to_owned(),
                     "/tmp/aws-oidc-token".to_owned(),
                 ),
@@ -2812,6 +2829,43 @@ mod tests {
         );
         assert!(!environment.contains_key("SCCACHE_CLIENT_SIDE"));
         assert!(!environment.contains_key("CARGO_BUILD_BUILD_DIR"));
+    }
+
+    #[test]
+    fn standard_profile_preserves_explicit_output_execute_denials() {
+        let project = tempfile::tempdir().unwrap();
+        let output = project.path().join("target");
+        let mut profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Rust,
+            Path::new("/Users/test"),
+            project.path(),
+        );
+        profile.merge_overrides(&ProfileOverrides {
+            deny_exec: vec![SandboxPath::dir(output.clone())],
+            ..ProfileOverrides::default()
+        });
+        profile.finalize();
+
+        apply_standard_profile(
+            &mut profile,
+            &["cargo".to_owned(), "test".to_owned()],
+            Path::new("/Users/test"),
+            project.path(),
+        )
+        .unwrap();
+
+        assert!(
+            profile
+                .deny_exec
+                .contains(&SandboxPath::dir(output.clone()))
+        );
+        assert!(
+            !profile
+                .allow_exec
+                .iter()
+                .any(|allowed| paths_overlap(&allowed.path, &output)),
+            "an inferred output grant must not override an explicit execute denial"
+        );
     }
 
     #[test]
