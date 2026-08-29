@@ -434,7 +434,9 @@ feature switches, terminal settings, and tool paths. It removes:
   `AZURE_CONFIG_DIR`, Azure
   client certificates selected by `AZURE_CLIENT_CERTIFICATE_PATH`, and Docker
   client TLS key directories selected by `DOCKER_CERT_PATH`, plus custom GitHub
-  CLI credential directories selected by `GH_CONFIG_DIR`;
+  CLI credential directories selected by `GH_CONFIG_DIR`; Cargo credential
+  files beneath the effective `CARGO_HOME` receive matching path denials rather
+  than withholding the ordinary Cargo configuration locator;
 - agent and credential socket variables;
 - dynamic-loader injection variables; and
 - SBE-reserved proxy, runtime, and policy variables.

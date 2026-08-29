@@ -113,6 +113,7 @@ async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
         });
     }
     profile.finalize();
+    protect_effective_cargo_credentials(&mut profile, &home, &pwd);
     if args.strict {
         enable_existing_dependency_execution(&mut profile, &args.command);
     } else {
@@ -892,6 +893,36 @@ fn effective_environment_path(profile: &SandboxProfile, name: &str) -> Option<Pa
         .get(name)
         .map(PathBuf::from)
         .or_else(|| std::env::var_os(name).map(PathBuf::from))
+}
+
+fn protect_effective_cargo_credentials(
+    profile: &mut SandboxProfile,
+    home: &Path,
+    project_dir: &Path,
+) {
+    let cargo_home =
+        effective_environment_path(profile, "CARGO_HOME").unwrap_or_else(|| home.join(".cargo"));
+    let cargo_home = if cargo_home.is_absolute() {
+        cargo_home
+    } else {
+        project_dir.join(cargo_home)
+    };
+    for name in ["credentials.toml", "credentials"] {
+        insert_builtin_read_denial(profile, SandboxPath::file(cargo_home.join(name)));
+    }
+}
+
+fn insert_builtin_read_denial(profile: &mut SandboxProfile, denial: SandboxPath) {
+    if profile.deny_read.iter().any(|existing| existing == &denial) {
+        return;
+    }
+    let value = denial.path.to_string_lossy().into_owned();
+    profile.deny_read.push(denial);
+    profile.grant_origins.push(GrantRecord {
+        kind: GrantKind::DenyRead,
+        value,
+        origin: GrantOrigin::BuiltIn,
+    });
 }
 
 fn effective_gradle_user_home(
@@ -3490,6 +3521,29 @@ mod tests {
         );
         assert!(strict.contains_key("PATH"));
         assert!(!strict.contains_key("RUSTFLAGS"));
+    }
+
+    #[test]
+    fn custom_cargo_home_credential_files_remain_denied() {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mut profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Rust, home.path(), project.path());
+        profile
+            .env
+            .insert("CARGO_HOME".to_owned(), "custom-cargo".to_owned());
+
+        protect_effective_cargo_credentials(&mut profile, home.path(), project.path());
+
+        for name in ["credentials.toml", "credentials"] {
+            let denied = SandboxPath::file(project.path().join("custom-cargo").join(name));
+            assert!(profile.deny_read.contains(&denied));
+            assert!(profile.grant_origins.iter().any(|record| {
+                record.kind == GrantKind::DenyRead
+                    && record.origin == GrantOrigin::BuiltIn
+                    && record.value == denied.path.to_string_lossy()
+            }));
+        }
     }
 
     #[tokio::test]

@@ -289,6 +289,8 @@ Standard mode does not hide files inside the selected workspace, including
 carve individual project files breaks general output creation on Linux. Keep
 real credentials outside untrusted workspaces or use `--strict`. Host SSH,
 cloud, package-registry, browser, and keychain credential paths remain denied.
+Cargo credential files remain denied beneath the effective `CARGO_HOME`,
+including a custom or relative location.
 
 Standard mode permits expected persistent write/execute overlap and labels the
 result tainted. Strict mode keeps the 0.4 W^X and hard-link checks. Toolchains

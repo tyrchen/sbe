@@ -108,6 +108,9 @@ All notable changes to this project will be documented in this file. See [conven
 - Filter GitLab job JWT variables, honor direct Cargo
   `--config install.root='path'` overrides, and reject implicit Cargo-config
   install roots before launch with explicit `--root` guidance.
+- Deny both Cargo credential-file spellings beneath the effective `CARGO_HOME`,
+  including custom and relative locations, without removing ordinary Cargo
+  configuration from the child environment.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23
