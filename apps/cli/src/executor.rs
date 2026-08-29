@@ -1067,11 +1067,21 @@ fn effective_npm_cache(
         } else {
             None
         };
+    let global_cache = if command_cache.is_none()
+        && environment_cache.is_none()
+        && project_cache.is_none()
+        && user_cache.is_none()
+    {
+        selected_global_npm_config_path(profile, command, home, project_dir, "cache")?
+    } else {
+        None
+    };
     let project_controlled = project_cache.is_some();
     let selected = command_cache
         .or(environment_cache)
         .or(project_cache)
         .or(user_cache)
+        .or(global_cache)
         .unwrap_or_else(|| home.join(".npm"));
     if selected.as_os_str().is_empty() {
         anyhow::bail!("NPM_CONFIG_CACHE must select a non-empty path");
@@ -1141,9 +1151,29 @@ fn effective_npm_global_config(
         profile
             .env
             .get("NPM_CONFIG_GLOBALCONFIG")
+            .or_else(|| profile.env.get("npm_config_globalconfig"))
             .map(PathBuf::from)
     });
     Ok(selected.map(|path| anchor_project_path(path, project_dir)))
+}
+
+fn selected_global_npm_config_path(
+    profile: &SandboxProfile,
+    command: &[String],
+    home: &Path,
+    project_dir: &Path,
+    key: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    let Some(path) = effective_npm_global_config(profile, command, project_dir)? else {
+        return Ok(None);
+    };
+    let Some(contents) = read_bounded_following_metadata_file(&path)? else {
+        anyhow::bail!(
+            "could not inspect explicit npm global configuration: {}",
+            path.display()
+        );
+    };
+    npm_config_path_value(&contents, &path, home, key, "global npmrc")
 }
 
 fn user_npm_config_path(
@@ -1288,6 +1318,15 @@ fn effective_pnpm_store(
         } else {
             None
         };
+    let global_store = if command_store.is_none()
+        && environment_store.is_none()
+        && project_store.is_none()
+        && user_store.is_none()
+    {
+        selected_global_npm_config_path(profile, command, home, project_dir, "store-dir")?
+    } else {
+        None
+    };
     let project_controlled = project_store.is_some();
     let default_store = effective_environment_path(profile, "PNPM_HOME")
         .map(|directory| directory.join("store"))
@@ -1300,6 +1339,7 @@ fn effective_pnpm_store(
         .or(environment_store)
         .or(project_store)
         .or(user_store)
+        .or(global_store)
         .unwrap_or(default_store);
     if selected.as_os_str().is_empty() {
         anyhow::bail!("pnpm store directory must be a non-empty path");
@@ -7747,12 +7787,21 @@ mod tests {
                 .contains(&SandboxPath::file(command_userconfig))
         );
 
+        std::fs::write(home.join(".npmrc"), "# no user cache\n").unwrap();
         let global_config = root.path().join("global-npmrc");
-        std::fs::write(&global_config, "registry=https://registry.npmjs.org/\n").unwrap();
+        let global_config_cache = root.path().join("global-config-cache");
+        std::fs::write(
+            &global_config,
+            format!(
+                "registry=https://registry.npmjs.org/\ncache={}\n",
+                global_config_cache.display()
+            ),
+        )
+        .unwrap();
         let mut global_config_selected =
             SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &project);
         global_config_selected.env.insert(
-            "NPM_CONFIG_GLOBALCONFIG".to_owned(),
+            "npm_config_globalconfig".to_owned(),
             global_config.to_string_lossy().into_owned(),
         );
         apply_standard_profile(
@@ -7766,6 +7815,11 @@ mod tests {
             global_config_selected
                 .allow_read
                 .contains(&SandboxPath::file(global_config))
+        );
+        assert!(
+            global_config_selected
+                .allow_write
+                .contains(&SandboxPath::dir(global_config_cache))
         );
 
         let pnpm_home = root.path().join("custom-pnpm-home");

@@ -212,17 +212,19 @@ rejected with `--root` guidance instead of failing later inside the sandbox.
 Registry and Git dependency caches follow the effective `CARGO_HOME`; its two
 credential-file spellings remain denied.
 For npm/npx, a command `--cache` selection overrides `NPM_CONFIG_CACHE`, then a
-simple project `.npmrc` `cache=path`, user `~/.npmrc`, and the default `~/.npm`.
+simple project `.npmrc` `cache=path`, user `~/.npmrc`, an explicitly selected
+global npmrc, and the default `~/.npm`.
 `--userconfig` or an explicitly restored user-config locator selects that user
 layer. The effective existing user configuration receives an exact read grant
 so npm can consume registry and other settings without exposing its directory.
 An explicitly restored or command-selected global configuration likewise
 receives only an exact file grant.
 For pnpm, `--store-dir`, its configuration environment, project `.npmrc`, and
-user `.npmrc` similarly select the store. Relative paths are anchored to the
-selected project. Without a store override, `PNPM_HOME/store` precedes the XDG
-and conventional defaults. An external project-selected cache/store requires
-explicit `--allow-write` approval.
+user `.npmrc`, then an explicitly selected global npmrc similarly select the
+store. Relative paths are anchored to the selected project. Without a store
+override, `PNPM_HOME/store` precedes the XDG and conventional defaults. An
+external project-selected cache/store requires explicit `--allow-write`
+approval.
 For uv and pip, command `--cache-dir` overrides `UV_CACHE_DIR` or
 `PIP_CACHE_DIR`. uv then reads project `uv.toml`, or `[tool.uv]` in
 `pyproject.toml` when no `uv.toml` exists; an external project-selected cache

@@ -238,7 +238,8 @@ Standard mode grants writes to:
   an install operation.
 
 For npm and npx commands, `--cache` overrides `NPM_CONFIG_CACHE`, then a simple
-project `.npmrc` `cache=path`, user `~/.npmrc`, then the default `~/.npm`.
+project `.npmrc` `cache=path`, user `~/.npmrc`, an explicitly selected global
+npmrc, then the default `~/.npm`.
 An npm `--userconfig` or explicitly restored user-config locator selects the
 user layer. The effective existing user configuration receives an exact read
 grant so the child npm, npx, or pnpm process sees the same configuration SBE
@@ -246,11 +247,11 @@ used without opening the containing directory. An explicitly restored or
 command-selected global configuration likewise receives only an exact file
 grant.
 pnpm's `--store-dir`, configuration environment, project `.npmrc`, and user
-`.npmrc` select its store in the same manner. The effective cache/store replaces
-the corresponding default writable grant; relative paths are anchored to the
-command project. Without an override, `PNPM_HOME/store` precedes the XDG and
-conventional defaults. A repository-selected external path requires
-`--allow-write`.
+`.npmrc`, then an explicitly selected global npmrc select its store in the same
+manner. The effective cache/store replaces the corresponding default writable
+grant; relative paths are anchored to the command project. Without an override,
+`PNPM_HOME/store` precedes the XDG and conventional defaults. A
+repository-selected external path requires `--allow-write`.
 
 For uv and pip commands, `--cache-dir` overrides the corresponding
 `UV_CACHE_DIR` or `PIP_CACHE_DIR`. uv then resolves a simple `cache-dir` from

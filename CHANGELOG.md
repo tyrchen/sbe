@@ -146,6 +146,8 @@ All notable changes to this project will be documented in this file. See [conven
   removing stale conventional Poetry cache grants.
 - Filter npm global-config and Poetry config-directory locators, honor Poetry's
   global/project configured cache, and grant Gradle's selected project cache.
+- Accept both npm global-config environment spellings and resolve cache/store
+  paths from the explicitly selected global npmrc after higher-priority layers.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23
