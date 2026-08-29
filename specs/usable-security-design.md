@@ -342,8 +342,10 @@ For the built-in workspace read grant, standard mode discovers symlinks in the
 source tree without descending into conventional generated dependency and
 output directories, then installs separate read rules for safe external
 referents. External directory referents are inspected for nested source links;
-canonical directory identities break cycles. Referents overlapping protected
-read denials are omitted.
+canonical directory identities break cycles, and fixed entry/depth budgets
+bound startup time and memory. Exceeding either budget fails policy resolution
+instead of continuing with a partial authority view. Referents overlapping
+protected read denials are omitted.
 
 On macOS it resolves and validates the target before rendering its canonical
 SBPL grant. Because the untrusted child has not started and cannot write
@@ -378,7 +380,8 @@ feature switches, terminal settings, and tool paths. It removes:
 - names matching a maintained high-confidence secret pattern such as tokens,
   passwords, private keys, and cloud credentials;
 - known credential variables independent of spelling convention, including
-  prefix-encoded forms such as Terraform's `TF_TOKEN_<host>`;
+  prefix-encoded forms such as Terraform's `TF_TOKEN_<host>` and concatenated
+  platform names such as Azure Pipelines' `SYSTEM_ACCESSTOKEN`;
 - agent and credential socket variables;
 - dynamic-loader injection variables; and
 - SBE-reserved proxy, runtime, and policy variables.

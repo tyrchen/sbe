@@ -294,7 +294,8 @@ or another declared writable root; an external referent fails with a copyable
 outside generated dependency/output directories, including nested links in an
 external source referent, so a link into an ordinary sibling checkout is
 readable without granting the sibling's parent. Canonical directory identities
-prevent traversal cycles. Magic links and protected referents remain rejected.
+prevent traversal cycles, while entry and depth budgets bound discovery work.
+Magic links and protected referents remain rejected.
 Strict mode retains no-follow resolution except for immutable system aliases.
 Denied paths include their current canonical target. Strict mode also retains
 hard-link alias rejection; standard mode does not recursively scan historical

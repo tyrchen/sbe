@@ -298,18 +298,13 @@ pub fn compile(
         )?;
     }
     for sp in &profile.allow_read {
-        let symlink_behavior = if security_mode.is_strict() {
-            UntrustedSymlinkBehavior::Reject
-        } else {
-            UntrustedSymlinkBehavior::Follow
-        };
         created = add_read_rule(
             created,
             sp,
             &forbidden_reads,
             abi,
             &mut carved_entries,
-            symlink_behavior,
+            UntrustedSymlinkBehavior::Reject,
         )?;
     }
 
@@ -323,12 +318,11 @@ pub fn compile(
         } else {
             write_access(abi)
         };
-        let symlink_behavior = if security_mode.is_strict() {
-            UntrustedSymlinkBehavior::Reject
-        } else {
-            UntrustedSymlinkBehavior::Follow
-        };
-        created = add_write_rule(created, sp, access, abi, symlink_behavior)?;
+        // Standard mode has already replaced existing symlink grants with
+        // canonical snapshots. Reject here so missing paths are created via
+        // the descriptor-relative no-symlink walk and a parallel build cannot
+        // insert a late symlink between profile resolution and compilation.
+        created = add_write_rule(created, sp, access, abi, UntrustedSymlinkBehavior::Reject)?;
         // Mutable caches and outputs must be readable to be useful, but they
         // remain non-executable. The forbidden-read lint rejects overlaps.
         created = add_read_rule(
@@ -337,7 +331,7 @@ pub fn compile(
             &forbidden_reads,
             abi,
             &mut carved_entries,
-            symlink_behavior,
+            UntrustedSymlinkBehavior::Reject,
         )?;
     }
     for path in BASELINE_WRITE_PATHS {
@@ -350,21 +344,17 @@ pub fn compile(
         )?;
     }
 
-    // Exec allowlist (read+exec); covers shared libraries too. Per-entry
-    // policy: Follow for root-owned system paths (/lib, /usr/, /bin, …)
-    // because those are symlinks on usr-merge distros and only root can
-    // tamper with them; Refuse for anything else (notably $HOME-relative
-    // entries like ~/.cargo/bin/, ~/.nvm/) because a hostile earlier
-    // build can plant a symlink there.
+    // Exec allowlist (read+exec); covers shared libraries too. Standard mode
+    // supplies canonical snapshots, while strict mode skips unsafe optional
+    // built-in alternatives and rejects user/runtime aliases.
     for (index, sp) in profile.allow_exec.iter().enumerate() {
         // Built-in profiles list alternatives for multiple distributions and
         // tool managers. If an optional alias exists under a mutable parent,
         // omitting its rule is fail-closed and lets unrelated commands use
         // the profile. User/runtime grants remain strict because silently
         // ignoring an explicitly requested capability would be misleading.
-        let symlink_behavior = if !security_mode.is_strict() {
-            UntrustedSymlinkBehavior::Follow
-        } else if index < profile.first_user_allow_exec {
+        let symlink_behavior = if security_mode.is_strict() && index < profile.first_user_allow_exec
+        {
             UntrustedSymlinkBehavior::Skip
         } else {
             UntrustedSymlinkBehavior::Reject

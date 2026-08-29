@@ -30,6 +30,8 @@ use crate::cli::RunArgs;
 /// sbe exit codes for its own errors (matching docker run / env conventions).
 const EXIT_SBE_ERROR: u8 = 125;
 const EXIT_SANDBOX_FAILED: u8 = 126;
+const MAX_SOURCE_SYMLINK_SCAN_ENTRIES: usize = 100_000;
+const MAX_SOURCE_SYMLINK_SCAN_DEPTH: usize = 128;
 
 const SAFE_PARENT_ENV: &[&str] = &[
     "PATH",
@@ -609,6 +611,7 @@ fn is_sensitive_environment_name(name: &str) -> bool {
         "SECRET",
         "SSH_AGENT_PID",
         "SSH_AUTH_SOCK",
+        "SYSTEM_ACCESSTOKEN",
         "TOKEN",
     ];
     const RESERVED: &[&str] = &[
@@ -899,7 +902,8 @@ fn resolve_standard_path_aliases(
 ) -> anyhow::Result<()> {
     snapshot_standard_write_aliases(profile, home, project_dir)?;
     snapshot_standard_exec_aliases(profile);
-    let read_aliases = workspace_read_aliases(profile, project_dir);
+    snapshot_standard_read_aliases(profile);
+    let read_aliases = workspace_read_aliases(profile, project_dir)?;
     for alias in read_aliases {
         if !profile.allow_read.contains(&alias) {
             profile.grant_origins.push(GrantRecord {
@@ -931,6 +935,36 @@ fn snapshot_standard_exec_aliases(profile: &mut SandboxProfile) {
             }
             records.push(GrantRecord {
                 kind: GrantKind::AllowExec,
+                value: resolved.to_string_lossy().into_owned(),
+                origin: GrantOrigin::Runtime,
+            });
+            SandboxPath {
+                path: resolved,
+                kind: grant.kind,
+            }
+        })
+        .collect();
+    profile.grant_origins.extend(records);
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "standard mode snapshots readable symlink referents before launching untrusted code"
+)]
+fn snapshot_standard_read_aliases(profile: &mut SandboxProfile) {
+    let mut records = Vec::new();
+    profile.allow_read = profile
+        .allow_read
+        .drain(..)
+        .map(|grant| {
+            let Ok(resolved) = std::fs::canonicalize(&grant.path) else {
+                return grant;
+            };
+            if resolved == grant.path {
+                return grant;
+            }
+            records.push(GrantRecord {
+                kind: GrantKind::AllowRead,
                 value: resolved.to_string_lossy().into_owned(),
                 origin: GrantOrigin::Runtime,
             });
@@ -1087,11 +1121,28 @@ fn grant_covers(grant: &SandboxPath, target: &Path) -> bool {
     }
 }
 
+fn workspace_read_aliases(
+    profile: &SandboxProfile,
+    project_dir: &Path,
+) -> anyhow::Result<Vec<SandboxPath>> {
+    workspace_read_aliases_with_limits(
+        profile,
+        project_dir,
+        MAX_SOURCE_SYMLINK_SCAN_ENTRIES,
+        MAX_SOURCE_SYMLINK_SCAN_DEPTH,
+    )
+}
+
 #[allow(
     clippy::disallowed_methods,
     reason = "standard mode snapshots source symlink referents before launching untrusted code"
 )]
-fn workspace_read_aliases(profile: &SandboxProfile, project_dir: &Path) -> Vec<SandboxPath> {
+fn workspace_read_aliases_with_limits(
+    profile: &SandboxProfile,
+    project_dir: &Path,
+    max_entries: usize,
+    max_depth: usize,
+) -> anyhow::Result<Vec<SandboxPath>> {
     const DERIVED_DIRECTORIES: &[&str] = &[
         ".git",
         ".gradle",
@@ -1109,10 +1160,17 @@ fn workspace_read_aliases(profile: &SandboxProfile, project_dir: &Path) -> Vec<S
 
     let project_referent =
         std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
-    let mut pending = vec![project_dir.to_path_buf()];
+    let mut pending = vec![(project_dir.to_path_buf(), 0_usize)];
     let mut visited_directories = BTreeSet::new();
     let mut resolved_paths = BTreeSet::new();
-    while let Some(directory) = pending.pop() {
+    let mut inspected_entries = 0_usize;
+    while let Some((directory, depth)) = pending.pop() {
+        if depth > max_depth {
+            anyhow::bail!(
+                "source symlink discovery exceeds the maximum depth of {max_depth} below '{}'",
+                project_dir.display()
+            );
+        }
         let directory = match std::fs::canonicalize(&directory) {
             Ok(directory) => directory,
             Err(error) => {
@@ -1131,6 +1189,14 @@ fn workspace_read_aliases(profile: &SandboxProfile, project_dir: &Path) -> Vec<S
             }
         };
         for entry in entries {
+            inspected_entries = inspected_entries.saturating_add(1);
+            if inspected_entries > max_entries {
+                anyhow::bail!(
+                    "source symlink discovery exceeds the {max_entries}-entry scan budget below \
+                     '{}'",
+                    project_dir.display()
+                );
+            }
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
@@ -1166,15 +1232,15 @@ fn workspace_read_aliases(profile: &SandboxProfile, project_dir: &Path) -> Vec<S
                 if resolved_paths.insert(resolved.clone())
                     && std::fs::metadata(&resolved).is_ok_and(|metadata| metadata.is_dir())
                 {
-                    pending.push(resolved);
+                    pending.push((resolved, depth + 1));
                 }
             } else if file_type.is_dir() {
-                pending.push(path);
+                pending.push((path, depth + 1));
             }
         }
     }
 
-    resolved_paths
+    Ok(resolved_paths
         .into_iter()
         .filter_map(|path| {
             let metadata = std::fs::metadata(&path).ok()?;
@@ -1184,7 +1250,7 @@ fn workspace_read_aliases(profile: &SandboxProfile, project_dir: &Path) -> Vec<S
                 SandboxPath::file(path)
             })
         })
-        .collect()
+        .collect())
 }
 
 #[allow(
@@ -2506,6 +2572,7 @@ mod tests {
                 ("GITHUB_TOKEN".to_owned(), "sentinel".to_owned()),
                 ("AWS_SECRET_ACCESS_KEY".to_owned(), "sentinel".to_owned()),
                 ("SSH_AUTH_SOCK".to_owned(), "/tmp/agent".to_owned()),
+                ("SYSTEM_ACCESSTOKEN".to_owned(), "sentinel".to_owned()),
                 ("NPM_TOKEN".to_owned(), "sentinel".to_owned()),
                 ("OPENAI_API_KEY".to_owned(), "sentinel".to_owned()),
                 ("TOKEN".to_owned(), "sentinel".to_owned()),
@@ -2910,6 +2977,30 @@ mod tests {
                 .any(|grant| { grant.path == std::fs::canonicalize(&protected).unwrap() }),
             "protected referents must not receive an inferred read grant"
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the unit test builds an isolated bounded source traversal fixture"
+    )]
+    fn standard_source_symlink_discovery_is_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let source = project.join("src");
+        let external = root.path().join("external");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        std::os::unix::fs::symlink(&external, source.join("external")).unwrap();
+        let profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, root.path(), &project);
+
+        let entry_error =
+            workspace_read_aliases_with_limits(&profile, &project, 1, 128).unwrap_err();
+        assert!(entry_error.to_string().contains("entry scan budget"));
+
+        let depth_error =
+            workspace_read_aliases_with_limits(&profile, &project, 100, 1).unwrap_err();
+        assert!(depth_error.to_string().contains("maximum depth"));
     }
 
     #[test]
