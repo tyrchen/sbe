@@ -238,10 +238,11 @@ Standard mode grants writes to:
   an install operation.
 
 For Gradle commands, the conventional cache grant follows Gradle's effective
-user home: `--gradle-user-home`/`-g`, inherited `GRADLE_USER_HOME`, then
-`~/.gradle`. Relative selections are anchored to the command's project. Only
-runtime subdirectories such as caches, wrapper distributions, daemons, and
-toolchains are writable; the user-home root and `init.d` remain immutable.
+user home: `--gradle-user-home`, every accepted `-g` form including `-g/path`,
+inherited `GRADLE_USER_HOME`, then `~/.gradle`. Relative selections are anchored
+to the command's project. Only runtime subdirectories such as `.tmp`, caches,
+wrapper distributions, daemons, and toolchains are writable; the user-home root
+and `init.d` remain immutable.
 
 It denies writes everywhere else. In particular, home-directory persistence,
 credentials, shell startup, SSH authorization, user service configuration, and
@@ -266,7 +267,8 @@ as the child environment: trusted configuration and explicit CLI environment
 values override the parent environment. Policy compilation must not authorize
 one Cargo target or install root and then launch Cargo with another.
 Explicit tool arguments remain higher precedence still: Cargo `--target-dir`
-overrides target environment/config paths, while Gradle's user-home flags and
+overrides direct `--config build.target-dir='path'` and target environment
+paths, while Gradle's user-home flags and
 `gradle.user.home` system property override `GRADLE_OPTS` and
 `JAVA_OPTS`, then `GRADLE_USER_HOME`. Repeated JVM properties use the last
 value. An inherited JVM-option value requiring shell expansion is rejected with

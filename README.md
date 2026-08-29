@@ -202,9 +202,12 @@ workflows, sccache, Gradle daemons, virtual environments, and normal incremental
 builds usable in one invocation. Top-level `cargo install` also receives its
 selected install root; the installed binary is not made trustworthy by SBE.
 An external Cargo target can be selected with an inherited `CARGO_TARGET_DIR`
-or granted explicitly with matching `--allow-write` and `--allow-exec` paths.
-Without that inherited variable, standard mode selects `$PWD/target` instead of
-trying to reproduce Cargo's layered configuration rules.
+or a direct `--config build.target-dir='path'` override, or granted explicitly
+with matching `--allow-write` and `--allow-exec` paths. Cargo `--config` file
+paths are rejected because SBE cannot determine their effective target without
+reimplementing Cargo's layered configuration; use `--target-dir` instead.
+Without an explicit or inherited override, standard mode selects `$PWD/target`
+instead of trying to reproduce Cargo's layered configuration rules.
 
 Persistent outputs and package caches are still attacker-controlled data after
 an untrusted build. Strict W^X prevents direct execution during that invocation;

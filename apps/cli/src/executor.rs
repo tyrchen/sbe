@@ -35,6 +35,7 @@ const EXIT_SANDBOX_FAILED: u8 = 126;
 const STANDARD_NO_PROXY: &str = "localhost,.localhost,127.0.0.1,::1";
 const STANDARD_JAVA_NON_PROXY_HOSTS: &str = "localhost|*.localhost|127.*|[::1]";
 const STANDARD_GRADLE_MUTABLE_SUBDIRECTORIES: &[&str] = &[
+    ".tmp",
     "caches",
     "daemon",
     "jdks",
@@ -774,7 +775,12 @@ fn apply_standard_profile(
 
     if command_is(command, "cargo") {
         let cargo_cli_target = command_option_value(command, "--target-dir").map(PathBuf::from);
-        if let Some(path) = cargo_cli_target {
+        let cargo_config_target = if cargo_cli_target.is_none() {
+            cargo_config_target_dir(command)?
+        } else {
+            None
+        };
+        if let Some(path) = cargo_cli_target.or(cargo_config_target) {
             let path = if path.is_absolute() {
                 path
             } else {
@@ -847,8 +853,7 @@ fn effective_gradle_user_home(
     if !command_is(command, "gradle") && !command_is(command, "gradlew") {
         return Ok(None);
     }
-    let command_home = command_option_value(command, "--gradle-user-home")
-        .or_else(|| command_option_value(command, "-g"))
+    let command_home = command_aliased_option_value(command, "--gradle-user-home", "-g")
         .map(PathBuf::from)
         .or_else(|| command_system_property(command, "gradle.user.home").map(PathBuf::from));
     let inherited_jvm_home = if command_home.is_none() {
@@ -1587,6 +1592,97 @@ fn command_option_value<'a>(command: &'a [String], option: &str) -> Option<&'a s
         }
     }
     None
+}
+
+fn command_aliased_option_value<'a>(
+    command: &'a [String],
+    long: &str,
+    short: &str,
+) -> Option<&'a str> {
+    let mut arguments = command
+        .iter()
+        .skip(1)
+        .take_while(|argument| argument.as_str() != "--");
+    let mut selected = None;
+    while let Some(argument) = arguments.next() {
+        if argument == long || argument == short {
+            selected = arguments.next().map(String::as_str);
+            continue;
+        }
+        if let Some(value) = argument
+            .strip_prefix(long)
+            .and_then(|suffix| suffix.strip_prefix('='))
+        {
+            selected = Some(value);
+            continue;
+        }
+        if let Some(suffix) = argument.strip_prefix(short) {
+            selected = Some(suffix.strip_prefix('=').unwrap_or(suffix));
+        }
+    }
+    selected.filter(|value| !value.is_empty())
+}
+
+fn cargo_config_target_dir(command: &[String]) -> anyhow::Result<Option<PathBuf>> {
+    let mut arguments = command
+        .iter()
+        .skip(1)
+        .take_while(|argument| argument.as_str() != "--");
+    let mut selected = None;
+    while let Some(argument) = arguments.next() {
+        let config = if argument == "--config" {
+            arguments
+                .next()
+                .map(String::as_str)
+                .context("cargo --config requires a value")?
+        } else if let Some(value) = argument.strip_prefix("--config=") {
+            value
+        } else {
+            continue;
+        };
+        let Some((key, value)) = config.split_once('=') else {
+            anyhow::bail!(
+                "cargo --config file paths cannot be inspected safely for build.target-dir; use \
+                 --target-dir or a direct --config build.target-dir='path' override"
+            );
+        };
+        let key = key.trim();
+        if key == "build.target-dir" {
+            selected = Some(parse_cargo_config_path(value)?);
+        } else if key == "build" || key.contains("target-dir") {
+            anyhow::bail!(
+                "cargo --config target-directory override '{key}' is unsupported; use \
+                 --target-dir or a direct --config build.target-dir='path' override"
+            );
+        }
+    }
+    Ok(selected)
+}
+
+fn parse_cargo_config_path(value: &str) -> anyhow::Result<PathBuf> {
+    let value = value.trim();
+    let path = if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
+        let path = &value[1..value.len() - 1];
+        if path.contains('\'') {
+            anyhow::bail!("cargo build.target-dir contains an unsupported quoted path");
+        }
+        path
+    } else if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+        let path = &value[1..value.len() - 1];
+        if path.contains('\\') || path.contains('"') {
+            anyhow::bail!("cargo build.target-dir contains unsupported TOML escapes");
+        }
+        path
+    } else {
+        anyhow::bail!(
+            "cargo build.target-dir must be a simple quoted path; use --target-dir for complex \
+             values"
+        );
+    };
+    if path.is_empty() || path.chars().any(char::is_control) {
+        anyhow::bail!("cargo build.target-dir must be a non-empty path without control characters");
+    }
+    Ok(PathBuf::from(path))
 }
 
 fn command_system_property<'a>(command: &'a [String], name: &str) -> Option<&'a str> {
@@ -3199,6 +3295,36 @@ mod tests {
         }
         assert!(!cli.allow_write.contains(&SandboxPath::dir(cli_home)));
 
+        let attached_home = root.path().join("attached-gradle");
+        let mut attached = SandboxProfile::for_ecosystem(Ecosystem::Java, &home, &project);
+        attached.env.insert(
+            "GRADLE_USER_HOME".to_owned(),
+            root.path()
+                .join("ignored-attached-environment")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        apply_standard_profile(
+            &mut attached,
+            &[
+                "gradle".to_owned(),
+                format!("-g{}", attached_home.display()),
+                "help".to_owned(),
+            ],
+            &home,
+            &project,
+        )
+        .unwrap();
+        for name in STANDARD_GRADLE_MUTABLE_SUBDIRECTORIES {
+            let path = attached_home.join(name);
+            assert!(
+                attached
+                    .allow_write
+                    .contains(&SandboxPath::dir(path.clone()))
+            );
+            assert!(attached.allow_exec.contains(&SandboxPath::dir(path)));
+        }
+
         let property_home = root.path().join("property-gradle");
         let mut property = SandboxProfile::for_ecosystem(Ecosystem::Java, &home, &project);
         property.env.insert(
@@ -3792,6 +3918,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         let target = tempfile::tempdir().unwrap();
+        let config_target = tempfile::tempdir().unwrap();
         let install_root = tempfile::tempdir().unwrap();
 
         let mut build_profile =
@@ -3852,6 +3979,57 @@ mod tests {
                 .contains(&SandboxPath::dir(target.path().to_path_buf())),
             "the CLI target directory must replace the lower-precedence environment path"
         );
+
+        let mut config_build_profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Rust, home.path(), project.path());
+        config_build_profile.env.insert(
+            "CARGO_TARGET_DIR".to_owned(),
+            target.path().to_string_lossy().into_owned(),
+        );
+        apply_standard_profile(
+            &mut config_build_profile,
+            &[
+                "cargo".to_owned(),
+                "build".to_owned(),
+                "--config".to_owned(),
+                format!("build.target-dir='{}'", config_target.path().display()),
+            ],
+            home.path(),
+            project.path(),
+        )
+        .unwrap();
+        assert!(
+            config_build_profile
+                .allow_write
+                .contains(&SandboxPath::dir(config_target.path().to_path_buf()))
+        );
+        assert!(
+            config_build_profile
+                .allow_exec
+                .contains(&SandboxPath::dir(config_target.path().to_path_buf()))
+        );
+        assert!(
+            !config_build_profile
+                .allow_write
+                .contains(&SandboxPath::dir(target.path().to_path_buf())),
+            "a direct Cargo config target must replace the environment path"
+        );
+
+        let mut config_file_profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Rust, home.path(), project.path());
+        let error = apply_standard_profile(
+            &mut config_file_profile,
+            &[
+                "cargo".to_owned(),
+                "--config".to_owned(),
+                "cargo-extra.toml".to_owned(),
+                "build".to_owned(),
+            ],
+            home.path(),
+            project.path(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("--target-dir"));
 
         let mut node_profile =
             SandboxProfile::for_ecosystem(Ecosystem::Node, home.path(), project.path());
