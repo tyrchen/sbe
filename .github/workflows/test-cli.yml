@@ -73,15 +73,15 @@ jobs:
           set -euo pipefail
           out=$(sbe inspect -- cargo build 2>&1)
           test -n "$out"
-          echo "$out" | head -40
-          echo "$out" | grep -E "^securityMode: standard" >/dev/null
+          head -40 <<<"$out"
+          grep -E "^securityMode: standard" <<<"$out" >/dev/null
           if [ "${{ runner.os }}" = "Linux" ]; then
-            echo "$out" | grep -E "^backend: landlock\+seccomp" >/dev/null
-            echo "$out" | grep -E "^landlockAbi: v[0-9]+" >/dev/null
-            echo "$out" | grep -E "^seccomp:" >/dev/null
+            grep -E "^backend: landlock\+seccomp" <<<"$out" >/dev/null
+            grep -E "^landlockAbi: v[0-9]+" <<<"$out" >/dev/null
+            grep -E "^seccomp:" <<<"$out" >/dev/null
           else
-            echo "$out" | grep -E "^\(version 1\)" >/dev/null
-            echo "$out" | grep -E "^\(deny default\)" >/dev/null
+            grep -E "^\(version 1\)" <<<"$out" >/dev/null
+            grep -E "^\(deny default\)" <<<"$out" >/dev/null
           fi
 
       - name: sbe inspect for every ecosystem (smoke)
