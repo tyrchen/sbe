@@ -758,7 +758,18 @@ fn apply_standard_profile(
     }
 
     if let Some(npm_cache) = effective_npm_cache(profile, command, home, project_dir)? {
-        replace_builtin_write_path(profile, &home.join(".npm"), SandboxPath::dir(npm_cache));
+        if npm_cache.project_controlled
+            && !project_npm_cache_is_approved(profile, &npm_cache.path, home, project_dir)
+        {
+            let resolved = resolve_existing_ancestor(&npm_cache.path)
+                .unwrap_or_else(|| npm_cache.path.clone());
+            return Err(external_write_approval_error(&npm_cache.path, &resolved));
+        }
+        replace_builtin_write_path(
+            profile,
+            &home.join(".npm"),
+            SandboxPath::dir(npm_cache.path),
+        );
     }
 
     if profile.name == "java" {
@@ -924,12 +935,17 @@ fn effective_environment_path(profile: &SandboxProfile, name: &str) -> Option<Pa
         .or_else(|| std::env::var_os(name).map(PathBuf::from))
 }
 
+struct NpmCacheSelection {
+    path: PathBuf,
+    project_controlled: bool,
+}
+
 fn effective_npm_cache(
     profile: &SandboxProfile,
     command: &[String],
     home: &Path,
     project_dir: &Path,
-) -> anyhow::Result<Option<PathBuf>> {
+) -> anyhow::Result<Option<NpmCacheSelection>> {
     if profile.name != "node" || (!command_is(command, "npm") && !command_is(command, "npx")) {
         return Ok(None);
     }
@@ -956,17 +972,113 @@ fn effective_npm_cache(
             command_cache = Some(PathBuf::from(value));
         }
     }
+    let environment_cache = if command_cache.is_none() {
+        effective_environment_path(profile, "NPM_CONFIG_CACHE").or_else(|| {
+            profile
+                .env
+                .get("npm_config_cache")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("npm_config_cache").map(PathBuf::from))
+        })
+    } else {
+        None
+    };
+    let project_cache = if command_cache.is_none() && environment_cache.is_none() {
+        project_npm_cache(project_dir, home)?
+    } else {
+        None
+    };
+    let project_controlled = project_cache.is_some();
     let selected = command_cache
-        .or_else(|| effective_environment_path(profile, "NPM_CONFIG_CACHE"))
+        .or(environment_cache)
+        .or(project_cache)
         .unwrap_or_else(|| home.join(".npm"));
     if selected.as_os_str().is_empty() {
         anyhow::bail!("NPM_CONFIG_CACHE must select a non-empty path");
     }
-    Ok(Some(if selected.is_absolute() {
-        selected
-    } else {
-        project_dir.join(selected)
+    Ok(Some(NpmCacheSelection {
+        path: if selected.is_absolute() {
+            selected
+        } else {
+            project_dir.join(selected)
+        },
+        project_controlled,
     }))
+}
+
+fn project_npm_cache(project_dir: &Path, home: &Path) -> anyhow::Result<Option<PathBuf>> {
+    let path = project_dir.join(".npmrc");
+    let Some(contents) = read_bounded_project_file(&path)? else {
+        return Ok(None);
+    };
+    let contents = std::str::from_utf8(&contents)
+        .with_context(|| format!("project npm configuration is not UTF-8: {}", path.display()))?;
+    let mut selected = None;
+    for line in contents.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            if line
+                .split_whitespace()
+                .next()
+                .is_some_and(|key| key.eq_ignore_ascii_case("cache"))
+            {
+                anyhow::bail!(
+                    "project .npmrc selects cache in an unsupported form; use npm \
+                     --cache=/unambiguous/path"
+                );
+            }
+            continue;
+        };
+        if !key.trim().eq_ignore_ascii_case("cache") {
+            continue;
+        }
+        let mut value = value.trim();
+        if value.len() >= 2
+            && ((value.starts_with('"') && value.ends_with('"'))
+                || (value.starts_with('\'') && value.ends_with('\'')))
+        {
+            value = &value[1..value.len() - 1];
+        }
+        let value = value
+            .replace("${HOME}", &home.to_string_lossy())
+            .replace("${home}", &home.to_string_lossy());
+        let value = value
+            .strip_prefix("~/")
+            .map_or_else(|| PathBuf::from(&value), |suffix| home.join(suffix));
+        let value_text = value.to_string_lossy();
+        if value.as_os_str().is_empty()
+            || value_text
+                .chars()
+                .any(|character| character.is_control() || matches!(character, '$' | '`'))
+            || value_text.starts_with('"')
+            || value_text.starts_with('\'')
+            || value_text.ends_with('"')
+            || value_text.ends_with('\'')
+        {
+            anyhow::bail!(
+                "project .npmrc selects cache in a form sbe cannot resolve safely; use npm \
+                 --cache=/unambiguous/path"
+            );
+        }
+        selected = Some(value);
+    }
+    Ok(selected)
+}
+
+fn project_npm_cache_is_approved(
+    profile: &SandboxProfile,
+    cache: &Path,
+    home: &Path,
+    project_dir: &Path,
+) -> bool {
+    let resolved = resolve_existing_ancestor(cache).unwrap_or_else(|| cache.to_path_buf());
+    let project =
+        resolve_existing_ancestor(project_dir).unwrap_or_else(|| project_dir.to_path_buf());
+    resolved.starts_with(project)
+        || cache.starts_with(home.join(".npm"))
+        || explicit_write_covers(profile, &resolved)
 }
 
 fn effective_cargo_home(profile: &SandboxProfile, home: &Path, project_dir: &Path) -> PathBuf {
@@ -1089,6 +1201,15 @@ fn effective_maven_settings_read_paths(
     .into_iter()
     .flatten()
     {
+        if settings.project_controlled {
+            let resolved =
+                resolve_existing_ancestor(&settings.path).unwrap_or_else(|| settings.path.clone());
+            let project =
+                resolve_existing_ancestor(project_dir).unwrap_or_else(|| project_dir.to_path_buf());
+            if !resolved.starts_with(project) && !explicit_read_covers(profile, &resolved) {
+                return Err(external_read_approval_error(&settings.path, &resolved));
+            }
+        }
         paths.push(SandboxPath::file(settings.path));
     }
     Ok(paths)
@@ -2117,6 +2238,24 @@ fn explicit_write_covers(profile: &SandboxProfile, target: &Path) -> bool {
         .iter()
         .filter_map(resolve_explicit_grant)
         .any(|explicit| grant_covers(&explicit, target))
+}
+
+fn explicit_read_covers(profile: &SandboxProfile, target: &Path) -> bool {
+    let built_in_boundary = profile.first_user_allow_read.min(profile.allow_read.len());
+    profile.allow_read[built_in_boundary..]
+        .iter()
+        .filter_map(resolve_explicit_grant)
+        .any(|explicit| grant_covers(&explicit, target))
+}
+
+fn external_read_approval_error(lexical: &Path, resolved: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "project-selected readable path '{}' resolves outside the workspace to '{}'; approve that \
+         target explicitly with --allow-read '{}'",
+        lexical.display(),
+        resolved.display(),
+        resolved.display()
+    )
 }
 
 fn external_write_approval_error(lexical: &Path, resolved: &Path) -> anyhow::Error {
@@ -3841,12 +3980,16 @@ fn build_overrides(args: &RunArgs, home: &Path, pwd: &Path) -> anyhow::Result<Pr
             .iter()
             .map(|path| expand_cli_path(path, home, pwd))
             .collect::<anyhow::Result<_>>()?,
+        allow_read: args
+            .allow_read
+            .iter()
+            .map(|path| expand_cli_path(path, home, pwd))
+            .collect::<anyhow::Result<_>>()?,
         deny_read: args
             .deny_read
             .iter()
             .map(|path| expand_cli_path(path, home, pwd))
             .collect::<anyhow::Result<_>>()?,
-        allow_read: Vec::new(),
         allow_domains: args
             .allow_domain
             .iter()
@@ -5204,7 +5347,42 @@ mod tests {
             project.path(),
         )
         .unwrap_err();
+        assert!(error.to_string().contains("--allow-read"));
+
+        let mut settings_read_approved =
+            SandboxProfile::for_ecosystem(Ecosystem::Java, home.path(), project.path());
+        settings_read_approved
+            .allow_read
+            .push(SandboxPath::file(explicit_settings.clone()));
+        let error = apply_standard_profile(
+            &mut settings_read_approved,
+            &["mvn".to_owned(), "validate".to_owned()],
+            home.path(),
+            project.path(),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("--allow-write"));
+
+        let mut project_settings_approved =
+            SandboxProfile::for_ecosystem(Ecosystem::Java, home.path(), project.path());
+        project_settings_approved
+            .allow_read
+            .push(SandboxPath::file(explicit_settings.clone()));
+        project_settings_approved
+            .allow_write
+            .push(SandboxPath::dir(explicit_repository.path().to_path_buf()));
+        apply_standard_profile(
+            &mut project_settings_approved,
+            &["mvn".to_owned(), "validate".to_owned()],
+            home.path(),
+            project.path(),
+        )
+        .unwrap();
+        assert!(
+            project_settings_approved
+                .allow_read
+                .contains(&SandboxPath::file(explicit_settings.clone()))
+        );
 
         std::fs::write(
             project.path().join(".mvn/maven.config"),
@@ -6407,6 +6585,40 @@ mod tests {
             environment_selected
                 .allow_write
                 .contains(&SandboxPath::dir(project.join("relative-npm-cache")))
+        );
+
+        let external_project_cache = root.path().join("project-selected-cache");
+        std::fs::create_dir_all(&external_project_cache).unwrap();
+        std::fs::write(
+            project.join(".npmrc"),
+            format!("cache={}\n", external_project_cache.display()),
+        )
+        .unwrap();
+        let mut unapproved = SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &project);
+        let error = apply_standard_profile(
+            &mut unapproved,
+            &["npm".to_owned(), "install".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("--allow-write"));
+
+        let mut approved = SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &project);
+        approved
+            .allow_write
+            .push(SandboxPath::dir(external_project_cache.clone()));
+        apply_standard_profile(
+            &mut approved,
+            &["npm".to_owned(), "install".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap();
+        assert!(
+            approved
+                .allow_write
+                .contains(&SandboxPath::dir(external_project_cache))
         );
     }
 

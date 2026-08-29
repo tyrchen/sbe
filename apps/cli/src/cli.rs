@@ -52,6 +52,10 @@ pub struct RunArgs {
     #[arg(short = 'w', long = "allow-write", action = clap::ArgAction::Append)]
     pub allow_write: Vec<PathBuf>,
 
+    /// Add readable path (repeatable). Built-in secret denials still win.
+    #[arg(long = "allow-read", action = clap::ArgAction::Append)]
+    pub allow_read: Vec<PathBuf>,
+
     /// Add read-denied path (repeatable).
     #[arg(short = 'r', long = "deny-read", action = clap::ArgAction::Append)]
     pub deny_read: Vec<PathBuf>,
@@ -145,6 +149,10 @@ pub struct InspectArgs {
     #[arg(short = 'w', long = "allow-write", action = clap::ArgAction::Append)]
     pub allow_write: Vec<PathBuf>,
 
+    /// Add readable path (repeatable). Built-in secret denials still win.
+    #[arg(long = "allow-read", action = clap::ArgAction::Append)]
+    pub allow_read: Vec<PathBuf>,
+
     /// Add read-denied path (repeatable).
     #[arg(short = 'r', long = "deny-read", action = clap::ArgAction::Append)]
     pub deny_read: Vec<PathBuf>,
@@ -207,6 +215,7 @@ impl InspectArgs {
             allow_domain: self.allow_domain.clone(),
             deny_domain: self.deny_domain.clone(),
             allow_write: self.allow_write.clone(),
+            allow_read: self.allow_read.clone(),
             deny_read: self.deny_read.clone(),
             allow_exec: self.allow_exec.clone(),
             deny_exec: self.deny_exec.clone(),

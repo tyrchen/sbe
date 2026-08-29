@@ -129,6 +129,8 @@ All notable changes to this project will be documented in this file. See [conven
   honor the effective JVM `user.home` for settings and repository defaults.
 - Follow npm's command/environment cache selection, and grant read-only access
   to effective Gradle homes and explicitly selected Maven settings.
+- Resolve project `.npmrc` cache paths behind the external-write gate, and
+  require explicit read approval for project-selected external Maven settings.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23

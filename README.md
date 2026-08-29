@@ -211,9 +211,10 @@ is not made trustworthy by SBE. An implicit `[install] root` in Cargo config is
 rejected with `--root` guidance instead of failing later inside the sandbox.
 Registry and Git dependency caches follow the effective `CARGO_HOME`; its two
 credential-file spellings remain denied.
-For npm/npx, a command `--cache` selection overrides `NPM_CONFIG_CACHE` and
-replaces the default `~/.npm` write grant; relative cache paths are anchored to
-the selected project.
+For npm/npx, a command `--cache` selection overrides `NPM_CONFIG_CACHE`, then a
+simple project `.npmrc` `cache=path`, and replaces the default `~/.npm` write
+grant; relative cache paths are anchored to the selected project. An external
+project-selected cache requires explicit `--allow-write` approval.
 An external Cargo target can be selected with an inherited `CARGO_TARGET_DIR`
 or a direct `--config build.target-dir='path'` override, or granted explicitly
 with matching `--allow-write` and `--allow-exec` paths. Cargo `--config` file
@@ -349,7 +350,9 @@ both the default user-settings location and Maven's default repository; a
 repository-controlled home or settings selection retains the external-write
 approval gate. Explicit user/global settings files and an alternate effective
 user `.m2` directory receive read-only grants so Maven can consume the same
-configuration SBE inspected.
+configuration SBE inspected. A project-selected external settings file requires
+explicit `--allow-read` approval; actual command and host-environment settings
+selections remain direct user intent.
 
 On macOS, secret read denials include both the configured pathname and its
 canonical target. A symlinked `~/.ssh`, `.aws`, or similar protected directory
@@ -454,6 +457,7 @@ reference. Security-relevant options include:
 --keep-env NAME                 Preserve one parent variable
 --env NAME=VALUE                Add one explicit variable
 --allow-write PATH              Add a writable path
+--allow-read PATH               Add a readable path; secret denials still win
 --deny-read PATH                Add a protected read path
 --allow-exec PATH               Add an executable path
 --allow-fetch DOMAIN            Add downloader execution and proxy destination

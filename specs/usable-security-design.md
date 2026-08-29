@@ -237,9 +237,10 @@ Standard mode grants writes to:
 - an installation root only when the user's top-level command clearly requests
   an install operation.
 
-For npm and npx commands, `--cache` overrides `NPM_CONFIG_CACHE`, then the
-default `~/.npm`. The effective cache replaces the default writable grant;
-relative paths are anchored to the command project.
+For npm and npx commands, `--cache` overrides `NPM_CONFIG_CACHE`, then a simple
+project `.npmrc` `cache=path`, then the default `~/.npm`. The effective cache
+replaces the default writable grant; relative paths are anchored to the command
+project. A repository-selected external cache requires `--allow-write`.
 
 For Gradle commands, the conventional cache grant follows Gradle's effective
 user home: `--gradle-user-home`, every accepted `-g` form including `-g/path`,
@@ -272,6 +273,9 @@ namespace. An external referent requires a matching explicit writable grant;
 command and host-environment sources continue to represent direct user intent.
 Explicit user/global settings files and the effective user `.m2` directory are
 granted read-only access; only the selected repository receives write access.
+A settings path selected by repository-controlled Maven config must stay inside
+the workspace or receive explicit `--allow-read` approval. Built-in secret
+denials remain sealed even against an explicit read grant.
 
 It denies writes everywhere else. In particular, home-directory persistence,
 credentials, shell startup, SSH authorization, user service configuration, and
