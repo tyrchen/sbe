@@ -122,6 +122,9 @@ All notable changes to this project will be documented in this file. See [conven
   grants beneath the effective `CARGO_HOME` while retaining credential denials.
 - Filter npm's custom `NPM_CONFIG_USERCONFIG` credential-file locator while
   preserving ordinary npm build configuration variables.
+- Filter Kerberos ticket-cache and keytab locators, and derive Maven's local
+  repository from bounded default/selected `settings.xml` reads after all
+  higher-precedence command, environment, and project JVM properties.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23

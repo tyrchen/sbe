@@ -247,7 +247,10 @@ and `init.d` remain immutable.
 For Maven commands, `-D`/`--define maven.repo.local=path` on the actual command
 selects the writable local repository, followed in precedence by `MAVEN_ARGS`,
 project `.mvn/maven.config`, `MAVEN_OPTS`, project `.mvn/jvm.config`, and the
-default `~/.m2/repository`. Within each source the last property wins. This
+effective settings `<localRepository>`, then the default `~/.m2/repository`.
+Settings selection follows the actual command, `MAVEN_ARGS`, project
+`.mvn/maven.config`, then the default user settings. Within each source the
+last property wins. This
 matches Maven's CLI merge, where environment arguments precede actual CLI
 arguments and CLI user properties override project configuration and JVM system
 properties. Relative selections are anchored to the command project; quoted,
@@ -451,7 +454,9 @@ feature switches, terminal settings, and tool paths. It removes:
   GitHub CLI credentials beneath an inherited `XDG_CONFIG_HOME` receive
   matching path denials rather than withholding those ordinary configuration
   locators; npm user-config files selected by `NPM_CONFIG_USERCONFIG` are
-  withheld because they commonly contain registry authentication tokens;
+  withheld because they commonly contain registry authentication tokens, as
+  are Kerberos ticket-cache/keytab locators `KRB5CCNAME`, `KRB5_KTNAME`, and
+  `KRB5_CLIENT_KTNAME`;
 - agent and credential socket variables;
 - dynamic-loader injection variables; and
 - SBE-reserved proxy, runtime, and policy variables.
