@@ -200,12 +200,16 @@ In standard mode the workspace and conventional package caches are writable,
 and expected build/dependency roots are executable. This makes install-then-run
 workflows, sccache, Gradle daemons, virtual environments, and normal incremental
 builds usable in one invocation. Top-level `cargo install` also receives its
-selected install root; the installed binary is not made trustworthy by SBE.
+selected install root from `--root`, `CARGO_INSTALL_ROOT`, a direct
+`--config install.root='path'`, or the Cargo-home default; the installed binary
+is not made trustworthy by SBE. An implicit `[install] root` in Cargo config is
+rejected with `--root` guidance instead of failing later inside the sandbox.
 An external Cargo target can be selected with an inherited `CARGO_TARGET_DIR`
 or a direct `--config build.target-dir='path'` override, or granted explicitly
 with matching `--allow-write` and `--allow-exec` paths. Cargo `--config` file
-paths are rejected because SBE cannot determine their effective target without
-reimplementing Cargo's layered configuration; use `--target-dir` instead.
+paths are rejected because SBE cannot determine their effective target or
+install root without reimplementing Cargo's layered configuration; use
+`--target-dir` or `--root` instead.
 Without an explicit or inherited override, standard mode selects `$PWD/target`
 instead of trying to reproduce Cargo's layered configuration rules.
 

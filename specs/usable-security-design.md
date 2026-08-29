@@ -273,8 +273,11 @@ Recognizing `cargo install` as install intent is acceptable; parsing Cargo
 metadata and recreating Cargo's installation transaction is not. The package
 manager owns its destination format, locking, overwrite behavior, and rollback.
 An explicit `--root` is the selected install root and takes precedence over
-`CARGO_INSTALL_ROOT`, `CARGO_HOME`, and the default. Inspection must say that
-the selected install root is writable and that the installed result is
+`CARGO_INSTALL_ROOT`, a direct `--config install.root='path'`, `CARGO_HOME`, and
+the default. An implicit Cargo config install root is rejected before launch
+with `--root` guidance rather than granting a repository-selected external
+location or reproducing Cargo's layered configuration. Inspection must say
+that the selected install root is writable and that the installed result is
 untrusted.
 
 Path grants derived from environment variables use the same final precedence
@@ -283,7 +286,9 @@ values override the parent environment. Policy compilation must not authorize
 one Cargo target or install root and then launch Cargo with another.
 Tool-native precedence must be preserved: Cargo `--target-dir` wins first,
 then `CARGO_TARGET_DIR`, then `CARGO_BUILD_TARGET_DIR`, then a direct
-`--config build.target-dir='path'`. Gradle's user-home flags and
+`--config build.target-dir='path'`. Cargo install uses `--root`, then
+`CARGO_INSTALL_ROOT`, then a direct `--config install.root='path'`, then
+`CARGO_HOME` and the default. Gradle's user-home flags and
 `gradle.user.home` system property override `GRADLE_OPTS` and
 `JAVA_OPTS`, then `GRADLE_USER_HOME`. Repeated JVM properties use the last
 value. An inherited JVM-option value requiring shell expansion is rejected with
@@ -422,8 +427,9 @@ feature switches, terminal settings, and tool paths. It removes:
   passwords, private keys, and cloud credentials;
 - known credential variables independent of spelling convention, including
   prefix-encoded forms such as Terraform's `TF_TOKEN_<host>` and concatenated
-  platform names such as Azure Pipelines' `SYSTEM_ACCESSTOKEN`, plus OIDC bearer
-  paths such as `AWS_WEB_IDENTITY_TOKEN_FILE` and custom credential stores such
+  platform names such as Azure Pipelines' `SYSTEM_ACCESSTOKEN` and GitLab's
+  `CI_JOB_JWT` / `CI_JOB_JWT_V2`, plus OIDC bearer paths such as
+  `AWS_WEB_IDENTITY_TOKEN_FILE` and custom credential stores such
   as `AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE`, `CLOUDSDK_CONFIG`,
   `AZURE_CONFIG_DIR`, Azure
   client certificates selected by `AZURE_CLIENT_CERTIFICATE_PATH`, and Docker

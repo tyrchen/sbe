@@ -105,6 +105,9 @@ All notable changes to this project will be documented in this file. See [conven
 - Filter custom AWS configuration-file locators and inspect direct symlink
   entries beneath generated dependency roots so warm linked dependencies remain
   readable without recursively scanning ordinary generated contents.
+- Filter GitLab job JWT variables, honor direct Cargo
+  `--config install.root='path'` overrides, and reject implicit Cargo-config
+  install roots before launch with explicit `--root` guidance.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23

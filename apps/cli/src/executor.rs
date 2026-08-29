@@ -632,6 +632,8 @@ fn is_sensitive_environment_name(name: &str) -> bool {
         "CLOUDSDK_CONFIG",
         "CREDENTIAL",
         "CREDENTIALS",
+        "CI_JOB_JWT",
+        "CI_JOB_JWT_V2",
         "DATABASE_URL",
         "DOCKER_AUTH_CONFIG",
         "DOCKER_CERT_PATH",
@@ -849,11 +851,22 @@ fn apply_standard_profile(
         }
     }
     if command_is(command, "cargo") && top_level_subcommand(command).is_command(&["install"]) {
-        let cargo_root = command_option_value(command, "--root")
-            .map(PathBuf::from)
-            .or_else(|| effective_environment_path(profile, "CARGO_INSTALL_ROOT"))
-            .or_else(|| effective_environment_path(profile, "CARGO_HOME"))
+        let explicit_root = command_option_value(command, "--root").map(PathBuf::from);
+        let environment_root = effective_environment_path(profile, "CARGO_INSTALL_ROOT");
+        let config_root = if explicit_root.is_none() && environment_root.is_none() {
+            cargo_config_install_root(command)?
+        } else {
+            None
+        };
+        let cargo_home = effective_environment_path(profile, "CARGO_HOME")
             .unwrap_or_else(|| home.join(".cargo"));
+        if explicit_root.is_none() && environment_root.is_none() && config_root.is_none() {
+            reject_implicit_cargo_install_root(project_dir, &cargo_home)?;
+        }
+        let cargo_root = explicit_root
+            .or(environment_root)
+            .or(config_root)
+            .unwrap_or(cargo_home);
         let cargo_root = if cargo_root.is_absolute() {
             cargo_root
         } else {
@@ -1918,13 +1931,13 @@ fn cargo_config_target_dir(command: &[String]) -> anyhow::Result<Option<PathBuf>
         };
         let Some((key, value)) = config.split_once('=') else {
             anyhow::bail!(
-                "cargo --config file paths cannot be inspected safely for build.target-dir; use \
-                 --target-dir or a direct --config build.target-dir='path' override"
+                "cargo --config file paths cannot be inspected safely for build.target-dir or \
+                 install.root; use --target-dir, --root, or a direct KEY='path' override"
             );
         };
         let key = key.trim();
         if key == "build.target-dir" {
-            selected = Some(parse_cargo_config_path(value)?);
+            selected = Some(parse_cargo_config_path(value, key, "--target-dir")?);
         } else if key == "build" || key.contains("target-dir") {
             anyhow::bail!(
                 "cargo --config target-directory override '{key}' is unsupported; use \
@@ -1935,30 +1948,190 @@ fn cargo_config_target_dir(command: &[String]) -> anyhow::Result<Option<PathBuf>
     Ok(selected)
 }
 
-fn parse_cargo_config_path(value: &str) -> anyhow::Result<PathBuf> {
+fn cargo_config_install_root(command: &[String]) -> anyhow::Result<Option<PathBuf>> {
+    let mut arguments = command
+        .iter()
+        .skip(1)
+        .take_while(|argument| argument.as_str() != "--");
+    let mut selected = None;
+    while let Some(argument) = arguments.next() {
+        let config = if argument == "--config" {
+            arguments
+                .next()
+                .map(String::as_str)
+                .context("cargo --config requires a value")?
+        } else if let Some(value) = argument.strip_prefix("--config=") {
+            value
+        } else {
+            continue;
+        };
+        let Some((key, value)) = config.split_once('=') else {
+            anyhow::bail!(
+                "cargo --config file paths cannot be inspected safely for install.root; use \
+                 --root or a direct --config install.root='path' override"
+            );
+        };
+        let key = key.trim();
+        if key == "install.root" {
+            selected = Some(parse_cargo_config_path(value, key, "--root")?);
+        } else if key == "include" {
+            anyhow::bail!(
+                "cargo --config include files cannot be inspected safely for install.root; use \
+                 --root to select the install destination explicitly"
+            );
+        } else if key == "install" || key.starts_with("install.root.") {
+            anyhow::bail!(
+                "cargo --config install-root override '{key}' is unsupported; use --root or a \
+                 direct --config install.root='path' override"
+            );
+        }
+    }
+    Ok(selected)
+}
+
+fn parse_cargo_config_path(
+    value: &str,
+    key: &str,
+    preferred_option: &str,
+) -> anyhow::Result<PathBuf> {
     let value = value.trim();
     let path = if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
         let path = &value[1..value.len() - 1];
         if path.contains('\'') {
-            anyhow::bail!("cargo build.target-dir contains an unsupported quoted path");
+            anyhow::bail!("cargo {key} contains an unsupported quoted path");
         }
         path
     } else if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
         let path = &value[1..value.len() - 1];
         if path.contains('\\') || path.contains('"') {
-            anyhow::bail!("cargo build.target-dir contains unsupported TOML escapes");
+            anyhow::bail!("cargo {key} contains unsupported TOML escapes");
         }
         path
     } else {
         anyhow::bail!(
-            "cargo build.target-dir must be a simple quoted path; use --target-dir for complex \
-             values"
+            "cargo {key} must be a simple quoted path; use {preferred_option} for complex values"
         );
     };
     if path.is_empty() || path.chars().any(char::is_control) {
-        anyhow::bail!("cargo build.target-dir must be a non-empty path without control characters");
+        anyhow::bail!("cargo {key} must be a non-empty path without control characters");
     }
     Ok(PathBuf::from(path))
+}
+
+fn reject_implicit_cargo_install_root(project_dir: &Path, cargo_home: &Path) -> anyhow::Result<()> {
+    for directory in project_dir.ancestors() {
+        reject_cargo_install_root_in_config(&directory.join(".cargo"))?;
+    }
+    reject_cargo_install_root_in_config(cargo_home)
+}
+
+fn reject_cargo_install_root_in_config(config_dir: &Path) -> anyhow::Result<()> {
+    for name in ["config", "config.toml"] {
+        let path = config_dir.join(name);
+        let Some(contents) = read_bounded_cargo_config(&path)? else {
+            continue;
+        };
+        let contents = std::str::from_utf8(&contents)
+            .with_context(|| format!("Cargo config is not UTF-8: {}", path.display()))?;
+        if cargo_config_may_define_install_root(contents) {
+            anyhow::bail!(
+                "Cargo config '{}' selects or may include install.root, which SBE cannot safely \
+                 reproduce; use an explicit cargo install --root path",
+                path.display()
+            );
+        }
+        // Cargo gives the legacy extensionless spelling precedence when both exist.
+        break;
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "Cargo itself follows config symlinks; policy preparation resolves the selected file \
+              before applying the bounded no-follow reader"
+)]
+fn read_bounded_cargo_config(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    let resolved = match std::fs::canonicalize(path) {
+        Ok(resolved) => resolved,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("resolve Cargo config: {}", path.display()));
+        }
+    };
+    read_bounded_project_file(&resolved)
+}
+
+fn cargo_config_may_define_install_root(contents: &str) -> bool {
+    let mut in_install_table = false;
+    let mut at_root = true;
+    for line in contents.lines() {
+        let line = strip_toml_comment(line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            let table = line.trim_matches(['[', ']']).trim();
+            in_install_table = simple_toml_key_path(table).is_some_and(|path| path == ["install"]);
+            at_root = false;
+            continue;
+        }
+        let Some((key, _value)) = line.split_once('=') else {
+            continue;
+        };
+        let Some(key) = simple_toml_key_path(key.trim()) else {
+            continue;
+        };
+        if key == ["install", "root"]
+            || (in_install_table && key == ["root"])
+            || (!in_install_table && key == ["install"])
+            || (at_root && key == ["include"])
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn simple_toml_key_path(key: &str) -> Option<Vec<&str>> {
+    key.split('.')
+        .map(|component| {
+            let component = component.trim();
+            if component.len() >= 2
+                && ((component.starts_with('\'') && component.ends_with('\''))
+                    || (component.starts_with('"') && component.ends_with('"')))
+            {
+                Some(&component[1..component.len() - 1])
+            } else if !component.is_empty()
+                && component
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || "_-".contains(character))
+            {
+                Some(component)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn strip_toml_comment(line: &str) -> &str {
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match (quote, character) {
+            (Some('"'), '\\') => escaped = true,
+            (Some(active), current) if active == current => quote = None,
+            (None, '\'' | '"') => quote = Some(character),
+            (None, '#') => return &line[..index],
+            _ => {}
+        }
+    }
+    line
 }
 
 fn command_system_property<'a>(command: &'a [String], name: &str) -> Option<&'a str> {
@@ -3233,6 +3406,8 @@ mod tests {
                 ),
                 ("AWS_SECRET_ACCESS_KEY".to_owned(), "sentinel".to_owned()),
                 ("AWS_CONFIG_FILE".to_owned(), "/tmp/aws-config".to_owned()),
+                ("CI_JOB_JWT".to_owned(), "sentinel".to_owned()),
+                ("CI_JOB_JWT_V2".to_owned(), "sentinel".to_owned()),
                 (
                     "AWS_SHARED_CREDENTIALS_FILE".to_owned(),
                     "/tmp/aws-credentials".to_owned(),
@@ -4717,6 +4892,131 @@ mod tests {
             ),
             Some("relative")
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the unit test writes isolated Cargo configuration fixtures"
+    )]
+    fn standard_cargo_install_handles_configured_roots_before_launch() {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let direct_root = tempfile::tempdir().unwrap();
+        let configured_root = tempfile::tempdir().unwrap();
+        let mut direct =
+            SandboxProfile::for_ecosystem(Ecosystem::Rust, home.path(), project.path());
+        apply_standard_profile(
+            &mut direct,
+            &[
+                "cargo".to_owned(),
+                "install".to_owned(),
+                "--config".to_owned(),
+                format!("install.root='{}'", direct_root.path().display()),
+                "ripgrep".to_owned(),
+            ],
+            home.path(),
+            project.path(),
+        )
+        .unwrap();
+        assert!(
+            direct
+                .allow_write
+                .contains(&SandboxPath::dir(direct_root.path().to_path_buf()))
+        );
+        assert!(
+            direct
+                .allow_exec
+                .contains(&SandboxPath::dir(direct_root.path().join("bin")))
+        );
+
+        let mut environment =
+            SandboxProfile::for_ecosystem(Ecosystem::Rust, home.path(), project.path());
+        environment.env.insert(
+            "CARGO_INSTALL_ROOT".to_owned(),
+            configured_root.path().display().to_string(),
+        );
+        apply_standard_profile(
+            &mut environment,
+            &[
+                "cargo".to_owned(),
+                "install".to_owned(),
+                "--config".to_owned(),
+                format!("install.root='{}'", direct_root.path().display()),
+                "ripgrep".to_owned(),
+            ],
+            home.path(),
+            project.path(),
+        )
+        .unwrap();
+        assert!(
+            environment
+                .allow_write
+                .contains(&SandboxPath::dir(configured_root.path().to_path_buf())),
+            "CARGO_INSTALL_ROOT takes precedence over the Cargo config value"
+        );
+        assert!(
+            !environment
+                .allow_write
+                .contains(&SandboxPath::dir(direct_root.path().to_path_buf()))
+        );
+
+        let cargo_config = project.path().join(".cargo/config.toml");
+        std::fs::create_dir_all(cargo_config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &cargo_config,
+            format!("[install]\nroot = '{}'\n", configured_root.path().display()),
+        )
+        .unwrap();
+        let mut implicit =
+            SandboxProfile::for_ecosystem(Ecosystem::Rust, home.path(), project.path());
+        let error = apply_standard_profile(
+            &mut implicit,
+            &[
+                "cargo".to_owned(),
+                "install".to_owned(),
+                "ripgrep".to_owned(),
+            ],
+            home.path(),
+            project.path(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cargo install --root"));
+
+        let mut explicit =
+            SandboxProfile::for_ecosystem(Ecosystem::Rust, home.path(), project.path());
+        apply_standard_profile(
+            &mut explicit,
+            &[
+                "cargo".to_owned(),
+                "install".to_owned(),
+                "--root".to_owned(),
+                direct_root.path().display().to_string(),
+                "ripgrep".to_owned(),
+            ],
+            home.path(),
+            project.path(),
+        )
+        .unwrap();
+        assert!(
+            explicit
+                .allow_write
+                .contains(&SandboxPath::dir(direct_root.path().to_path_buf())),
+            "an explicit root must override an implicit Cargo config"
+        );
+
+        assert!(cargo_config_may_define_install_root(
+            "[\"install\"]\n\"root\" = '/tmp/cargo' # selected root"
+        ));
+        assert!(cargo_config_may_define_install_root(
+            "'install'.'root' = '/tmp/cargo'"
+        ));
+        assert!(cargo_config_may_define_install_root(
+            "include = ['shared.toml']"
+        ));
+        assert!(!cargo_config_may_define_install_root(
+            "[build]\ntarget-dir = 'install/root' # not an install setting"
+        ));
     }
 
     #[test]
