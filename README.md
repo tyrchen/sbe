@@ -214,7 +214,8 @@ credential-file spellings remain denied.
 For npm/npx, a command `--cache` selection overrides `NPM_CONFIG_CACHE`, then a
 simple project `.npmrc` `cache=path`, user `~/.npmrc`, and the default `~/.npm`.
 `--userconfig` or an explicitly restored user-config locator selects that user
-layer and receives an exact read grant.
+layer. The effective existing user configuration receives an exact read grant
+so npm can consume registry and other settings without exposing its directory.
 For pnpm, `--store-dir`, its configuration environment, project `.npmrc`, and
 user `.npmrc` similarly select the store. Relative paths are anchored to the
 selected project. Without a store override, `PNPM_HOME/store` precedes the XDG
@@ -224,7 +225,8 @@ For uv and pip, command `--cache-dir` overrides `UV_CACHE_DIR` or
 `PIP_CACHE_DIR`. uv then reads project `uv.toml`, or `[tool.uv]` in
 `pyproject.toml` when no `uv.toml` exists; an external project-selected cache
 requires explicit `--allow-write` approval. pip reads its legacy/current user
-configuration for `cache-dir`. The XDG or conventional platform cache is the
+configuration for `cache-dir`; each effective existing user configuration file
+receives an exact read grant. The XDG or conventional platform cache is the
 final fallback, and the effective cache replaces only that tool's default
 writable grant. Without overrides, macOS uses `~/Library/Caches/{pip,uv}` and
 Linux uses the XDG cache home.

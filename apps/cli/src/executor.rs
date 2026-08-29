@@ -778,7 +778,9 @@ fn apply_standard_profile(
         && (command_is(command, "npm") || command_is(command, "npx") || command_is(command, "pnpm"))
     {
         let user_config = effective_npm_user_config(profile, command, home, project_dir)?;
-        if user_config.explicit {
+        if user_config.explicit
+            || read_bounded_following_metadata_file(&user_config.path)?.is_some()
+        {
             insert_builtin_path_grant(
                 profile,
                 GrantKind::AllowRead,
@@ -810,6 +812,11 @@ fn apply_standard_profile(
             &cache.conventional,
             SandboxPath::dir(cache.selected),
         );
+    }
+    if profile.name == "python" && command_uses_pip(command) {
+        for config in effective_pip_config_read_paths(profile, home, project_dir)? {
+            insert_builtin_path_grant(profile, GrantKind::AllowRead, SandboxPath::file(config));
+        }
     }
 
     if profile.name == "java" {
@@ -1299,7 +1306,7 @@ fn effective_python_cache(
     };
     let config_cache =
         if command_cache.is_none() && environment_cache.is_none() && default_name == "pip" {
-            effective_pip_config_cache(profile, home)?
+            effective_pip_config_cache(profile, home, project_dir)?
         } else {
             None
         };
@@ -1424,11 +1431,13 @@ fn simple_uv_cache_path(value: &str, source: &Path) -> anyhow::Result<PathBuf> {
 fn effective_pip_config_cache(
     profile: &SandboxProfile,
     home: &Path,
+    project_dir: &Path,
 ) -> anyhow::Result<Option<PathBuf>> {
     let legacy = home.join(".pip/pip.conf");
     let mut selected = read_pip_config_cache(&legacy, home, false)?;
 
     let user_config_root = effective_environment_path(profile, "XDG_CONFIG_HOME")
+        .map(|path| anchor_project_path(path, project_dir))
         .unwrap_or_else(|| platform_config_home(home));
     let user_config = user_config_root.join("pip/pip.conf");
     if let Some(cache) = read_pip_config_cache(&user_config, home, false)? {
@@ -1437,12 +1446,64 @@ fn effective_pip_config_cache(
 
     // Ambient PIP_CONFIG_FILE is filtered. If it is present in the resolved profile, the user
     // explicitly restored it and its final config layer should be honored.
-    if let Some(explicit) = profile.env.get("PIP_CONFIG_FILE").map(PathBuf::from)
+    if let Some(explicit) = effective_profile_path(profile, "PIP_CONFIG_FILE", project_dir)
         && let Some(cache) = read_pip_config_cache(&explicit, home, true)?
     {
         selected = Some(cache);
     }
     Ok(selected)
+}
+
+fn effective_pip_config_read_paths(
+    profile: &SandboxProfile,
+    home: &Path,
+    project_dir: &Path,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let user_config_root = effective_environment_path(profile, "XDG_CONFIG_HOME")
+        .map(|path| anchor_project_path(path, project_dir))
+        .unwrap_or_else(|| platform_config_home(home));
+    let candidates = [
+        home.join(".pip/pip.conf"),
+        user_config_root.join("pip/pip.conf"),
+    ];
+    let mut selected = Vec::new();
+    for path in candidates {
+        if read_bounded_following_metadata_file(&path)?.is_some() {
+            selected.push(path);
+        }
+    }
+    if let Some(path) = effective_profile_path(profile, "PIP_CONFIG_FILE", project_dir) {
+        if read_bounded_following_metadata_file(&path)?.is_none() {
+            anyhow::bail!(
+                "could not inspect explicit pip configuration: {}",
+                path.display()
+            );
+        }
+        if !selected.contains(&path) {
+            selected.push(path);
+        }
+    }
+    Ok(selected)
+}
+
+fn effective_profile_path(
+    profile: &SandboxProfile,
+    name: &str,
+    project_dir: &Path,
+) -> Option<PathBuf> {
+    profile
+        .env
+        .get(name)
+        .map(PathBuf::from)
+        .map(|path| anchor_project_path(path, project_dir))
+}
+
+fn anchor_project_path(path: PathBuf, project_dir: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        project_dir.join(path)
+    }
 }
 
 fn read_pip_config_cache(
@@ -5157,6 +5218,11 @@ mod tests {
                 .allow_write
                 .contains(&SandboxPath::dir(pip_config_cache))
         );
+        assert!(
+            pip_config
+                .allow_read
+                .contains(&SandboxPath::file(pip_config_home.join("pip/pip.conf")))
+        );
     }
 
     #[test]
@@ -7359,6 +7425,11 @@ mod tests {
             user_selected
                 .allow_write
                 .contains(&SandboxPath::dir(user_cache))
+        );
+        assert!(
+            user_selected
+                .allow_read
+                .contains(&SandboxPath::file(home.join(".npmrc")))
         );
 
         let command_userconfig_root = tempfile::tempdir().unwrap();

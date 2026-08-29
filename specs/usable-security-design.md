@@ -240,7 +240,9 @@ Standard mode grants writes to:
 For npm and npx commands, `--cache` overrides `NPM_CONFIG_CACHE`, then a simple
 project `.npmrc` `cache=path`, user `~/.npmrc`, then the default `~/.npm`.
 An npm `--userconfig` or explicitly restored user-config locator selects the
-user layer and receives an exact read grant.
+user layer. The effective existing user configuration receives an exact read
+grant so the child npm, npx, or pnpm process sees the same configuration SBE
+used without opening the containing directory.
 pnpm's `--store-dir`, configuration environment, project `.npmrc`, and user
 `.npmrc` select its store in the same manner. The effective cache/store replaces
 the corresponding default writable grant; relative paths are anchored to the
@@ -252,7 +254,8 @@ For uv and pip commands, `--cache-dir` overrides the corresponding
 `UV_CACHE_DIR` or `PIP_CACHE_DIR`. uv then resolves a simple `cache-dir` from
 project `uv.toml`, or `[tool.uv]` in `pyproject.toml` when no adjacent
 `uv.toml` exists. pip resolves `cache-dir` from its legacy/current user
-configuration after environment overrides. `XDG_CACHE_HOME` and the
+configuration after environment overrides; each effective existing user
+configuration receives an exact read grant. `XDG_CACHE_HOME` and the
 conventional cache are the final fallback. The selected cache replaces only
 that tool's default grant; a repository-selected uv cache outside the workspace
 requires `--allow-write`. Conventional macOS caches live beneath
