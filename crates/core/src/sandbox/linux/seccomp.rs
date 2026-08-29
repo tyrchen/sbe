@@ -21,7 +21,7 @@ use seccompiler::{
 use crate::{
     error::CoreError,
     profile::{NetworkMode, SandboxProfile},
-    sandbox::{BackendOptions, linux::probe::ProbeResult},
+    sandbox::{BackendOptions, SecurityMode, linux::probe::ProbeResult},
 };
 
 /// Syscalls killed outright when invoked from inside the sandbox.
@@ -97,6 +97,7 @@ pub fn compile(
     proxy_port: Option<u16>,
     probe: &ProbeResult,
     _options: BackendOptions,
+    security_mode: SecurityMode,
 ) -> Result<CompiledSeccomp, CoreError> {
     let target_arch = std::env::consts::ARCH
         .try_into()
@@ -127,7 +128,13 @@ pub fn compile(
             errno_rules.entry(nr).or_default();
         }
     }
-    add_network_socket_rules(&mut errno_rules, profile.network_mode)?;
+    let network_mode = if security_mode.is_strict() || profile.network_mode == NetworkMode::DenyAll
+    {
+        profile.network_mode
+    } else {
+        NetworkMode::AllowAll
+    };
+    add_network_socket_rules(&mut errno_rules, network_mode)?;
 
     // A pre-v4 `connect()` address filter is intentionally impossible here:
     // seccomp cannot inspect `copy_from_user`-backed sockaddrs, and matching
@@ -324,6 +331,7 @@ mod tests {
             Some(8080),
             &probe(LandlockAbi::V4),
             BackendOptions::default(),
+            SecurityMode::Strict,
         )
         .expect("seccomp compile");
         assert!(!compiled.kill.is_empty(), "kill filter empty");

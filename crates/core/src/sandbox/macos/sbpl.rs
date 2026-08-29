@@ -1,9 +1,14 @@
-use std::{collections::BTreeSet, fmt::Write, path::Path};
+use std::{
+    collections::BTreeSet,
+    fmt::Write,
+    path::{Path, PathBuf},
+};
 
 use crate::{
     config::{PathKind, SandboxPath},
     error::CoreError,
     profile::{NetworkMode, SandboxProfile},
+    sandbox::SecurityMode,
 };
 
 /// Generate a Seatbelt Profile Language (SBPL) policy string from a `SandboxProfile`.
@@ -13,7 +18,11 @@ use crate::{
 /// - All reads allowed except explicit denylist (secrets)
 /// - All network denied except proxy/localhost
 /// - All risky process-exec denied
-pub fn generate(profile: &SandboxProfile, proxy_port: Option<u16>) -> Result<String, CoreError> {
+pub fn generate(
+    profile: &SandboxProfile,
+    proxy_port: Option<u16>,
+    security_mode: SecurityMode,
+) -> Result<String, CoreError> {
     let mut sb = String::with_capacity(4096);
 
     if profile.name.chars().any(char::is_control) {
@@ -32,7 +41,7 @@ pub fn generate(profile: &SandboxProfile, proxy_port: Option<u16>) -> Result<Str
     section_process(&mut sb, profile)?;
     section_file_read(&mut sb, profile)?;
     section_file_write(&mut sb, profile)?;
-    section_network(&mut sb, profile, proxy_port)?;
+    section_network(&mut sb, profile, proxy_port, security_mode)?;
     section_misc(&mut sb);
 
     Ok(sb)
@@ -76,12 +85,7 @@ fn section_file_read(sb: &mut String, profile: &SandboxProfile) -> Result<(), Co
             .chain(&profile.allow_write)
             .chain(&profile.allow_exec)
             .map(|sandbox_path| sandbox_path.path.as_path())
-            .chain(
-                profile
-                    .ephemeral_write_exec
-                    .iter()
-                    .map(|path| path.as_path()),
-            )
+            .chain(profile.ephemeral_write_exec.iter().map(PathBuf::as_path))
             .filter(|path| path.starts_with(shared))
             .collect();
         let mut ancestor_literals = BTreeSet::new();
@@ -175,6 +179,7 @@ fn section_network(
     sb: &mut String,
     profile: &SandboxProfile,
     proxy_port: Option<u16>,
+    security_mode: SecurityMode,
 ) -> Result<(), CoreError> {
     writeln!(sb, ";; Network").ok();
 
@@ -192,14 +197,26 @@ fn section_network(
             writeln!(sb, "(deny network*)").ok();
             writeln!(sb, "(allow network-outbound").ok();
             writeln!(sb, "    (remote tcp \"localhost:{port}\")").ok();
+            if !security_mode.is_strict() {
+                writeln!(sb, "    (remote ip \"localhost:*\")").ok();
+            }
             writeln!(sb, ")").ok();
+            if !security_mode.is_strict() {
+                writeln!(sb, "(allow network-inbound (local ip \"localhost:*\"))").ok();
+            }
         }
         NetworkMode::DirectHttps443 => {
             writeln!(sb, "(deny network*)").ok();
             writeln!(sb, "(allow network-outbound").ok();
             writeln!(sb, "    (remote tcp \"*:443\")").ok();
+            if !security_mode.is_strict() {
+                writeln!(sb, "    (remote ip \"localhost:*\")").ok();
+            }
             writeln!(sb, "    (literal \"/private/var/run/mDNSResponder\")").ok();
             writeln!(sb, ")").ok();
+            if !security_mode.is_strict() {
+                writeln!(sb, "(allow network-inbound (local ip \"localhost:*\"))").ok();
+            }
         }
     }
 
@@ -293,12 +310,16 @@ mod tests {
     use super::*;
     use crate::detect::Ecosystem;
 
+    const fn strict_options() -> SecurityMode {
+        SecurityMode::Strict
+    }
+
     #[test]
     fn test_should_generate_valid_sbpl_for_node() {
         let home = PathBuf::from("/Users/test");
         let pwd = PathBuf::from("/Users/test/project");
         let profile = SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &pwd);
-        let sbpl = generate(&profile, Some(12345)).unwrap();
+        let sbpl = generate(&profile, Some(12345), strict_options()).unwrap();
 
         assert!(sbpl.contains("(version 1)"));
         assert!(sbpl.contains("(deny default)"));
@@ -320,10 +341,22 @@ mod tests {
         let home = PathBuf::from("/Users/test");
         let pwd = PathBuf::from("/Users/test/project");
         let profile = SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &pwd);
-        let sbpl = generate(&profile, Some(12345)).unwrap();
+        let sbpl = generate(&profile, Some(12345), strict_options()).unwrap();
 
         assert!(sbpl.contains("(remote tcp \"localhost:12345\")"));
         assert!(!sbpl.contains("remote ip \"localhost:*\""));
+    }
+
+    #[test]
+    fn standard_proxy_mode_allows_local_build_services() {
+        let home = PathBuf::from("/Users/test");
+        let pwd = PathBuf::from("/Users/test/project");
+        let profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, &home, &pwd);
+        let sbpl = generate(&profile, Some(12345), SecurityMode::Standard).unwrap();
+
+        assert!(sbpl.contains("(remote tcp \"localhost:12345\")"));
+        assert!(sbpl.contains("(remote ip \"localhost:*\")"));
+        assert!(sbpl.contains("(allow network-inbound (local ip \"localhost:*\"))"));
     }
 
     #[test]
@@ -333,7 +366,7 @@ mod tests {
         let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, &home, &pwd);
         profile.allow_all_network = true;
         profile.recompute_network_mode();
-        let sbpl = generate(&profile, None).unwrap();
+        let sbpl = generate(&profile, None, strict_options()).unwrap();
 
         assert!(sbpl.contains("(allow network*)"));
         assert!(!sbpl.contains("(deny network*)"));
@@ -350,7 +383,7 @@ mod tests {
         profile
             .ephemeral_write_exec
             .push(PathBuf::from("/private/tmp/sbe-private"));
-        let sbpl = generate(&profile, Some(12345)).unwrap();
+        let sbpl = generate(&profile, Some(12345), strict_options()).unwrap();
 
         assert!(sbpl.contains("/private/tmp/sbe-private"));
         assert_eq!(sbpl.matches("(subpath \"/private/tmp\")").count(), 1);
@@ -366,7 +399,7 @@ mod tests {
         let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &pwd);
         profile.enable_proxy = false;
         profile.recompute_network_mode();
-        let sbpl = generate(&profile, None).unwrap();
+        let sbpl = generate(&profile, None, strict_options()).unwrap();
 
         assert!(sbpl.contains("(remote tcp \"*:443\")"));
         assert!(!sbpl.contains("(remote ip \"localhost:*\")"));
@@ -380,7 +413,7 @@ mod tests {
         let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &pwd);
         profile.allow_domains.clear();
         profile.recompute_network_mode();
-        let sbpl = generate(&profile, None).unwrap();
+        let sbpl = generate(&profile, None, strict_options()).unwrap();
 
         assert!(sbpl.contains("(deny network*)"));
         assert!(!sbpl.contains("(remote tcp \"*:443\")"));
@@ -393,7 +426,7 @@ mod tests {
 
         for eco in Ecosystem::ALL {
             let profile = SandboxProfile::for_ecosystem(eco, &home, &pwd);
-            let sbpl = generate(&profile, Some(12345)).unwrap();
+            let sbpl = generate(&profile, Some(12345), strict_options()).unwrap();
             assert!(sbpl.contains("(version 1)"), "missing version for {eco}");
             assert!(
                 sbpl.contains("(deny default)"),
@@ -407,7 +440,7 @@ mod tests {
         let home = PathBuf::from("/Users/test");
         let pwd = PathBuf::from("/Users/test/project");
         let profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, &home, &pwd);
-        let sbpl = generate(&profile, Some(12345)).unwrap();
+        let sbpl = generate(&profile, Some(12345), strict_options()).unwrap();
 
         // Individual binaries should be literal
         assert!(sbpl.contains("(literal \"/bin/sh\")"));
@@ -422,7 +455,7 @@ mod tests {
         let home = PathBuf::from("/Users/test");
         let pwd = PathBuf::from("/Users/test/project");
         let profile = SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &pwd);
-        let sbpl = generate(&profile, Some(12345)).unwrap();
+        let sbpl = generate(&profile, Some(12345), strict_options()).unwrap();
 
         // Should have scoped mach-lookup, not blanket allow
         assert!(sbpl.contains("(allow mach-lookup"));
@@ -440,7 +473,7 @@ mod tests {
         profile
             .allow_write
             .push(SandboxPath::file(PathBuf::from("/tmp/a\"b\\c")));
-        let sbpl = generate(&profile, Some(12345)).unwrap();
+        let sbpl = generate(&profile, Some(12345), strict_options()).unwrap();
         assert!(sbpl.contains("(literal \"/tmp/a\\\"b\\\\c\")"));
     }
 
@@ -452,7 +485,7 @@ mod tests {
         profile
             .allow_write
             .push(SandboxPath::file(PathBuf::from("/tmp/a\nb")));
-        assert!(generate(&profile, Some(12345)).is_err());
+        assert!(generate(&profile, Some(12345), strict_options()).is_err());
     }
 
     #[test]
@@ -477,7 +510,7 @@ mod tests {
         let mut profile =
             SandboxProfile::for_ecosystem(Ecosystem::Rust, directory.path(), directory.path());
         profile.deny_read = vec![SandboxPath::dir(alias.clone())];
-        let sbpl = generate(&profile, Some(12345)).unwrap();
+        let sbpl = generate(&profile, Some(12345), strict_options()).unwrap();
 
         assert!(sbpl.contains(&format!("(subpath \"{}\")", alias.display())));
         assert!(sbpl.contains(&format!("(subpath \"{}\")", canonical_protected.display())));

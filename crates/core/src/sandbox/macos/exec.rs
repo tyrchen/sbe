@@ -6,7 +6,11 @@ use tempfile::NamedTempFile;
 use tokio::process::Command;
 use tracing::debug;
 
-use crate::{error::CoreError, profile::SandboxProfile, sandbox::macos::sbpl};
+use crate::{
+    error::CoreError,
+    profile::SandboxProfile,
+    sandbox::{SecurityMode, macos::sbpl},
+};
 
 /// Spawn the user command under `sandbox-exec` and wait for it to exit.
 pub(super) async fn run_sandboxed(
@@ -14,10 +18,13 @@ pub(super) async fn run_sandboxed(
     proxy_port: Option<u16>,
     command: &[String],
     extra_env: &HashMap<String, String>,
+    security_mode: SecurityMode,
     pid_tx: Option<tokio::sync::oneshot::Sender<u32>>,
 ) -> Result<ExitStatus, CoreError> {
-    profile.validate_security_invariants()?;
-    let sbpl_text = sbpl::generate(profile, proxy_port)?;
+    if security_mode.is_strict() {
+        profile.validate_security_invariants()?;
+    }
+    let sbpl_text = sbpl::generate(profile, proxy_port, security_mode)?;
     let sbpl_file = write_sbpl_tempfile(&sbpl_text)?;
     let sbpl_path = sbpl_file.path().to_path_buf();
     debug!(path = %sbpl_path.display(), "wrote SBPL profile");

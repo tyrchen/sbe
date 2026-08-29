@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::{
     collections::HashMap,
     fmt,
@@ -5,9 +7,6 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
 };
-
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
@@ -838,7 +837,8 @@ fn visit_regular_files(
             *inspected = inspected.saturating_add(1);
             if *inspected > MAX_WRITABLE_ALIAS_SCAN_ENTRIES {
                 return Err(crate::error::CoreError::ProfileLint(format!(
-                    "persistent writable-alias scan exceeds {MAX_WRITABLE_ALIAS_SCAN_ENTRIES} entries"
+                    "persistent writable-alias scan exceeds {MAX_WRITABLE_ALIAS_SCAN_ENTRIES} \
+                     entries"
                 )));
             }
             let path = entry.path();

@@ -16,8 +16,9 @@
 
 use std::{collections::HashMap, process::ExitStatus};
 
-use crate::{error::CoreError, profile::SandboxProfile};
 use serde::{Deserialize, Serialize};
+
+use crate::{error::CoreError, profile::SandboxProfile};
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -119,4 +120,23 @@ pub struct BackendOptions {
     /// Explicit opt-in to Linux's destination-port-only compatibility mode.
     /// This never disables filesystem or privilege-escalation lints.
     pub allow_insecure_network: bool,
+}
+
+/// Product-level security contract selected for one sandbox invocation.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SecurityMode {
+    /// Practical containment for ordinary builds and developer tooling.
+    #[default]
+    Standard,
+    /// Fail closed unless every high-assurance invariant is available.
+    Strict,
+}
+
+impl SecurityMode {
+    /// Whether this mode requires the strict 0.4 security boundary.
+    #[must_use]
+    pub const fn is_strict(self) -> bool {
+        matches!(self, Self::Strict)
+    }
 }

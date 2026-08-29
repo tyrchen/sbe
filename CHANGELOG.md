@@ -3,6 +3,35 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [sbexec-v0.4.1](https://github.com/tyrchen/sbe/compare/sbexec-v0.4.0..sbexec-v0.4.1) - 2026-08-28
+
+### Usability
+
+- Make the practical `standard` sandbox the default and preserve the 0.4
+  fail-closed boundary behind `--strict`.
+- Let standard builds write the workspace, execute mutable build outputs,
+  inherit non-sensitive build environment variables, and use local developer
+  services while retaining secret-path, descriptor, privilege, and proxy
+  protections.
+- Support globally configured sccache through ordinary executable/cache grants
+  and local IPC; no sccache source or managed adapter is shipped by SBE.
+- Follow pre-existing tool and cache symlinks in standard mode while retaining
+  strict no-follow behavior and protected-path denials.
+- Allow explicit top-level `cargo install` commands to manage their selected
+  install root instead of reimplementing Cargo's transaction format.
+- Stop requiring `--allow-insecure-linux-network` for standard Linux builds;
+  inspection and runtime warnings continue to report that domain egress is
+  best-effort on Linux.
+
+### Security
+
+- Keep strict mode behavior for positive environment allowlisting, persistent
+  W^X, hard-link validation, exact workspace outputs, ambient local-service
+  denial, and fail-closed Linux network capability checks.
+- Keep standard-mode symlink referents subject to protected-path denials and
+  filter high-confidence API-key and cloud-credential environment variables.
+
+---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23
 
 ### Security

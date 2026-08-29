@@ -12,7 +12,7 @@ use std::{
 use anyhow::Context;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use sbe_core::{
-    BackendOptions, Sandbox, SandboxBackend,
+    BackendOptions, Sandbox, SandboxBackend, SecurityMode,
     config::{SandboxPath, expand_path, load_configs, resolve_profile},
     detect::{self, Ecosystem},
     error::CoreError,
@@ -22,8 +22,7 @@ use sbe_core::{
     },
 };
 use sbe_proxy::{ProxyEndpoint, ProxyServer, allowlist::DomainAllowlist};
-use tokio::io::AsyncWriteExt;
-use tokio::sync::watch;
+use tokio::{io::AsyncWriteExt, sync::watch};
 use tracing::{info, warn};
 
 use crate::cli::RunArgs;
@@ -68,7 +67,9 @@ pub async fn execute(args: &RunArgs) -> ExitCode {
 async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
     let pwd = std::env::current_dir().context("failed to get current directory")?;
     let home = dirs::home_dir().context("could not determine home directory")?;
-    reject_project_relocation(&args.command)?;
+    if args.strict {
+        reject_project_relocation(&args.command)?;
+    }
 
     // Determine ecosystem
     let command_name = &args.command[0];
@@ -78,7 +79,7 @@ async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
 
     // Build and resolve profile
     let mut profile = SandboxProfile::for_ecosystem(ecosystem, &home, &pwd);
-    if ecosystem == Ecosystem::Node {
+    if args.strict && ecosystem == Ecosystem::Node {
         configure_node_workspace(&mut profile, &args.command, &pwd)?;
     }
     let configs = load_configs(&pwd, args.config.as_deref(), args.trust_project_config).await?;
@@ -96,9 +97,14 @@ async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
         });
     }
     profile.finalize();
-    enable_existing_dependency_execution(&mut profile, &args.command);
+    if args.strict {
+        enable_existing_dependency_execution(&mut profile, &args.command);
+    } else {
+        apply_standard_profile(&mut profile, &args.command, &home, &pwd);
+        resolve_standard_path_aliases(&mut profile, &pwd);
+    }
 
-    if !args.dry_run {
+    if args.strict && !args.dry_run {
         if cargo_uses_persistent_target(&args.command) {
             ensure_child_directory(&pwd, c"target")?;
         }
@@ -135,14 +141,22 @@ async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
     // Normal execution performs the filesystem identity scan exactly once in
     // the platform backend immediately before spawn. Inspection has no spawn,
     // so its branch below runs the complete validation explicitly.
-    profile.validate_structural_security_invariants()?;
+    if args.strict {
+        profile.validate_structural_security_invariants()?;
+    }
 
     // Construct backend (kernel probe runs once here).
     let backend_options = BackendOptions {
         allow_degraded: cli_allow_degraded,
         allow_insecure_network: args.allow_insecure_linux_network || cli_allow_degraded,
     };
-    let backend = Sandbox::new_with_options(backend_options).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let security_mode = if args.strict {
+        SecurityMode::Strict
+    } else {
+        SecurityMode::Standard
+    };
+    let backend = Sandbox::new_with_mode(backend_options, security_mode)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     info!(
         backend = backend.name(),
         kernel = %backend.info().kernel,
@@ -159,13 +173,16 @@ async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
         &runtime_temp_path,
         &pwd,
         &args.command,
+        args.strict,
     )
     .await?;
 
     // Dry run / inspect: print policy and exit
     if args.dry_run {
-        profile.validate_security_invariants()?;
-        print_inspect_output(&profile, &backend, proxy_port, &extra_env)?;
+        if args.strict {
+            profile.validate_security_invariants()?;
+        }
+        print_inspect_output(&profile, &backend, proxy_port, &extra_env, args.strict)?;
         let _ = shutdown_tx.send(true);
         if let Some(runtime) = proxy.take() {
             await_proxy_shutdown(runtime).await?;
@@ -315,8 +332,9 @@ async fn build_extra_env(
     runtime_temp: &Path,
     project_dir: &Path,
     command: &[String],
+    strict: bool,
 ) -> anyhow::Result<HashMap<String, String>> {
-    let mut env = filter_parent_environment(std::env::vars());
+    let mut env = filter_parent_environment(std::env::vars(), strict);
     let mut inherited: Vec<String> = env.keys().cloned().collect();
     inherited.sort();
     for name in inherited {
@@ -328,8 +346,8 @@ async fn build_extra_env(
     insert_runtime_environment(profile, &mut env, "TEMP", temp.clone());
     insert_runtime_environment(profile, &mut env, "XDG_RUNTIME_DIR", temp.clone());
     let profile_name = profile.name.clone();
-    match profile_name.as_str() {
-        "rust" => {
+    match (strict, profile_name.as_str()) {
+        (true, "rust") => {
             let target_dir = if cargo_executes_target(command) {
                 runtime_temp.join("cargo-target")
             } else {
@@ -351,7 +369,7 @@ async fn build_extra_env(
                     .into_owned(),
             );
         }
-        "python" => {
+        (true, "python") => {
             insert_runtime_environment(
                 profile,
                 &mut env,
@@ -368,7 +386,7 @@ async fn build_extra_env(
                 runtime_temp.join("uv-cache").to_string_lossy().into_owned(),
             );
         }
-        "elixir" => {
+        (true, "elixir") => {
             insert_runtime_environment(
                 profile,
                 &mut env,
@@ -391,7 +409,7 @@ async fn build_extra_env(
                     .into_owned(),
             );
         }
-        "java" => {
+        (true, "java") => {
             insert_runtime_environment(
                 profile,
                 &mut env,
@@ -424,6 +442,18 @@ async fn build_extra_env(
             );
         }
         _ => {}
+    }
+    if !strict
+        && profile_name == "rust"
+        && !env.contains_key("CARGO_TARGET_DIR")
+        && !env.contains_key("CARGO_BUILD_TARGET_DIR")
+    {
+        insert_runtime_environment(
+            profile,
+            &mut env,
+            "CARGO_TARGET_DIR",
+            project_dir.join("target").to_string_lossy().into_owned(),
+        );
     }
     if let Some(endpoint) = proxy_endpoint {
         let proxy_url = endpoint.url();
@@ -517,13 +547,275 @@ fn record_effective_environment(profile: &mut SandboxProfile, name: &str, origin
     });
 }
 
-fn filter_parent_environment<I>(variables: I) -> HashMap<String, String>
+fn filter_parent_environment<I>(variables: I, strict: bool) -> HashMap<String, String>
 where
     I: IntoIterator<Item = (String, String)>,
 {
     variables
         .into_iter()
-        .filter(|(name, _)| SAFE_PARENT_ENV.contains(&name.as_str()))
+        .filter(|(name, _)| {
+            if strict {
+                SAFE_PARENT_ENV.contains(&name.as_str())
+            } else {
+                !is_sensitive_environment_name(name)
+            }
+        })
+        .collect()
+}
+
+fn is_sensitive_environment_name(name: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AZURE_CLIENT_SECRET",
+        "DOCKER_AUTH_CONFIG",
+        "GPG_AGENT_INFO",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "KUBECONFIG",
+        "SSH_AGENT_PID",
+        "SSH_AUTH_SOCK",
+    ];
+    const RESERVED: &[&str] = &[
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "XDG_RUNTIME_DIR",
+        "SBE_PROXY_TOKEN",
+    ];
+
+    let upper = name.to_ascii_uppercase();
+    EXACT.contains(&upper.as_str())
+        || RESERVED.contains(&upper.as_str())
+        || upper.starts_with("DYLD_")
+        || upper == "LD_PRELOAD"
+        || upper == "LD_LIBRARY_PATH"
+        || [
+            "_TOKEN",
+            "_API_KEY",
+            "_SECRET",
+            "_PASSWORD",
+            "_PASSWD",
+            "_PRIVATE_KEY",
+            "_CREDENTIAL",
+            "_CREDENTIALS",
+        ]
+        .iter()
+        .any(|suffix| upper.ends_with(suffix))
+}
+
+fn apply_standard_profile(
+    profile: &mut SandboxProfile,
+    command: &[String],
+    home: &Path,
+    project_dir: &Path,
+) {
+    let project_outputs = replace_builtin_project_writes(profile, project_dir);
+
+    insert_builtin_path_grant(
+        profile,
+        GrantKind::AllowWrite,
+        SandboxPath::dir(project_dir.to_path_buf()),
+    );
+    for output in project_outputs
+        .into_iter()
+        .filter(|output| resolves_within(output, project_dir))
+    {
+        insert_builtin_path_grant(profile, GrantKind::AllowExec, SandboxPath::dir(output));
+    }
+
+    for name in ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"] {
+        if let Some(path) = std::env::var_os(name).map(PathBuf::from) {
+            let path = if path.is_absolute() {
+                path
+            } else {
+                project_dir.join(path)
+            };
+            insert_builtin_path_grant(
+                profile,
+                GrantKind::AllowWrite,
+                SandboxPath::dir(path.clone()),
+            );
+            insert_builtin_path_grant(profile, GrantKind::AllowExec, SandboxPath::dir(path));
+        }
+    }
+
+    if command_is(command, "cargo") && top_level_subcommand(command).is_command(&["install"]) {
+        let cargo_root = std::env::var_os("CARGO_INSTALL_ROOT")
+            .or_else(|| std::env::var_os("CARGO_HOME"))
+            .map_or_else(|| home.join(".cargo"), PathBuf::from);
+        let cargo_root = if cargo_root.is_absolute() {
+            cargo_root
+        } else {
+            project_dir.join(cargo_root)
+        };
+        insert_builtin_path_grant(
+            profile,
+            GrantKind::AllowWrite,
+            SandboxPath::dir(cargo_root.clone()),
+        );
+        insert_builtin_path_grant(
+            profile,
+            GrantKind::AllowExec,
+            SandboxPath::dir(cargo_root.join("bin")),
+        );
+    }
+}
+
+fn replace_builtin_project_writes(
+    profile: &mut SandboxProfile,
+    project_dir: &Path,
+) -> Vec<PathBuf> {
+    let built_in_boundary = profile
+        .first_user_allow_write
+        .min(profile.allow_write.len());
+    let mut project_outputs = Vec::new();
+    let mut removed = Vec::new();
+    let mut retained = Vec::with_capacity(profile.allow_write.len());
+    for (index, grant) in profile.allow_write.drain(..).enumerate() {
+        if index < built_in_boundary
+            && grant.path != project_dir
+            && grant.path.starts_with(project_dir)
+        {
+            if grant.kind == sbe_core::config::PathKind::Subpath {
+                project_outputs.push(grant.path.clone());
+            }
+            removed.push(grant.path);
+        } else {
+            retained.push(grant);
+        }
+    }
+    profile.allow_write = retained;
+    profile.first_user_allow_write = built_in_boundary.saturating_sub(removed.len());
+    profile.grant_origins.retain(|record| {
+        record.kind != GrantKind::AllowWrite
+            || record.origin != GrantOrigin::BuiltIn
+            || !removed
+                .iter()
+                .any(|path| record.value == path.to_string_lossy())
+    });
+    project_outputs
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "standard mode resolves existing ancestors before granting executable project output"
+)]
+fn resolves_within(path: &Path, root: &Path) -> bool {
+    let Ok(root) = std::fs::canonicalize(root) else {
+        return false;
+    };
+    let mut existing = Some(path);
+    while let Some(candidate) = existing {
+        match std::fs::canonicalize(candidate) {
+            Ok(resolved) => return resolved.starts_with(&root),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                existing = candidate.parent();
+            }
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+fn insert_builtin_path_grant(profile: &mut SandboxProfile, kind: GrantKind, grant: SandboxPath) {
+    let paths = match kind {
+        GrantKind::AllowWrite => &mut profile.allow_write,
+        GrantKind::AllowExec => &mut profile.allow_exec,
+        _ => return,
+    };
+    if paths.iter().any(|existing| existing == &grant) {
+        return;
+    }
+    let value = grant.path.to_string_lossy().into_owned();
+    match kind {
+        GrantKind::AllowWrite => {
+            let index = profile.first_user_allow_write.min(paths.len());
+            paths.insert(index, grant);
+            profile.first_user_allow_write = index + 1;
+        }
+        GrantKind::AllowExec => {
+            let index = profile.first_user_allow_exec.min(paths.len());
+            paths.insert(index, grant);
+            profile.first_user_allow_exec = index + 1;
+        }
+        _ => return,
+    }
+    profile.grant_origins.push(GrantRecord {
+        kind,
+        value,
+        origin: GrantOrigin::BuiltIn,
+    });
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "standard mode snapshots pre-existing user tool and cache symlinks before launch"
+)]
+fn resolve_standard_path_aliases(profile: &mut SandboxProfile, project_dir: &Path) {
+    let write_aliases = resolved_aliases(
+        &profile.allow_write,
+        profile.first_user_allow_write,
+        project_dir,
+    );
+    let exec_aliases = resolved_aliases(
+        &profile.allow_exec,
+        profile.first_user_allow_exec,
+        project_dir,
+    );
+    for alias in write_aliases {
+        if !profile.allow_write.contains(&alias) {
+            profile.grant_origins.push(GrantRecord {
+                kind: GrantKind::AllowWrite,
+                value: alias.path.to_string_lossy().into_owned(),
+                origin: GrantOrigin::Runtime,
+            });
+            profile.allow_write.push(alias);
+        }
+    }
+    for alias in exec_aliases {
+        if !profile.allow_exec.contains(&alias) {
+            profile.grant_origins.push(GrantRecord {
+                kind: GrantKind::AllowExec,
+                value: alias.path.to_string_lossy().into_owned(),
+                origin: GrantOrigin::Runtime,
+            });
+            profile.allow_exec.push(alias);
+        }
+    }
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "standard mode snapshots pre-existing user tool and cache symlinks before launch"
+)]
+fn resolved_aliases(
+    paths: &[SandboxPath],
+    built_in_boundary: usize,
+    project_dir: &Path,
+) -> Vec<SandboxPath> {
+    paths
+        .iter()
+        .enumerate()
+        .filter_map(|(index, grant)| {
+            let resolved = std::fs::canonicalize(&grant.path).ok()?;
+            if resolved == grant.path {
+                return None;
+            }
+            let built_in_project_path = index < built_in_boundary
+                && grant.path.starts_with(project_dir)
+                && !resolved.starts_with(project_dir);
+            if built_in_project_path {
+                return None;
+            }
+            Some(SandboxPath {
+                path: resolved,
+                kind: grant.kind,
+            })
+        })
         .collect()
 }
 
@@ -1031,8 +1323,9 @@ fn ensure_literal_write_targets(
     command: &[String],
     project_dir: &Path,
 ) -> anyhow::Result<()> {
-    use sbe_core::config::PathKind;
     use std::os::fd::OwnedFd;
+
+    use sbe_core::config::PathKind;
 
     reject_project_relocation(command)?;
     let program = command
@@ -1571,10 +1864,15 @@ fn print_inspect_output(
     backend: &Sandbox,
     proxy_port: Option<u16>,
     effective_environment: &HashMap<String, String>,
+    strict: bool,
 ) -> anyhow::Result<()> {
     eprintln!("--- Backend ---");
     eprintln!("name:    {}", backend.name());
     eprintln!("kernel:  {}", backend.info().kernel);
+    eprintln!(
+        "securityMode: {}",
+        if strict { "strict" } else { "standard" }
+    );
     eprintln!("features:");
     let f = &backend.info().features;
     eprintln!("  fs_write       : {}", f.fs_write);
@@ -1778,17 +2076,40 @@ mod tests {
 
     #[test]
     fn ambient_credentials_are_not_inherited() {
-        let inherited = filter_parent_environment([
-            ("PATH".to_owned(), "/usr/bin".to_owned()),
-            ("LANG".to_owned(), "C.UTF-8".to_owned()),
-            ("GITHUB_TOKEN".to_owned(), "sentinel".to_owned()),
-            ("AWS_SECRET_ACCESS_KEY".to_owned(), "sentinel".to_owned()),
-            ("SSH_AUTH_SOCK".to_owned(), "/tmp/agent".to_owned()),
-            ("NPM_TOKEN".to_owned(), "sentinel".to_owned()),
-        ]);
-        assert_eq!(inherited.len(), 2);
+        let inherited = filter_parent_environment(
+            [
+                ("PATH".to_owned(), "/usr/bin".to_owned()),
+                ("LANG".to_owned(), "C.UTF-8".to_owned()),
+                ("RUSTFLAGS".to_owned(), "-Cdebuginfo=1".to_owned()),
+                ("GITHUB_TOKEN".to_owned(), "sentinel".to_owned()),
+                ("AWS_SECRET_ACCESS_KEY".to_owned(), "sentinel".to_owned()),
+                ("SSH_AUTH_SOCK".to_owned(), "/tmp/agent".to_owned()),
+                ("NPM_TOKEN".to_owned(), "sentinel".to_owned()),
+                ("OPENAI_API_KEY".to_owned(), "sentinel".to_owned()),
+                (
+                    "GOOGLE_APPLICATION_CREDENTIALS".to_owned(),
+                    "/tmp/google-credentials.json".to_owned(),
+                ),
+            ],
+            false,
+        );
+        assert_eq!(inherited.len(), 3);
         assert_eq!(inherited.get("PATH").map(String::as_str), Some("/usr/bin"));
+        assert_eq!(
+            inherited.get("RUSTFLAGS").map(String::as_str),
+            Some("-Cdebuginfo=1")
+        );
         assert!(!inherited.values().any(|value| value == "sentinel"));
+
+        let strict = filter_parent_environment(
+            [
+                ("PATH".to_owned(), "/usr/bin".to_owned()),
+                ("RUSTFLAGS".to_owned(), "-Cdebuginfo=1".to_owned()),
+            ],
+            true,
+        );
+        assert!(strict.contains_key("PATH"));
+        assert!(!strict.contains_key("RUSTFLAGS"));
     }
 
     #[tokio::test]
@@ -1798,9 +2119,16 @@ mod tests {
         let mut profile =
             SandboxProfile::for_ecosystem(Ecosystem::Java, Path::new("/home/test"), project.path());
 
-        let environment = build_extra_env(&mut profile, None, runtime.path(), project.path(), &[])
-            .await
-            .unwrap();
+        let environment = build_extra_env(
+            &mut profile,
+            None,
+            runtime.path(),
+            project.path(),
+            &[],
+            true,
+        )
+        .await
+        .unwrap();
         let sbt_options = environment.get("SBT_OPTS").unwrap();
 
         assert!(sbt_options.contains("-Dsbt.boot.directory="));
@@ -1820,6 +2148,7 @@ mod tests {
             runtime.path(),
             project.path(),
             &["cargo".to_owned(), "test".to_owned()],
+            true,
         )
         .await
         .unwrap();
@@ -1839,6 +2168,7 @@ mod tests {
             runtime.path(),
             project.path(),
             &["cargo".to_owned(), "build".to_owned()],
+            true,
         )
         .await
         .unwrap();
@@ -1863,6 +2193,7 @@ mod tests {
             runtime.path(),
             project.path(),
             &["cargo".to_owned(), "nextest".to_owned(), "run".to_owned()],
+            true,
         )
         .await
         .unwrap();
@@ -1877,6 +2208,124 @@ mod tests {
             "nextest".to_owned(),
             "run".to_owned(),
         ]));
+    }
+
+    #[tokio::test]
+    async fn standard_rust_profile_keeps_normal_outputs_and_wrapper_support() {
+        let project = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let mut profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Rust,
+            Path::new("/Users/test"),
+            project.path(),
+        );
+        apply_standard_profile(
+            &mut profile,
+            &["cargo".to_owned(), "test".to_owned()],
+            Path::new("/Users/test"),
+            project.path(),
+        );
+
+        assert!(
+            profile
+                .allow_write
+                .contains(&SandboxPath::dir(project.path().to_path_buf()))
+        );
+        assert!(
+            profile
+                .allow_exec
+                .contains(&SandboxPath::dir(project.path().join("target")))
+        );
+        assert!(
+            profile.validate_structural_security_invariants().is_err(),
+            "standard mode deliberately permits mutable executable build output"
+        );
+
+        let environment = build_extra_env(
+            &mut profile,
+            None,
+            runtime.path(),
+            project.path(),
+            &["cargo".to_owned(), "test".to_owned()],
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            environment.get("CARGO_TARGET_DIR").map(String::as_str),
+            project.path().join("target").to_str()
+        );
+        assert!(!environment.contains_key("SCCACHE_CLIENT_SIDE"));
+        assert!(!environment.contains_key("CARGO_BUILD_BUILD_DIR"));
+    }
+
+    #[test]
+    fn standard_profile_does_not_follow_project_output_symlinks_outside_project() {
+        let project = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(external.path(), project.path().join("target")).unwrap();
+        let mut profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Rust,
+            Path::new("/Users/test"),
+            project.path(),
+        );
+
+        apply_standard_profile(
+            &mut profile,
+            &["cargo".to_owned(), "build".to_owned()],
+            Path::new("/Users/test"),
+            project.path(),
+        );
+        resolve_standard_path_aliases(&mut profile, project.path());
+
+        assert!(
+            profile
+                .allow_write
+                .contains(&SandboxPath::dir(project.path().to_path_buf()))
+        );
+        assert!(!profile.allow_write.iter().any(|grant| {
+            grant.path == project.path().join("target") || grant.path == external.path()
+        }));
+        assert!(!profile.allow_exec.iter().any(|grant| {
+            grant.path == project.path().join("target") || grant.path == external.path()
+        }));
+    }
+
+    #[test]
+    fn standard_cargo_install_only_executes_the_install_bin_directory() {
+        let project = tempfile::tempdir().unwrap();
+        let home = Path::new("/Users/test");
+        let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, home, project.path());
+        apply_standard_profile(
+            &mut profile,
+            &[
+                "cargo".to_owned(),
+                "install".to_owned(),
+                "ripgrep".to_owned(),
+            ],
+            home,
+            project.path(),
+        );
+
+        let cargo_root = std::env::var_os("CARGO_INSTALL_ROOT")
+            .or_else(|| std::env::var_os("CARGO_HOME"))
+            .map_or_else(|| home.join(".cargo"), PathBuf::from);
+        let cargo_root = if cargo_root.is_absolute() {
+            cargo_root
+        } else {
+            project.path().join(cargo_root)
+        };
+        assert!(
+            profile
+                .allow_write
+                .contains(&SandboxPath::dir(cargo_root.clone()))
+        );
+        assert!(
+            profile
+                .allow_exec
+                .contains(&SandboxPath::dir(cargo_root.join("bin")))
+        );
+        assert!(!profile.allow_exec.contains(&SandboxPath::dir(cargo_root)));
     }
 
     #[test]

@@ -219,6 +219,7 @@ profiles:
       - "$PWD/Cargo.lock"
       - "~/.cargo/registry/"
       - "~/.cargo/git/"
+      - "~/.cache/sccache/"
       # NOTE: ~/.cargo/bin/ is NOT writable — prevents trojaning cargo binaries
       - "~/.cache/zig/"
     allowDomains:
@@ -232,6 +233,8 @@ profiles:
     allowExec:
       - "~/.cargo/bin/"
       - "~/.rustup/toolchains/"
+      - "/usr/bin/sccache"
+      - "/usr/local/bin/sccache"
 
   python:
     allowWrite:

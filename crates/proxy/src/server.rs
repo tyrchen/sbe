@@ -90,13 +90,9 @@ impl ProxyEndpoint {
 
     fn java_tool_options(&self, agent_path: &str, temp_path: &str) -> String {
         format!(
-            "-javaagent:{agent_path} \
-             -Djava.io.tmpdir={temp_path} \
-             -Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort={} \
-             -Dhttp.proxyProtocol=http \
-             -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort={} \
-             -Dhttps.proxyProtocol=http \
-             -Dhttp.nonProxyHosts= \
+            "-javaagent:{agent_path} -Djava.io.tmpdir={temp_path} -Dhttp.proxyHost=127.0.0.1 \
+             -Dhttp.proxyPort={} -Dhttp.proxyProtocol=http -Dhttps.proxyHost=127.0.0.1 \
+             -Dhttps.proxyPort={} -Dhttps.proxyProtocol=http -Dhttp.nonProxyHosts= \
              -Djdk.http.auth.tunneling.disabledSchemes=",
             self.port, self.port
         )

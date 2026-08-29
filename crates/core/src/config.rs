@@ -329,7 +329,9 @@ impl ProfileConfig {
         if self.allow_degraded == Some(true) {
             return Err(config_policy(
                 path,
-                "allowDegraded in configuration is no longer accepted; use the capability-specific CLI option --allow-insecure-linux-network for one trusted invocation",
+                "allowDegraded in configuration is no longer accepted; use the \
+                 capability-specific CLI options --strict and --allow-insecure-linux-network for \
+                 one trusted invocation",
             ));
         }
         let lists = [
@@ -418,7 +420,8 @@ impl ProfileConfig {
         if expands_authority {
             return Err(config_policy(
                 path,
-                "project configuration may only add denyRead/denyExec or explicitly disable allowAllNetwork/allowDegraded; pass --trust-project-config to authorize expansion",
+                "project configuration may only add denyRead/denyExec or explicitly disable \
+                 allowAllNetwork/allowDegraded; pass --trust-project-config to authorize expansion",
             ));
         }
         Ok(())

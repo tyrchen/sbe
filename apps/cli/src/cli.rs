@@ -31,6 +31,11 @@ pub enum Commands {
 /// Arguments shared between `run` and `inspect`.
 #[derive(Debug, Parser)]
 pub struct RunArgs {
+    /// Require the fail-closed 0.4 security boundary. The default standard
+    /// mode favors compatibility while preserving core host protections.
+    #[arg(long)]
+    pub strict: bool,
+
     /// Use a specific profile (overrides auto-detect).
     #[arg(short = 'p', long)]
     pub profile: Option<String>,
@@ -120,6 +125,10 @@ pub struct RunArgs {
 
 #[derive(Debug, Parser)]
 pub struct InspectArgs {
+    /// Inspect the fail-closed strict policy instead of the standard policy.
+    #[arg(long)]
+    pub strict: bool,
+
     /// Use a specific profile (overrides auto-detect).
     #[arg(short = 'p', long)]
     pub profile: Option<String>,
@@ -193,6 +202,7 @@ impl InspectArgs {
     /// Convert inspect args into equivalent run args for profile resolution.
     pub fn as_run_args(&self) -> RunArgs {
         RunArgs {
+            strict: self.strict,
             profile: self.profile.clone(),
             allow_domain: self.allow_domain.clone(),
             deny_domain: self.deny_domain.clone(),

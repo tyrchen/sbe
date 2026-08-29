@@ -21,7 +21,7 @@ use super::{landlock, probe, seccomp};
 use crate::{
     error::CoreError,
     profile::{NetworkMode, SandboxProfile},
-    sandbox::{BackendOptions, linux::probe::ProbeResult},
+    sandbox::{BackendOptions, SecurityMode, linux::probe::ProbeResult},
 };
 
 const LAUNCHER_MARKER: &str = "__sbe_linux_launcher";
@@ -45,6 +45,7 @@ struct LauncherPayload {
     command: Vec<String>,
     environment: HashMap<String, String>,
     options: BackendOptions,
+    security_mode: SecurityMode,
 }
 
 /// Parent-side asynchronous wrapper: write a private bounded payload and
@@ -56,10 +57,13 @@ pub(super) async fn run_sandboxed(
     extra_env: &HashMap<String, String>,
     probe: &ProbeResult,
     options: BackendOptions,
+    security_mode: SecurityMode,
     pid_tx: Option<tokio::sync::oneshot::Sender<u32>>,
 ) -> Result<ExitStatus, CoreError> {
-    enforce_network_capability(profile, probe, options)?;
-    profile.validate_security_invariants()?;
+    enforce_network_capability(profile, probe, options, security_mode)?;
+    if security_mode.is_strict() {
+        profile.validate_security_invariants()?;
+    }
     if command.is_empty() {
         return Err(CoreError::Backend("empty command vector".to_owned()));
     }
@@ -75,6 +79,7 @@ pub(super) async fn run_sandboxed(
         command: command.to_vec(),
         environment: extra_env.clone(),
         options,
+        security_mode,
     };
     let encoded = serde_json::to_vec(&payload)
         .map_err(|error| CoreError::Backend(format!("serialize launcher policy: {error}")))?;
@@ -249,14 +254,31 @@ fn launcher_main(policy_fd: RawFd) -> Result<ExitCode, CoreError> {
     profile.first_user_allow_exec = payload.first_user_allow_exec;
     profile.first_user_allow_read = payload.first_user_allow_read;
     profile.ephemeral_write_exec = payload.ephemeral_write_exec;
-    profile.validate_structural_security_invariants()?;
+    if payload.security_mode.is_strict() {
+        profile.validate_structural_security_invariants()?;
+    }
 
     let live_probe = probe::run()?;
-    enforce_network_capability(&profile, &live_probe, payload.options)?;
-    let compiled_landlock =
-        landlock::compile(&profile, payload.proxy_port, &live_probe, payload.options)?;
-    let compiled_seccomp =
-        seccomp::compile(&profile, payload.proxy_port, &live_probe, payload.options)?;
+    enforce_network_capability(
+        &profile,
+        &live_probe,
+        payload.options,
+        payload.security_mode,
+    )?;
+    let compiled_landlock = landlock::compile(
+        &profile,
+        payload.proxy_port,
+        &live_probe,
+        payload.options,
+        payload.security_mode,
+    )?;
+    let compiled_seccomp = seccomp::compile(
+        &profile,
+        payload.proxy_port,
+        &live_probe,
+        payload.options,
+        payload.security_mode,
+    )?;
 
     let program = payload
         .command
@@ -340,6 +362,7 @@ fn enforce_network_capability(
     profile: &SandboxProfile,
     probe: &ProbeResult,
     options: BackendOptions,
+    security_mode: SecurityMode,
 ) -> Result<(), CoreError> {
     if matches!(
         profile.network_mode,
@@ -347,6 +370,14 @@ fn enforce_network_capability(
     ) {
         // DenyAll is fully enforced by the unconditional seccomp socket(2)
         // rule and does not depend on Landlock's ABI-v4 TCP port mediation.
+        return Ok(());
+    }
+    if !security_mode.is_strict() {
+        eprintln!(
+            "sbe: WARNING: standard Linux mode cannot enforce domain egress while preserving \
+             local build services; filesystem, environment, descriptor, privilege, and proxy \
+             protections remain active (use --strict for fail-closed networking)"
+        );
         return Ok(());
     }
     if profile.network_mode == NetworkMode::Proxy && !options.allow_insecure_network {
@@ -385,9 +416,10 @@ fn enforce_network_capability(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use crate::detect::Ecosystem;
-    use std::path::PathBuf;
 
     #[test]
     fn strict_proxy_mode_refuses_port_only_linux_confinement() {
@@ -400,8 +432,13 @@ mod tests {
             kernel: "test".to_owned(),
             abi: super::super::probe::LandlockAbi::V9,
         };
-        let error =
-            enforce_network_capability(&profile, &probe, BackendOptions::default()).unwrap_err();
+        let error = enforce_network_capability(
+            &profile,
+            &probe,
+            BackendOptions::default(),
+            SecurityMode::Strict,
+        )
+        .unwrap_err();
         assert!(format!("{error}").contains("strict-domain-egress"));
     }
 
@@ -424,6 +461,30 @@ mod tests {
                     allow_insecure_network: true,
                     ..BackendOptions::default()
                 },
+                SecurityMode::Strict,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn standard_proxy_mode_keeps_partial_linux_protection() {
+        let profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Node,
+            &PathBuf::from("/home/test"),
+            &PathBuf::from("/work/project"),
+        );
+        let probe = ProbeResult {
+            kernel: "test".to_owned(),
+            abi: super::super::probe::LandlockAbi::V3,
+        };
+
+        assert!(
+            enforce_network_capability(
+                &profile,
+                &probe,
+                BackendOptions::default(),
+                SecurityMode::Standard,
             )
             .is_ok()
         );
@@ -444,7 +505,15 @@ mod tests {
             abi: super::super::probe::LandlockAbi::V3,
         };
 
-        assert!(enforce_network_capability(&profile, &probe, BackendOptions::default()).is_ok());
+        assert!(
+            enforce_network_capability(
+                &profile,
+                &probe,
+                BackendOptions::default(),
+                SecurityMode::Standard,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -474,6 +543,7 @@ mod tests {
             command: vec!["/bin/true".to_owned()],
             environment: HashMap::new(),
             options: BackendOptions::default(),
+            security_mode: SecurityMode::Standard,
         };
         let encoded = serde_json::to_vec(&payload).unwrap();
         let decoded: LauncherPayload = serde_json::from_slice(&encoded).unwrap();
