@@ -238,9 +238,11 @@ Standard mode grants writes to:
   an install operation.
 
 For npm and npx commands, `--cache` overrides `NPM_CONFIG_CACHE`, then a simple
-project `.npmrc` `cache=path`, then the default `~/.npm`. The effective cache
-replaces the default writable grant; relative paths are anchored to the command
-project. A repository-selected external cache requires `--allow-write`.
+project `.npmrc` `cache=path`, user `~/.npmrc`, then the default `~/.npm`.
+pnpm's `--store-dir`, configuration environment, project `.npmrc`, and user
+`.npmrc` select its store in the same manner. The effective cache/store replaces
+the corresponding default writable grant; relative paths are anchored to the
+command project. A repository-selected external path requires `--allow-write`.
 
 For Gradle commands, the conventional cache grant follows Gradle's effective
 user home: `--gradle-user-home`, every accepted `-g` form including `-g/path`,
@@ -471,7 +473,7 @@ feature switches, terminal settings, and tool paths. It removes:
   locators; npm user-config files selected by `NPM_CONFIG_USERCONFIG` are
   withheld because they commonly contain registry authentication tokens, as
   are Kerberos ticket-cache/keytab locators `KRB5CCNAME`, `KRB5_KTNAME`, and
-  `KRB5_CLIENT_KTNAME`;
+  `KRB5_CLIENT_KTNAME`, plus the custom netrc locator `NETRC`;
 - agent and credential socket variables;
 - dynamic-loader injection variables; and
 - SBE-reserved proxy, runtime, and policy variables.

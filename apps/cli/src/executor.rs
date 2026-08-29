@@ -652,6 +652,7 @@ fn is_sensitive_environment_name(name: &str) -> bool {
         "MONGODB_URI",
         "MONGO_URL",
         "MYSQL_PWD",
+        "NETRC",
         "NPM_CONFIG_USERCONFIG",
         "PASSWORD",
         "PASSWD",
@@ -759,7 +760,7 @@ fn apply_standard_profile(
 
     if let Some(npm_cache) = effective_npm_cache(profile, command, home, project_dir)? {
         if npm_cache.project_controlled
-            && !project_npm_cache_is_approved(profile, &npm_cache.path, home, project_dir)
+            && !project_cache_is_approved(profile, &npm_cache.path, &home.join(".npm"), project_dir)
         {
             let resolved = resolve_existing_ancestor(&npm_cache.path)
                 .unwrap_or_else(|| npm_cache.path.clone());
@@ -770,6 +771,17 @@ fn apply_standard_profile(
             &home.join(".npm"),
             SandboxPath::dir(npm_cache.path),
         );
+    }
+    if let Some(pnpm_store) = effective_pnpm_store(profile, command, home, project_dir)? {
+        let conventional = home.join(".local/share/pnpm");
+        if pnpm_store.project_controlled
+            && !project_cache_is_approved(profile, &pnpm_store.path, &conventional, project_dir)
+        {
+            let resolved = resolve_existing_ancestor(&pnpm_store.path)
+                .unwrap_or_else(|| pnpm_store.path.clone());
+            return Err(external_write_approval_error(&pnpm_store.path, &resolved));
+        }
+        replace_builtin_write_path(profile, &conventional, SandboxPath::dir(pnpm_store.path));
     }
 
     if profile.name == "java" {
@@ -988,10 +1000,17 @@ fn effective_npm_cache(
     } else {
         None
     };
+    let user_cache =
+        if command_cache.is_none() && environment_cache.is_none() && project_cache.is_none() {
+            user_npm_config_path(home, "cache")?
+        } else {
+            None
+        };
     let project_controlled = project_cache.is_some();
     let selected = command_cache
         .or(environment_cache)
         .or(project_cache)
+        .or(user_cache)
         .unwrap_or_else(|| home.join(".npm"));
     if selected.as_os_str().is_empty() {
         anyhow::bail!("NPM_CONFIG_CACHE must select a non-empty path");
@@ -1011,8 +1030,26 @@ fn project_npm_cache(project_dir: &Path, home: &Path) -> anyhow::Result<Option<P
     let Some(contents) = read_bounded_project_file(&path)? else {
         return Ok(None);
     };
-    let contents = std::str::from_utf8(&contents)
-        .with_context(|| format!("project npm configuration is not UTF-8: {}", path.display()))?;
+    npm_config_path_value(&contents, &path, home, "cache", "project .npmrc")
+}
+
+fn user_npm_config_path(home: &Path, key: &str) -> anyhow::Result<Option<PathBuf>> {
+    let path = home.join(".npmrc");
+    let Some(contents) = read_bounded_following_metadata_file(&path)? else {
+        return Ok(None);
+    };
+    npm_config_path_value(&contents, &path, home, key, "user .npmrc")
+}
+
+fn npm_config_path_value(
+    contents: &[u8],
+    path: &Path,
+    home: &Path,
+    selected_key: &str,
+    source: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    let contents = std::str::from_utf8(contents)
+        .with_context(|| format!("{source} is not UTF-8: {}", path.display()))?;
     let mut selected = None;
     for line in contents.lines().map(str::trim) {
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
@@ -1022,16 +1059,16 @@ fn project_npm_cache(project_dir: &Path, home: &Path) -> anyhow::Result<Option<P
             if line
                 .split_whitespace()
                 .next()
-                .is_some_and(|key| key.eq_ignore_ascii_case("cache"))
+                .is_some_and(|key| key.eq_ignore_ascii_case(selected_key))
             {
                 anyhow::bail!(
-                    "project .npmrc selects cache in an unsupported form; use npm \
-                     --cache=/unambiguous/path"
+                    "{source} selects {selected_key} in an unsupported form; use an explicit \
+                     unambiguous command option"
                 );
             }
             continue;
         };
-        if !key.trim().eq_ignore_ascii_case("cache") {
+        if !key.trim().eq_ignore_ascii_case(selected_key) {
             continue;
         }
         let mut value = value.trim();
@@ -1058,8 +1095,8 @@ fn project_npm_cache(project_dir: &Path, home: &Path) -> anyhow::Result<Option<P
             || value_text.ends_with('\'')
         {
             anyhow::bail!(
-                "project .npmrc selects cache in a form sbe cannot resolve safely; use npm \
-                 --cache=/unambiguous/path"
+                "{source} selects {selected_key} in a form sbe cannot resolve safely; use an \
+                 explicit unambiguous command option"
             );
         }
         selected = Some(value);
@@ -1067,17 +1104,100 @@ fn project_npm_cache(project_dir: &Path, home: &Path) -> anyhow::Result<Option<P
     Ok(selected)
 }
 
-fn project_npm_cache_is_approved(
+fn effective_pnpm_store(
+    profile: &SandboxProfile,
+    command: &[String],
+    home: &Path,
+    project_dir: &Path,
+) -> anyhow::Result<Option<NpmCacheSelection>> {
+    if profile.name != "node" || !command_is(command, "pnpm") {
+        return Ok(None);
+    }
+    let mut command_store = None;
+    let mut arguments = command
+        .iter()
+        .skip(1)
+        .take_while(|argument| argument.as_str() != "--");
+    while let Some(argument) = arguments.next() {
+        let value = if argument == "--store-dir" {
+            Some(
+                arguments
+                    .next()
+                    .map(String::as_str)
+                    .context("pnpm --store-dir requires a value")?,
+            )
+        } else {
+            argument.strip_prefix("--store-dir=")
+        };
+        if let Some(value) = value {
+            if value.is_empty() || value.chars().any(char::is_control) {
+                anyhow::bail!("pnpm --store-dir must select a non-empty unambiguous path");
+            }
+            command_store = Some(PathBuf::from(value));
+        }
+    }
+    let environment_store = if command_store.is_none() {
+        [
+            "PNPM_STORE_DIR",
+            "NPM_CONFIG_STORE_DIR",
+            "pnpm_config_store_dir",
+            "npm_config_store_dir",
+        ]
+        .iter()
+        .find_map(|name| effective_environment_path(profile, name))
+    } else {
+        None
+    };
+    let project_store = if command_store.is_none() && environment_store.is_none() {
+        let path = project_dir.join(".npmrc");
+        read_bounded_project_file(&path)?
+            .map(|contents| {
+                npm_config_path_value(&contents, &path, home, "store-dir", "project .npmrc")
+            })
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    let user_store =
+        if command_store.is_none() && environment_store.is_none() && project_store.is_none() {
+            user_npm_config_path(home, "store-dir")?
+        } else {
+            None
+        };
+    let project_controlled = project_store.is_some();
+    let default_store = effective_environment_path(profile, "XDG_DATA_HOME")
+        .map(|directory| directory.join("pnpm"))
+        .unwrap_or_else(|| home.join(".local/share/pnpm"));
+    let selected = command_store
+        .or(environment_store)
+        .or(project_store)
+        .or(user_store)
+        .unwrap_or(default_store);
+    if selected.as_os_str().is_empty() {
+        anyhow::bail!("pnpm store directory must be a non-empty path");
+    }
+    Ok(Some(NpmCacheSelection {
+        path: if selected.is_absolute() {
+            selected
+        } else {
+            project_dir.join(selected)
+        },
+        project_controlled,
+    }))
+}
+
+fn project_cache_is_approved(
     profile: &SandboxProfile,
     cache: &Path,
-    home: &Path,
+    conventional: &Path,
     project_dir: &Path,
 ) -> bool {
     let resolved = resolve_existing_ancestor(cache).unwrap_or_else(|| cache.to_path_buf());
     let project =
         resolve_existing_ancestor(project_dir).unwrap_or_else(|| project_dir.to_path_buf());
     resolved.starts_with(project)
-        || cache.starts_with(home.join(".npm"))
+        || cache.starts_with(conventional)
         || explicit_write_covers(profile, &resolved)
 }
 
@@ -4139,6 +4259,7 @@ mod tests {
                     "NPM_CONFIG_USERCONFIG".to_owned(),
                     "/tmp/custom-npmrc".to_owned(),
                 ),
+                ("NETRC".to_owned(), "/tmp/custom-netrc".to_owned()),
                 ("KRB5CCNAME".to_owned(), "FILE:/tmp/krb5cc".to_owned()),
                 (
                     "KRB5_CLIENT_KTNAME".to_owned(),
@@ -6619,6 +6740,87 @@ mod tests {
             approved
                 .allow_write
                 .contains(&SandboxPath::dir(external_project_cache))
+        );
+
+        std::fs::write(project.join(".npmrc"), "# no project cache\n").unwrap();
+        let user_cache = root.path().join("user-selected-cache");
+        std::fs::create_dir_all(&user_cache).unwrap();
+        std::fs::write(
+            home.join(".npmrc"),
+            format!("cache={}\n", user_cache.display()),
+        )
+        .unwrap();
+        let mut user_selected = SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &project);
+        apply_standard_profile(
+            &mut user_selected,
+            &["npm".to_owned(), "install".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap();
+        assert!(
+            user_selected
+                .allow_write
+                .contains(&SandboxPath::dir(user_cache))
+        );
+
+        let command_store = root.path().join("command-pnpm-store");
+        let mut pnpm_command = SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &project);
+        apply_standard_profile(
+            &mut pnpm_command,
+            &[
+                "pnpm".to_owned(),
+                "install".to_owned(),
+                "--store-dir".to_owned(),
+                command_store.display().to_string(),
+            ],
+            &home,
+            &project,
+        )
+        .unwrap();
+        assert!(
+            pnpm_command
+                .allow_write
+                .contains(&SandboxPath::dir(command_store))
+        );
+        assert!(
+            !pnpm_command
+                .allow_write
+                .contains(&SandboxPath::dir(home.join(".local/share/pnpm")))
+        );
+
+        let project_store = root.path().join("project-pnpm-store");
+        std::fs::create_dir_all(&project_store).unwrap();
+        std::fs::write(
+            project.join(".npmrc"),
+            format!("store-dir={}\n", project_store.display()),
+        )
+        .unwrap();
+        let mut pnpm_unapproved = SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &project);
+        let error = apply_standard_profile(
+            &mut pnpm_unapproved,
+            &["pnpm".to_owned(), "install".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("--allow-write"));
+
+        let mut pnpm_approved = SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &project);
+        pnpm_approved
+            .allow_write
+            .push(SandboxPath::dir(project_store.clone()));
+        apply_standard_profile(
+            &mut pnpm_approved,
+            &["pnpm".to_owned(), "install".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap();
+        assert!(
+            pnpm_approved
+                .allow_write
+                .contains(&SandboxPath::dir(project_store))
         );
     }
 

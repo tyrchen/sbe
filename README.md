@@ -212,9 +212,11 @@ rejected with `--root` guidance instead of failing later inside the sandbox.
 Registry and Git dependency caches follow the effective `CARGO_HOME`; its two
 credential-file spellings remain denied.
 For npm/npx, a command `--cache` selection overrides `NPM_CONFIG_CACHE`, then a
-simple project `.npmrc` `cache=path`, and replaces the default `~/.npm` write
-grant; relative cache paths are anchored to the selected project. An external
-project-selected cache requires explicit `--allow-write` approval.
+simple project `.npmrc` `cache=path`, user `~/.npmrc`, and the default `~/.npm`.
+For pnpm, `--store-dir`, its configuration environment, project `.npmrc`, and
+user `.npmrc` similarly select the store. Relative paths are anchored to the
+selected project. An external project-selected cache/store requires explicit
+`--allow-write` approval.
 An external Cargo target can be selected with an inherited `CARGO_TARGET_DIR`
 or a direct `--config build.target-dir='path'` override, or granted explicitly
 with matching `--allow-write` and `--allow-exec` paths. Cargo `--config` file

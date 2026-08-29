@@ -131,6 +131,8 @@ All notable changes to this project will be documented in this file. See [conven
   to effective Gradle homes and explicitly selected Maven settings.
 - Resolve project `.npmrc` cache paths behind the external-write gate, and
   require explicit read approval for project-selected external Maven settings.
+- Filter the custom `NETRC` credential locator, resolve npm user-config cache
+  paths, and follow pnpm store selection across command/configuration sources.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23
