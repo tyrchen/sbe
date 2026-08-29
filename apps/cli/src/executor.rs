@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     ffi::CString,
     os::{
         fd::{AsRawFd, FromRawFd},
@@ -171,6 +171,7 @@ async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
         &mut profile,
         proxy.as_ref().map(|runtime| &runtime.endpoint),
         &runtime_temp_path,
+        &home,
         &pwd,
         &args.command,
         args.strict,
@@ -330,6 +331,7 @@ async fn build_extra_env(
     profile: &mut SandboxProfile,
     proxy_endpoint: Option<&ProxyEndpoint>,
     runtime_temp: &Path,
+    home: &Path,
     project_dir: &Path,
     command: &[String],
     strict: bool,
@@ -438,6 +440,26 @@ async fn build_extra_env(
                     sbt_root.join("global").display(),
                     sbt_root.join("boot").display(),
                     sbt_root.join("ivy2").display(),
+                ),
+            );
+        }
+        (false, "java") => {
+            // Keep ordinary dependency caches persistent, but put sbt's
+            // mutable global base in the private run root. The default global
+            // base also contains settings and plugins, so granting ~/.sbt
+            // broadly would let an untrusted build persist executable code.
+            let inherited = env.get("SBT_OPTS").cloned().unwrap_or_default();
+            let separator = if inherited.is_empty() { "" } else { " " };
+            insert_runtime_environment(
+                profile,
+                &mut env,
+                "SBT_OPTS",
+                format!(
+                    "{inherited}{separator}-Dsbt.global.base={} -Dsbt.boot.directory={} \
+                     -Dsbt.ivy.home={}",
+                    runtime_temp.join("sbt-global").display(),
+                    home.join(".sbt/boot").display(),
+                    home.join(".ivy2").display(),
                 ),
             );
         }
@@ -565,16 +587,24 @@ where
 
 fn is_sensitive_environment_name(name: &str) -> bool {
     const EXACT: &[&str] = &[
+        "API_KEY",
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
         "AWS_SESSION_TOKEN",
         "AZURE_CLIENT_SECRET",
+        "CREDENTIAL",
+        "CREDENTIALS",
         "DOCKER_AUTH_CONFIG",
         "GPG_AGENT_INFO",
         "GOOGLE_APPLICATION_CREDENTIALS",
         "KUBECONFIG",
+        "PASSWORD",
+        "PASSWD",
+        "PRIVATE_KEY",
+        "SECRET",
         "SSH_AGENT_PID",
         "SSH_AUTH_SOCK",
+        "TOKEN",
     ];
     const RESERVED: &[&str] = &[
         "HTTP_PROXY",
@@ -641,7 +671,7 @@ fn apply_standard_profile(
         // Standard mode uses the package manager's ordinary persistent
         // caches. Strict mode redirects these into the private runtime root.
         for cache in [
-            home.join(".sbt"),
+            home.join(".sbt/boot"),
             home.join(".ivy2/cache"),
             home.join(".cache/coursier"),
         ] {
@@ -672,9 +702,11 @@ fn apply_standard_profile(
     }
 
     if command_is(command, "cargo") && top_level_subcommand(command).is_command(&["install"]) {
-        let cargo_root = std::env::var_os("CARGO_INSTALL_ROOT")
-            .or_else(|| std::env::var_os("CARGO_HOME"))
-            .map_or_else(|| home.join(".cargo"), PathBuf::from);
+        let cargo_root = command_option_value(command, "--root")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("CARGO_INSTALL_ROOT").map(PathBuf::from))
+            .or_else(|| std::env::var_os("CARGO_HOME").map(PathBuf::from))
+            .unwrap_or_else(|| home.join(".cargo"));
         let cargo_root = if cargo_root.is_absolute() {
             cargo_root
         } else {
@@ -828,6 +860,7 @@ fn resolve_standard_path_aliases(profile: &mut SandboxProfile, project_dir: &Pat
         profile.first_user_allow_exec,
         project_dir,
     );
+    let read_aliases = workspace_read_aliases(profile, project_dir);
     for alias in write_aliases {
         if !profile.allow_write.contains(&alias) {
             profile.grant_origins.push(GrantRecord {
@@ -846,6 +879,136 @@ fn resolve_standard_path_aliases(profile: &mut SandboxProfile, project_dir: &Pat
                 origin: GrantOrigin::Runtime,
             });
             profile.allow_exec.push(alias);
+        }
+    }
+    for alias in read_aliases {
+        if !profile.allow_read.contains(&alias) {
+            profile.grant_origins.push(GrantRecord {
+                kind: GrantKind::AllowRead,
+                value: alias.path.to_string_lossy().into_owned(),
+                origin: GrantOrigin::Runtime,
+            });
+            profile.allow_read.push(alias);
+        }
+    }
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "standard mode snapshots source symlink referents before launching untrusted code"
+)]
+fn workspace_read_aliases(profile: &SandboxProfile, project_dir: &Path) -> Vec<SandboxPath> {
+    const DERIVED_DIRECTORIES: &[&str] = &[
+        ".git",
+        ".gradle",
+        ".venv",
+        ".yarn",
+        "_build",
+        "build",
+        "deps",
+        "dist",
+        "node_modules",
+        "target",
+        "venv",
+    ];
+    const MAGIC_ROOTS: &[&str] = &["/dev", "/proc", "/sys"];
+
+    let project_referent =
+        std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
+    let mut pending = vec![project_dir.to_path_buf()];
+    let mut resolved_paths = BTreeSet::new();
+    while let Some(directory) = pending.pop() {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) => {
+                warn!(path = %directory.display(), %error, "could not inspect workspace symlinks");
+                continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    warn!(path = %directory.display(), %error, "could not inspect workspace entry");
+                    continue;
+                }
+            };
+            let path = entry.path();
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| DERIVED_DIRECTORIES.contains(&name))
+            {
+                continue;
+            }
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) => {
+                    warn!(path = %path.display(), %error, "could not inspect workspace entry type");
+                    continue;
+                }
+            };
+            if file_type.is_symlink() {
+                let Ok(resolved) = std::fs::canonicalize(&path) else {
+                    continue;
+                };
+                if resolved.starts_with(&project_referent)
+                    || MAGIC_ROOTS.iter().any(|root| resolved.starts_with(root))
+                    || overlaps_denied_read(profile, &resolved)
+                {
+                    continue;
+                }
+                resolved_paths.insert(resolved);
+            } else if file_type.is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+
+    resolved_paths
+        .into_iter()
+        .filter_map(|path| {
+            let metadata = std::fs::metadata(&path).ok()?;
+            Some(if metadata.is_dir() {
+                SandboxPath::dir(path)
+            } else {
+                SandboxPath::file(path)
+            })
+        })
+        .collect()
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "standard mode compares source symlink referents with protected paths before launch"
+)]
+fn overlaps_denied_read(profile: &SandboxProfile, candidate: &Path) -> bool {
+    profile.deny_read.iter().any(|denied| {
+        let denied = resolve_existing_ancestor(&denied.path).unwrap_or_else(|| denied.path.clone());
+        candidate.starts_with(&denied) || denied.starts_with(candidate)
+    })
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "standard mode resolves a protected path's existing ancestor before comparison"
+)]
+fn resolve_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut existing = path;
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::canonicalize(existing) {
+            Ok(mut resolved) => {
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Some(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(existing.file_name()?.to_os_string());
+                existing = existing.parent()?;
+            }
+            Err(_) => return None,
         }
     }
 }
@@ -930,6 +1093,25 @@ fn command_has_flag(command: &[String], flags: &[&str]) -> bool {
         .skip(1)
         .take_while(|argument| argument.as_str() != "--")
         .any(|argument| flags.contains(&argument.as_str()))
+}
+
+fn command_option_value<'a>(command: &'a [String], option: &str) -> Option<&'a str> {
+    let mut arguments = command
+        .iter()
+        .skip(1)
+        .take_while(|argument| argument.as_str() != "--");
+    while let Some(argument) = arguments.next() {
+        if argument == option {
+            return arguments.next().map(String::as_str);
+        }
+        if let Some(value) = argument
+            .strip_prefix(option)
+            .and_then(|suffix| suffix.strip_prefix('='))
+        {
+            return Some(value);
+        }
+    }
+    None
 }
 
 #[cfg(target_os = "linux")]
@@ -2148,6 +2330,14 @@ mod tests {
                 ("SSH_AUTH_SOCK".to_owned(), "/tmp/agent".to_owned()),
                 ("NPM_TOKEN".to_owned(), "sentinel".to_owned()),
                 ("OPENAI_API_KEY".to_owned(), "sentinel".to_owned()),
+                ("TOKEN".to_owned(), "sentinel".to_owned()),
+                ("API_KEY".to_owned(), "sentinel".to_owned()),
+                ("SECRET".to_owned(), "sentinel".to_owned()),
+                ("PASSWORD".to_owned(), "sentinel".to_owned()),
+                ("PASSWD".to_owned(), "sentinel".to_owned()),
+                ("PRIVATE_KEY".to_owned(), "sentinel".to_owned()),
+                ("CREDENTIAL".to_owned(), "sentinel".to_owned()),
+                ("CREDENTIALS".to_owned(), "sentinel".to_owned()),
                 (
                     "GOOGLE_APPLICATION_CREDENTIALS".to_owned(),
                     "/tmp/google-credentials.json".to_owned(),
@@ -2185,6 +2375,7 @@ mod tests {
             &mut profile,
             None,
             runtime.path(),
+            Path::new("/home/test"),
             project.path(),
             &[],
             true,
@@ -2208,6 +2399,7 @@ mod tests {
             &mut profile,
             None,
             runtime.path(),
+            Path::new("/home/test"),
             project.path(),
             &["cargo".to_owned(), "test".to_owned()],
             true,
@@ -2228,6 +2420,7 @@ mod tests {
             &mut profile,
             None,
             runtime.path(),
+            Path::new("/home/test"),
             project.path(),
             &["cargo".to_owned(), "build".to_owned()],
             true,
@@ -2253,6 +2446,7 @@ mod tests {
             &mut profile,
             None,
             runtime.path(),
+            Path::new("/home/test"),
             project.path(),
             &["cargo".to_owned(), "nextest".to_owned(), "run".to_owned()],
             true,
@@ -2316,6 +2510,7 @@ mod tests {
             &mut profile,
             None,
             runtime.path(),
+            Path::new("/Users/test"),
             project.path(),
             &["cargo".to_owned(), "test".to_owned()],
             false,
@@ -2360,6 +2555,53 @@ mod tests {
         assert!(!profile.allow_exec.iter().any(|grant| {
             grant.path == project.path().join("target") || grant.path == external.path()
         }));
+        assert!(
+            !profile
+                .allow_read
+                .iter()
+                .any(|grant| grant.path == external.path()),
+            "generated output symlinks are not inferred as source read grants"
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the unit test builds and resolves an isolated temporary symlink fixture"
+    )]
+    fn standard_profile_reads_source_symlink_referents_outside_project() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let source = project.join("src");
+        let shared = root.path().join("shared");
+        let protected = root.path().join(".aws");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::create_dir_all(&protected).unwrap();
+        std::os::unix::fs::symlink("../../shared", source.join("shared")).unwrap();
+        std::os::unix::fs::symlink("../../.aws", source.join("credentials")).unwrap();
+        let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, root.path(), &project);
+
+        apply_standard_profile(
+            &mut profile,
+            &["cargo".to_owned(), "build".to_owned()],
+            root.path(),
+            &project,
+        );
+        resolve_standard_path_aliases(&mut profile, &project);
+
+        assert!(
+            profile
+                .allow_read
+                .contains(&SandboxPath::dir(std::fs::canonicalize(shared).unwrap()))
+        );
+        assert!(
+            !profile
+                .allow_read
+                .iter()
+                .any(|grant| { grant.path == std::fs::canonicalize(&protected).unwrap() }),
+            "protected referents must not receive an inferred read grant"
+        );
     }
 
     #[test]
@@ -2387,10 +2629,11 @@ mod tests {
         assert!(profile.deny_read.contains(&SandboxPath::file(denied)));
     }
 
-    #[test]
-    fn standard_java_profile_uses_normal_persistent_caches() {
+    #[tokio::test]
+    async fn standard_java_profile_uses_normal_persistent_caches() {
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
         let mut profile =
             SandboxProfile::for_ecosystem(Ecosystem::Java, home.path(), project.path());
 
@@ -2401,7 +2644,7 @@ mod tests {
             project.path(),
         );
 
-        for cache in [".sbt", ".ivy2/cache", ".cache/coursier"] {
+        for cache in [".sbt/boot", ".ivy2/cache", ".cache/coursier"] {
             assert!(
                 profile
                     .allow_write
@@ -2409,6 +2652,33 @@ mod tests {
                 "missing standard cache grant for {cache}"
             );
         }
+        assert!(
+            !profile
+                .allow_write
+                .contains(&SandboxPath::dir(home.path().join(".sbt"))),
+            "the sbt global plugin/settings root must remain non-writable"
+        );
+
+        let environment = build_extra_env(
+            &mut profile,
+            None,
+            runtime.path(),
+            home.path(),
+            project.path(),
+            &["sbt".to_owned(), "compile".to_owned()],
+            false,
+        )
+        .await
+        .unwrap();
+        let sbt_options = environment.get("SBT_OPTS").unwrap();
+        assert!(sbt_options.contains(&format!(
+            "-Dsbt.global.base={}",
+            runtime.path().join("sbt-global").display()
+        )));
+        assert!(sbt_options.contains(&format!(
+            "-Dsbt.boot.directory={}",
+            home.path().join(".sbt/boot").display()
+        )));
     }
 
     #[test]
@@ -2446,6 +2716,48 @@ mod tests {
                 .contains(&SandboxPath::dir(cargo_root.join("bin")))
         );
         assert!(!profile.allow_exec.contains(&SandboxPath::dir(cargo_root)));
+    }
+
+    #[test]
+    fn standard_cargo_install_honors_explicit_root() {
+        let project = tempfile::tempdir().unwrap();
+        let install_root = tempfile::tempdir().unwrap();
+        let home = Path::new("/Users/test");
+        let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, home, project.path());
+        apply_standard_profile(
+            &mut profile,
+            &[
+                "cargo".to_owned(),
+                "install".to_owned(),
+                "--root".to_owned(),
+                install_root.path().to_string_lossy().into_owned(),
+                "ripgrep".to_owned(),
+            ],
+            home,
+            project.path(),
+        );
+
+        assert!(
+            profile
+                .allow_write
+                .contains(&SandboxPath::dir(install_root.path().to_path_buf()))
+        );
+        assert!(
+            profile
+                .allow_exec
+                .contains(&SandboxPath::dir(install_root.path().join("bin")))
+        );
+        assert_eq!(
+            command_option_value(
+                &[
+                    "cargo".to_owned(),
+                    "install".to_owned(),
+                    "--root=relative".to_owned()
+                ],
+                "--root"
+            ),
+            Some("relative")
+        );
     }
 
     #[test]

@@ -166,9 +166,10 @@ A dedicated status descriptor distinguishes setup failure from a target that
 itself exits 126.
 
 Linux paths use descriptor-backed resolution and always reject magic links.
-Standard mode follows an existing ordinary symlink to its opened referent;
-strict mode uses `RESOLVE_NO_SYMLINKS`, with root-owned immutable distribution
-aliases as the exception. Landlock
+Standard mode follows an existing ordinary symlink to its opened referent and
+snapshots source-tree symlink targets outside generated dependency/output
+directories; strict mode uses `RESOLVE_NO_SYMLINKS`, with root-owned immutable
+distribution aliases as the exception. Landlock
 read grants exclude `Execute`; write grants add only data-read rights, while
 execute grants are separate. Parent read trees are carved into safe inode
 rules when they contain a protected descendant such as `$PWD/.env`.

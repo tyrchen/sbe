@@ -280,11 +280,18 @@ result tainted. Strict mode keeps the 0.4 W^X and hard-link checks. Toolchains
 such as `~/.rustup` remain non-writable during ordinary builds in both modes.
 
 On Linux, standard grants follow an existing ordinary symlink to its opened
-referent and install the Landlock rule from that descriptor; magic links remain
-rejected. Strict mode retains no-follow resolution except for immutable system
-aliases. Denied paths include their current canonical target. Strict mode also
-retains hard-link alias rejection; standard mode does not recursively scan
-historical caches before every launch.
+referent and install the Landlock rule from that descriptor. Before launch it
+discovers source-tree symlinks outside generated dependency/output directories,
+so a link into an ordinary sibling checkout is readable without granting the
+sibling's parent. Magic links and protected referents remain rejected. Strict
+mode retains no-follow resolution except for immutable system aliases. Denied
+paths include their current canonical target. Strict mode also retains
+hard-link alias rejection; standard mode does not recursively scan historical
+caches before every launch.
+
+For sbt, standard keeps boot, Ivy, and Coursier dependency caches persistent,
+but places the mutable global base in the private per-run directory. This keeps
+`~/.sbt` settings and global-plugin locations from becoming a persistence path.
 
 On macOS, secret read denials include both the configured pathname and its
 canonical target. A symlinked `~/.ssh`, `.aws`, or similar protected directory

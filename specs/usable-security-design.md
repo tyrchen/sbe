@@ -250,8 +250,10 @@ dependencies belong outside an untrusted workspace or require strict mode.
 Recognizing `cargo install` as install intent is acceptable; parsing Cargo
 metadata and recreating Cargo's installation transaction is not. The package
 manager owns its destination format, locking, overwrite behavior, and rollback.
-Inspection must say that the selected install root is writable and that the
-installed result is untrusted.
+An explicit `--root` is the selected install root and takes precedence over
+`CARGO_INSTALL_ROOT`, `CARGO_HOME`, and the default. Inspection must say that
+the selected install root is writable and that the installed result is
+untrusted.
 
 Built-in profiles should remain small declarations of roots, domains, reserved
 environment names, and optional local IPC needs. They must not contain a second
@@ -320,6 +322,10 @@ records both lexical and resolved paths. On Linux it opens the final object with
 descriptor-relative kernel resolution, rejects magic links, validates the
 opened object's type and boundary, and installs the Landlock rule from that
 file descriptor. It does not require `RESOLVE_NO_SYMLINKS` for ordinary grants.
+For the built-in workspace read grant, standard mode discovers symlinks in the
+source tree without descending into conventional generated dependency and
+output directories, then installs separate read rules for safe external
+referents. Referents overlapping protected read denials are omitted.
 
 On macOS it resolves and validates the target before rendering both necessary
 SBPL spellings. Because the untrusted child has not started and cannot write
@@ -542,9 +548,9 @@ sbe run -- uv run pytest
 sbe run -- ./gradlew build
 ```
 
-The matrix includes Homebrew, rustup, mise/asdf-style symlinks, a globally
-configured sccache, concurrent builds, an approved external target-directory
-symlink, and warm package caches.
+The matrix includes Homebrew, rustup, mise/asdf-style symlinks, a source link
+into a sibling checkout, a globally configured sccache, concurrent builds, an
+approved external target-directory symlink, and warm package caches.
 
 Standard policy compilation never recursively scans unrelated caches or the
 workspace for hard links. Read-denial carving may inspect siblings along the

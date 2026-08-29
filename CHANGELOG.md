@@ -16,12 +16,13 @@ All notable changes to this project will be documented in this file. See [conven
 - Treat the selected workspace as readable input in standard mode, including
   `.env*`, so Linux can support general file creation without reimplementing
   each package manager; strict mode retains project secret-file denials.
-- Keep executable output roots installable before Linux Landlock enforcement
-  and let standard sbt builds use their ordinary persistent package caches.
+- Keep executable output roots installable before Linux Landlock enforcement.
+- Let standard sbt builds use persistent boot/dependency caches while keeping
+  the global settings/plugin base private and non-persistent.
 - Support globally configured sccache through ordinary executable/cache grants
   and local IPC; no sccache source or managed adapter is shipped by SBE.
-- Follow pre-existing tool and cache symlinks in standard mode while retaining
-  strict no-follow behavior and protected-path denials.
+- Follow pre-existing tool, cache, and source-tree symlinks in standard mode
+  while retaining strict no-follow behavior and protected-path denials.
 - Allow explicit top-level `cargo install` commands to manage their selected
   install root instead of reimplementing Cargo's transaction format.
 - Stop requiring `--allow-insecure-linux-network` for standard Linux builds;
@@ -34,7 +35,8 @@ All notable changes to this project will be documented in this file. See [conven
   W^X, hard-link validation, exact workspace outputs, ambient local-service
   denial, and fail-closed Linux network capability checks.
 - Keep standard-mode symlink referents subject to protected-path denials and
-  filter high-confidence API-key and cloud-credential environment variables.
+  filter high-confidence API-key and cloud-credential environment variables,
+  including bare names such as `TOKEN`, `API_KEY`, and `PASSWORD`.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23

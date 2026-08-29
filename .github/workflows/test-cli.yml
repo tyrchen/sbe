@@ -8,9 +8,10 @@ name: test-cli
 #  2. ecosystem (Linux): for each language ecosystem, run a representative
 #     real-world build under the default standard mode against (a) a fresh "happy path"
 #     project that depends on a real upstream package, and (b) the hostile
-#     fixture in /fixtures/<eco>/ that exercises every attack in
-#     fixtures/ATTACKS.md. The fixture output must contain zero `PWNED:`
-#     lines and at least one `SAFE:` line for every attack ID.
+#     fixture in /fixtures/<eco>/ that exercises host credential, persistence,
+#     privilege, and egress attacks. Workspace `.env` confidentiality is
+#     verified separately under strict mode because standard deliberately
+#     treats workspace files as readable input.
 #
 #  3. network-filter (Linux best-effort mode): explicit proxy-allowlist tests — `curl` to
 #     an allowed domain (registry) succeeds; `curl` to an evil domain
@@ -34,7 +35,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: never
   # Used by every "verify-fixture-output" step.
-  ATTACK_IDS: "ssh-read aws-read gcloud-read gh-token-read env-read bashrc-write authorized-keys-write sudo-exec pkexec-exec curl-evil"
+  ATTACK_IDS: "ssh-read aws-read gcloud-read gh-token-read bashrc-write authorized-keys-write sudo-exec pkexec-exec curl-evil"
 
 jobs:
   install:
@@ -119,6 +120,18 @@ jobs:
           out=$(sbe run --profile rust -- /bin/echo "hello from sbe")
           echo "got: $out"
           test "$out" = "hello from sbe"
+
+      - name: standard reads source symlinks into sibling workspaces
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/sbe-source-symlink"
+          rm -rf "$root"
+          mkdir -p "$root/project/src" "$root/shared"
+          printf 'shared-source\n' >"$root/shared/value.txt"
+          ln -s ../../shared "$root/project/src/shared"
+          cd "$root/project"
+          out=$(sbe run --profile rust -- /bin/cat src/shared/value.txt)
+          test "$out" = shared-source
 
       - name: explicit allow-all-network permits real sockets
         run: |
@@ -416,14 +429,25 @@ jobs:
           sbe run -- cargo build --release 2>&1 | tee out.log
           grep -q "Compiling serde" out.log
           ./target/release/real | grep -q '"name":"sbe"'
+          install_root="$RUNNER_TEMP/sbe-explicit-cargo-root"
+          rm -rf "$install_root"
+          sbe run -- cargo install --offline --path . --root "$install_root"
+          "$install_root/bin/real" | grep -q '"name":"sbe"'
 
-      - name: hostile fixture — every attack must be SAFE (10/10)
+      - name: hostile fixture — standard host controls and strict workspace secret
         run: |
           set -euo pipefail
           cd fixtures/rust
           rm -rf target
           sbe run -- cargo build 2>&1 | tee out.log
           ${GITHUB_WORKSPACE}/.github/workflows/verify-attacks.sh out.log
+          printf 'strict-workspace-secret\n' >.env
+          rm -rf target
+          sbe run --strict --allow-all-network --env RUSTC_WRAPPER= -- \
+            cargo build --offline 2>&1 | tee strict.out.log
+          ATTACK_IDS=env-read \
+            ${GITHUB_WORKSPACE}/.github/workflows/verify-attacks.sh strict.out.log
+          rm .env
 
   ecosystem-node:
     name: ecosystem / npm
@@ -488,7 +512,7 @@ jobs:
           test -d node_modules/chalk
           sbe run -- npm exec --offline -- local-sbe-tool | grep -Fx sbe-local-tool-ok
 
-      - name: hostile fixture — every attack must be SAFE (10/10)
+      - name: hostile fixture — standard host controls SAFE (9/9)
         run: |
           set -euo pipefail
           cd fixtures/node
@@ -540,7 +564,7 @@ jobs:
           test -d .venv/lib
           sbe run -- .venv/bin/python -c 'import requests; print(requests.__name__)' | grep -Fx requests
 
-      - name: hostile fixture — every attack must be SAFE (10/10)
+      - name: hostile fixture — standard host controls SAFE (9/9)
         run: |
           set -euo pipefail
           export UV_CACHE_DIR="$HOME/.cache/uv"
@@ -617,7 +641,7 @@ jobs:
           sbe run -- mix compile 2>&1 | tee compile.log
           grep -qE "(Compiled|Generated real)" compile.log
 
-      - name: hostile fixture — every attack must be SAFE (10/10)
+      - name: hostile fixture — standard host controls SAFE (9/9)
         run: |
           set -euo pipefail
           cd fixtures/elixir
@@ -740,7 +764,7 @@ jobs:
           cd fixtures/scala
           rm -rf target project/target project/project
           # The build.sbt evaluates on every sbt task and runs the attack
-          # matrix (10 probes, each subprocess capped at 5s via
+          # host-control matrix (9 asserted probes, each subprocess capped at 5s via
           # ProcessBuilder.waitFor). `sbt test` exercises a full compile +
           # MUnit test run for the cats-effect Greeter, so the sandbox
           # actually has work to mediate (dep resolution → ivy2, scalac,
