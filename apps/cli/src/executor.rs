@@ -807,11 +807,13 @@ fn apply_standard_profile(
                 .unwrap_or_else(|| cache.selected.clone());
             return Err(external_write_approval_error(&cache.selected, &resolved));
         }
-        replace_builtin_write_path(
-            profile,
-            &cache.conventional,
-            SandboxPath::dir(cache.selected),
-        );
+        for conventional in &cache.conventional {
+            replace_builtin_write_path(
+                profile,
+                conventional,
+                SandboxPath::dir(cache.selected.clone()),
+            );
+        }
     }
     if profile.name == "python" && command_uses_pip(command) {
         for config in effective_pip_config_read_paths(profile, home, project_dir)? {
@@ -1276,7 +1278,7 @@ fn effective_pnpm_store(
 }
 
 struct CacheReplacement {
-    conventional: PathBuf,
+    conventional: Vec<PathBuf>,
     selected: PathBuf,
     project_controlled: bool,
 }
@@ -1295,6 +1297,8 @@ fn effective_python_cache(
             ("UV_CACHE_DIR", "uv")
         } else if command_uses_pip(command) {
             ("PIP_CACHE_DIR", "pip")
+        } else if command_is(command, "poetry") {
+            ("POETRY_CACHE_DIR", "pypoetry")
         } else {
             return Ok(None);
         };
@@ -1320,7 +1324,7 @@ fn effective_python_cache(
         None
     };
     let project_controlled = project_cache.is_some();
-    let conventional = home.join(".cache").join(default_name);
+    let conventional = conventional_python_caches(home, default_name);
     let default_cache = effective_environment_path(profile, "XDG_CACHE_HOME")
         .map(|directory| directory.join(default_name))
         .unwrap_or_else(|| platform_python_cache(home, default_name));
@@ -1341,6 +1345,15 @@ fn effective_python_cache(
         },
         project_controlled,
     }))
+}
+
+fn conventional_python_caches(home: &Path, name: &str) -> Vec<PathBuf> {
+    let xdg = home.join(".cache").join(name);
+    #[cfg(target_os = "macos")]
+    if name == "pypoetry" {
+        return vec![xdg, home.join("Library/Caches/pypoetry")];
+    }
+    vec![xdg]
 }
 
 fn effective_project_uv_cache(project_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
@@ -5041,6 +5054,76 @@ mod tests {
             default_pip
                 .allow_write
                 .contains(&SandboxPath::dir(platform_python_cache(&home, "pip")))
+        );
+
+        let mut default_poetry = SandboxProfile::for_ecosystem(Ecosystem::Python, &home, &project);
+        apply_standard_profile(
+            &mut default_poetry,
+            &["poetry".to_owned(), "install".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap();
+        assert!(
+            default_poetry
+                .allow_write
+                .contains(&SandboxPath::dir(platform_python_cache(&home, "pypoetry")))
+        );
+
+        let poetry_environment_cache = root.path().join("poetry-environment-cache");
+        let ignored_xdg_cache = root.path().join("ignored-xdg-cache");
+        let mut poetry_environment =
+            SandboxProfile::for_ecosystem(Ecosystem::Python, &home, &project);
+        poetry_environment.env.insert(
+            "POETRY_CACHE_DIR".to_owned(),
+            poetry_environment_cache.to_string_lossy().into_owned(),
+        );
+        poetry_environment.env.insert(
+            "XDG_CACHE_HOME".to_owned(),
+            ignored_xdg_cache.to_string_lossy().into_owned(),
+        );
+        apply_standard_profile(
+            &mut poetry_environment,
+            &["poetry".to_owned(), "install".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap();
+        assert!(
+            poetry_environment
+                .allow_write
+                .contains(&SandboxPath::dir(poetry_environment_cache))
+        );
+        assert!(
+            !poetry_environment
+                .allow_write
+                .contains(&SandboxPath::dir(ignored_xdg_cache.join("pypoetry")))
+        );
+        for conventional in conventional_python_caches(&home, "pypoetry") {
+            assert!(
+                !poetry_environment
+                    .allow_write
+                    .contains(&SandboxPath::dir(conventional))
+            );
+        }
+
+        let poetry_xdg_home = root.path().join("poetry-xdg-cache");
+        let mut poetry_xdg = SandboxProfile::for_ecosystem(Ecosystem::Python, &home, &project);
+        poetry_xdg.env.insert(
+            "XDG_CACHE_HOME".to_owned(),
+            poetry_xdg_home.to_string_lossy().into_owned(),
+        );
+        apply_standard_profile(
+            &mut poetry_xdg,
+            &["poetry".to_owned(), "install".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap();
+        assert!(
+            poetry_xdg
+                .allow_write
+                .contains(&SandboxPath::dir(poetry_xdg_home.join("pypoetry")))
         );
 
         let uv_environment_cache = root.path().join("uv-environment-cache");

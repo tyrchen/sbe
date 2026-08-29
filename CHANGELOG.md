@@ -142,6 +142,8 @@ All notable changes to this project will be documented in this file. See [conven
   directories behind the external-write gate.
 - Grant exact read access to effective npm and pip user configuration files so
   the sandboxed tools consume the same settings used during policy preparation.
+- Follow Poetry's command, `POETRY_CACHE_DIR`, and XDG cache selection while
+  removing stale conventional Poetry cache grants.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23

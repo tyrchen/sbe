@@ -230,6 +230,9 @@ receives an exact read grant. The XDG or conventional platform cache is the
 final fallback, and the effective cache replaces only that tool's default
 writable grant. Without overrides, macOS uses `~/Library/Caches/{pip,uv}` and
 Linux uses the XDG cache home.
+Poetry similarly follows command `--cache-dir`, `POETRY_CACHE_DIR`, then
+`XDG_CACHE_HOME`; the selected `pypoetry` cache replaces both conventional
+macOS-compatible cache grants.
 An external Cargo target can be selected with an inherited `CARGO_TARGET_DIR`
 or a direct `--config build.target-dir='path'` override, or granted explicitly
 with matching `--allow-write` and `--allow-exec` paths. Cargo `--config` file

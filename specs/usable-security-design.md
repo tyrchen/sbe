@@ -260,6 +260,9 @@ conventional cache are the final fallback. The selected cache replaces only
 that tool's default grant; a repository-selected uv cache outside the workspace
 requires `--allow-write`. Conventional macOS caches live beneath
 `~/Library/Caches`; Linux follows XDG conventions.
+Poetry follows command `--cache-dir`, `POETRY_CACHE_DIR`, then
+`XDG_CACHE_HOME`; its selected `pypoetry` cache replaces the conventional
+writable grants, including both historical macOS-compatible locations.
 
 For Gradle commands, the conventional cache grant follows Gradle's effective
 user home: `--gradle-user-home`, every accepted `-g` form including `-g/path`,
