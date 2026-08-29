@@ -244,12 +244,15 @@ to the command's project. Only runtime subdirectories such as `.tmp`, caches,
 wrapper distributions, daemons, and toolchains are writable; the user-home root
 and `init.d` remain immutable.
 
-For Maven commands, `-D`/`--define maven.repo.local=path` selects the writable
-local repository, followed in precedence by `MAVEN_OPTS`, project
-`.mvn/jvm.config`, and the default `~/.m2/repository`. Within JVM option sources
-the last property wins, matching Java. Relative selections are anchored to the
-command project; quoted, expanded, or otherwise ambiguous option values fail
-with guidance to use a direct unambiguous command property.
+For Maven commands, `-D`/`--define maven.repo.local=path` on the actual command
+selects the writable local repository, followed in precedence by `MAVEN_ARGS`,
+project `.mvn/maven.config`, `MAVEN_OPTS`, project `.mvn/jvm.config`, and the
+default `~/.m2/repository`. Within each source the last property wins. This
+matches Maven's CLI merge, where environment arguments precede actual CLI
+arguments and CLI user properties override project configuration and JVM system
+properties. Relative selections are anchored to the command project; quoted,
+expanded, or otherwise ambiguous option values fail with guidance to use a
+direct unambiguous command property.
 
 It denies writes everywhere else. In particular, home-directory persistence,
 credentials, shell startup, SSH authorization, user service configuration, and
@@ -415,8 +418,9 @@ feature switches, terminal settings, and tool paths. It removes:
   prefix-encoded forms such as Terraform's `TF_TOKEN_<host>` and concatenated
   platform names such as Azure Pipelines' `SYSTEM_ACCESSTOKEN`, plus OIDC bearer
   paths such as `AWS_WEB_IDENTITY_TOKEN_FILE` and custom credential stores such
-  as `AWS_SHARED_CREDENTIALS_FILE`, `CLOUDSDK_CONFIG`, `AZURE_CONFIG_DIR`, and
-  Docker client TLS key directories selected by `DOCKER_CERT_PATH`;
+  as `AWS_SHARED_CREDENTIALS_FILE`, `CLOUDSDK_CONFIG`, `AZURE_CONFIG_DIR`, Azure
+  client certificates selected by `AZURE_CLIENT_CERTIFICATE_PATH`, and Docker
+  client TLS key directories selected by `DOCKER_CERT_PATH`;
 - agent and credential socket variables;
 - dynamic-loader injection variables; and
 - SBE-reserved proxy, runtime, and policy variables.

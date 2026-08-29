@@ -625,6 +625,7 @@ fn is_sensitive_environment_name(name: &str) -> bool {
         "AWS_SHARED_CREDENTIALS_FILE",
         "AWS_SESSION_TOKEN",
         "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AZURE_CLIENT_CERTIFICATE_PATH",
         "AZURE_CLIENT_SECRET",
         "AZURE_CONFIG_DIR",
         "CLOUDSDK_CONFIG",
@@ -912,7 +913,44 @@ fn effective_maven_local_repository(
         return Ok(None);
     }
     let command_value = command_maven_property(command, "maven.repo.local").map(PathBuf::from);
-    let maven_opts_value = if command_value.is_none() {
+    let maven_args_value = if command_value.is_none() {
+        let arguments = profile
+            .env
+            .get("MAVEN_ARGS")
+            .cloned()
+            .or_else(|| std::env::var("MAVEN_ARGS").ok());
+        arguments
+            .as_deref()
+            .map(|arguments| maven_args_local_repository(arguments, "MAVEN_ARGS"))
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    let maven_config_value = if command_value.is_none() && maven_args_value.is_none() {
+        let path = project_dir.join(".mvn/maven.config");
+        read_bounded_project_file(&path)?
+            .map(|contents| {
+                let contents = std::str::from_utf8(&contents).with_context(|| {
+                    format!("Maven argument config is not UTF-8: {}", path.display())
+                })?;
+                let mut arguments = vec!["mvn".to_owned()];
+                arguments.extend(
+                    contents
+                        .lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                        .map(str::to_owned),
+                );
+                maven_argument_list_local_repository(&arguments, ".mvn/maven.config", true)
+            })
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    let argument_value = command_value.or(maven_args_value).or(maven_config_value);
+    let maven_opts_value = if argument_value.is_none() {
         let options = profile
             .env
             .get("MAVEN_OPTS")
@@ -926,7 +964,7 @@ fn effective_maven_local_repository(
     } else {
         None
     };
-    let project_value = if command_value.is_none() && maven_opts_value.is_none() {
+    let project_jvm_value = if argument_value.is_none() && maven_opts_value.is_none() {
         let path = project_dir.join(".mvn/jvm.config");
         read_bounded_project_file(&path)?
             .map(|contents| {
@@ -940,7 +978,7 @@ fn effective_maven_local_repository(
     } else {
         None
     };
-    let Some(path) = command_value.or(maven_opts_value).or(project_value) else {
+    let Some(path) = argument_value.or(maven_opts_value).or(project_jvm_value) else {
         return Ok(None);
     };
     if path.as_os_str().is_empty() {
@@ -955,6 +993,45 @@ fn effective_maven_local_repository(
         return Ok(None);
     }
     Ok(Some(path))
+}
+
+fn maven_args_local_repository(arguments: &str, source: &str) -> anyhow::Result<Option<PathBuf>> {
+    let mut command = vec!["mvn".to_owned()];
+    command.extend(arguments.split_whitespace().map(str::to_owned));
+    maven_argument_list_local_repository(&command, source, true)
+}
+
+fn maven_argument_list_local_repository(
+    arguments: &[String],
+    source: &str,
+    reject_shell_syntax: bool,
+) -> anyhow::Result<Option<PathBuf>> {
+    let selected = command_maven_property(arguments, "maven.repo.local");
+    if let Some(value) = selected {
+        if value.is_empty()
+            || value.chars().any(char::is_control)
+            || (reject_shell_syntax
+                && value.chars().any(|character| {
+                    matches!(character, '$' | '`' | '\\' | '\'' | '"' | '*' | '?' | '[')
+                }))
+        {
+            anyhow::bail!(
+                "{source} selects maven.repo.local in a form that sbe cannot resolve safely; use \
+                 -Dmaven.repo.local=/unambiguous/path"
+            );
+        }
+        return Ok(Some(PathBuf::from(value)));
+    }
+    if arguments
+        .iter()
+        .any(|argument| argument.contains("maven.repo.local"))
+    {
+        anyhow::bail!(
+            "{source} selects maven.repo.local in an unsupported form; use \
+             -Dmaven.repo.local=/unambiguous/path"
+        );
+    }
+    Ok(None)
 }
 
 fn maven_options_local_repository(options: &str, source: &str) -> anyhow::Result<Option<PathBuf>> {
@@ -3116,6 +3193,10 @@ mod tests {
                     "/tmp/azure-config".to_owned(),
                 ),
                 (
+                    "AZURE_CLIENT_CERTIFICATE_PATH".to_owned(),
+                    "/tmp/azure-client.pem".to_owned(),
+                ),
+                (
                     "CLOUDSDK_CONFIG".to_owned(),
                     "/tmp/gcloud-config".to_owned(),
                 ),
@@ -4154,6 +4235,79 @@ mod tests {
                 .contains(&SandboxPath::dir(jvm_repository.path().to_path_buf())),
             "MAVEN_OPTS is appended after .mvn/jvm.config and its last property wins"
         );
+
+        let config_repository = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join(".mvn/maven.config"),
+            format!(
+                "-Dmaven.repo.local={}\n",
+                config_repository.path().display()
+            ),
+        )
+        .unwrap();
+        let mut maven_config =
+            SandboxProfile::for_ecosystem(Ecosystem::Java, home.path(), project.path());
+        maven_config
+            .env
+            .insert("MAVEN_ARGS".to_owned(), "-B".to_owned());
+        maven_config.env.insert(
+            "MAVEN_OPTS".to_owned(),
+            format!("-Dmaven.repo.local={}", opts_repository.path().display()),
+        );
+        apply_standard_profile(
+            &mut maven_config,
+            &["mvn".to_owned(), "validate".to_owned()],
+            home.path(),
+            project.path(),
+        )
+        .unwrap();
+        assert!(
+            maven_config
+                .allow_write
+                .contains(&SandboxPath::dir(config_repository.path().to_path_buf())),
+            "project Maven arguments override JVM system-property sources"
+        );
+
+        let args_repository = tempfile::tempdir().unwrap();
+        let mut maven_args =
+            SandboxProfile::for_ecosystem(Ecosystem::Java, home.path(), project.path());
+        maven_args.env.insert(
+            "MAVEN_ARGS".to_owned(),
+            format!("-Dmaven.repo.local={}", args_repository.path().display()),
+        );
+        apply_standard_profile(
+            &mut maven_args,
+            &["mvn".to_owned(), "validate".to_owned()],
+            home.path(),
+            project.path(),
+        )
+        .unwrap();
+        assert!(
+            maven_args
+                .allow_write
+                .contains(&SandboxPath::dir(args_repository.path().to_path_buf()))
+        );
+        assert!(
+            !maven_args
+                .allow_write
+                .contains(&SandboxPath::dir(config_repository.path().to_path_buf())),
+            "MAVEN_ARGS is passed as CLI input and overrides project Maven arguments"
+        );
+
+        let mut ambiguous_args =
+            SandboxProfile::for_ecosystem(Ecosystem::Java, home.path(), project.path());
+        ambiguous_args.env.insert(
+            "MAVEN_ARGS".to_owned(),
+            "-Dmaven.repo.local='$HOME/maven repository'".to_owned(),
+        );
+        let error = apply_standard_profile(
+            &mut ambiguous_args,
+            &["mvn".to_owned(), "validate".to_owned()],
+            home.path(),
+            project.path(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unambiguous"));
     }
 
     #[test]
