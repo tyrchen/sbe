@@ -606,6 +606,8 @@ fn is_sensitive_environment_name(name: &str) -> bool {
     const EXACT: &[&str] = &[
         "API_KEY",
         "AWS_ACCESS_KEY_ID",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
         "AWS_SECRET_ACCESS_KEY",
         "AWS_SHARED_CREDENTIALS_FILE",
         "AWS_SESSION_TOKEN",
@@ -742,7 +744,8 @@ fn apply_standard_profile(
             SandboxPath::dir(home.join("Library/Caches/Coursier")),
         );
 
-        if let Some(gradle_home) = effective_gradle_user_home(profile, command, home, project_dir) {
+        if let Some(gradle_home) = effective_gradle_user_home(profile, command, home, project_dir)?
+        {
             // Keep init.d and root-level initialization scripts immutable.
             // Standard mode accepts cache poisoning, but should not provide a
             // direct unsandboxed-startup persistence mechanism.
@@ -758,27 +761,9 @@ fn apply_standard_profile(
         }
     }
 
-    let cargo_cli_target = command_is(command, "cargo")
-        .then(|| command_option_value(command, "--target-dir"))
-        .flatten()
-        .map(PathBuf::from);
-    if let Some(path) = cargo_cli_target {
-        let path = if path.is_absolute() {
-            path
-        } else {
-            project_dir.join(path)
-        };
-        insert_builtin_path_grant(
-            profile,
-            GrantKind::AllowWrite,
-            SandboxPath::dir(path.clone()),
-        );
-        insert_builtin_path_grant(profile, GrantKind::AllowExec, SandboxPath::dir(path));
-    } else {
-        for name in ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"] {
-            let Some(path) = effective_environment_path(profile, name) else {
-                continue;
-            };
+    if command_is(command, "cargo") {
+        let cargo_cli_target = command_option_value(command, "--target-dir").map(PathBuf::from);
+        if let Some(path) = cargo_cli_target {
             let path = if path.is_absolute() {
                 path
             } else {
@@ -790,6 +775,23 @@ fn apply_standard_profile(
                 SandboxPath::dir(path.clone()),
             );
             insert_builtin_path_grant(profile, GrantKind::AllowExec, SandboxPath::dir(path));
+        } else {
+            for name in ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"] {
+                let Some(path) = effective_environment_path(profile, name) else {
+                    continue;
+                };
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    project_dir.join(path)
+                };
+                insert_builtin_path_grant(
+                    profile,
+                    GrantKind::AllowWrite,
+                    SandboxPath::dir(path.clone()),
+                );
+                insert_builtin_path_grant(profile, GrantKind::AllowExec, SandboxPath::dir(path));
+            }
         }
     }
     if command_is(command, "cargo") && top_level_subcommand(command).is_command(&["install"]) {
@@ -830,22 +832,65 @@ fn effective_gradle_user_home(
     command: &[String],
     home: &Path,
     project_dir: &Path,
-) -> Option<PathBuf> {
+) -> anyhow::Result<Option<PathBuf>> {
     if !command_is(command, "gradle") && !command_is(command, "gradlew") {
-        return None;
+        return Ok(None);
     }
-    let selected = command_option_value(command, "--gradle-user-home")
+    let command_home = command_option_value(command, "--gradle-user-home")
         .or_else(|| command_option_value(command, "-g"))
         .map(PathBuf::from)
-        .or_else(|| command_system_property(command, "gradle.user.home").map(PathBuf::from))
+        .or_else(|| command_system_property(command, "gradle.user.home").map(PathBuf::from));
+    let gradle_opts_home = if command_home.is_none() {
+        gradle_opts_user_home(profile)?
+    } else {
+        None
+    };
+    let selected = command_home
+        .or(gradle_opts_home)
         .or_else(|| effective_environment_path(profile, "GRADLE_USER_HOME"))
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| home.join(".gradle"));
-    Some(if selected.is_absolute() {
+    Ok(Some(if selected.is_absolute() {
         selected
     } else {
         project_dir.join(selected)
-    })
+    }))
+}
+
+fn gradle_opts_user_home(profile: &SandboxProfile) -> anyhow::Result<Option<PathBuf>> {
+    let Some(options) = profile
+        .env
+        .get("GRADLE_OPTS")
+        .cloned()
+        .or_else(|| std::env::var("GRADLE_OPTS").ok())
+    else {
+        return Ok(None);
+    };
+    let mut selected = None;
+    for token in options.split_whitespace() {
+        let Some(value) = token.strip_prefix("-Dgradle.user.home=") else {
+            continue;
+        };
+        if value.is_empty()
+            || value
+                .chars()
+                .any(|character| matches!(character, '$' | '`' | '\\' | '\'' | '"'))
+        {
+            anyhow::bail!(
+                "GRADLE_OPTS selects gradle.user.home with quoting or expansion that sbe cannot \
+                 resolve safely; use --gradle-user-home or GRADLE_USER_HOME"
+            );
+        }
+        // JVM system properties use the last repeated value.
+        selected = Some(PathBuf::from(value));
+    }
+    if selected.is_none() && options.contains("-Dgradle.user.home") {
+        anyhow::bail!(
+            "GRADLE_OPTS selects gradle.user.home in an unsupported form; use --gradle-user-home \
+             or GRADLE_USER_HOME"
+        );
+    }
+    Ok(selected)
 }
 
 #[cfg(target_os = "macos")]
@@ -859,7 +904,7 @@ fn prepare_standard_gradle_directories(
     home: &Path,
     project_dir: &Path,
 ) -> anyhow::Result<()> {
-    let Some(gradle_home) = effective_gradle_user_home(profile, command, home, project_dir) else {
+    let Some(gradle_home) = effective_gradle_user_home(profile, command, home, project_dir)? else {
         return Ok(());
     };
     for name in STANDARD_GRADLE_MUTABLE_SUBDIRECTORIES {
@@ -2727,6 +2772,14 @@ mod tests {
                 ("LANG".to_owned(), "C.UTF-8".to_owned()),
                 ("RUSTFLAGS".to_owned(), "-Cdebuginfo=1".to_owned()),
                 ("GITHUB_TOKEN".to_owned(), "sentinel".to_owned()),
+                (
+                    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI".to_owned(),
+                    "/v2/credentials/task".to_owned(),
+                ),
+                (
+                    "AWS_CONTAINER_CREDENTIALS_FULL_URI".to_owned(),
+                    "http://127.0.0.1/credentials".to_owned(),
+                ),
                 ("AWS_SECRET_ACCESS_KEY".to_owned(), "sentinel".to_owned()),
                 (
                     "AWS_SHARED_CREDENTIALS_FILE".to_owned(),
@@ -3112,6 +3165,58 @@ mod tests {
             );
             assert!(property.allow_exec.contains(&SandboxPath::dir(path)));
         }
+
+        let opts_home = root.path().join("opts-gradle");
+        let mut opts = SandboxProfile::for_ecosystem(Ecosystem::Java, &home, &project);
+        opts.env.insert(
+            "GRADLE_OPTS".to_owned(),
+            format!(
+                "-Xmx1g -Dgradle.user.home={} -Dfile.encoding=UTF-8",
+                opts_home.display()
+            ),
+        );
+        apply_standard_profile(
+            &mut opts,
+            &["gradle".to_owned(), "build".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap();
+        for name in STANDARD_GRADLE_MUTABLE_SUBDIRECTORIES {
+            let path = opts_home.join(name);
+            assert!(opts.allow_write.contains(&SandboxPath::dir(path.clone())));
+            assert!(opts.allow_exec.contains(&SandboxPath::dir(path)));
+        }
+
+        let mut ambiguous = SandboxProfile::for_ecosystem(Ecosystem::Java, &home, &project);
+        ambiguous.env.insert(
+            "GRADLE_OPTS".to_owned(),
+            "-Dgradle.user.home='$HOME/Gradle Home'".to_owned(),
+        );
+        let error = apply_standard_profile(
+            &mut ambiguous,
+            &["gradle".to_owned(), "build".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("--gradle-user-home"));
+        assert_eq!(
+            effective_gradle_user_home(
+                &ambiguous,
+                &[
+                    "gradle".to_owned(),
+                    "-g".to_owned(),
+                    "explicit-gradle".to_owned(),
+                    "build".to_owned(),
+                ],
+                &home,
+                &project,
+            )
+            .unwrap(),
+            Some(project.join("explicit-gradle")),
+            "a higher-precedence explicit home must bypass ambiguous lower-precedence options"
+        );
     }
 
     #[test]
@@ -3512,6 +3617,31 @@ mod tests {
                 .allow_write
                 .contains(&SandboxPath::dir(target.path().to_path_buf())),
             "the CLI target directory must replace the lower-precedence environment path"
+        );
+
+        let mut node_profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Node, home.path(), project.path());
+        node_profile.env.insert(
+            "CARGO_TARGET_DIR".to_owned(),
+            target.path().to_string_lossy().into_owned(),
+        );
+        apply_standard_profile(
+            &mut node_profile,
+            &["npm".to_owned(), "install".to_owned()],
+            home.path(),
+            project.path(),
+        )
+        .unwrap();
+        assert!(
+            !node_profile
+                .allow_write
+                .contains(&SandboxPath::dir(target.path().to_path_buf())),
+            "Cargo configuration must not expand a non-Cargo command's authority"
+        );
+        assert!(
+            !node_profile
+                .allow_exec
+                .contains(&SandboxPath::dir(target.path().to_path_buf()))
         );
 
         let mut install_profile =

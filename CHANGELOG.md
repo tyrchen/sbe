@@ -69,6 +69,9 @@ All notable changes to this project will be documented in this file. See [conven
   environment/default home when deriving standard-mode grants.
 - Distinguish Maven's `-fae`, `-ff`, and `-fn` failure-mode flags from attached
   `-f<project>` relocation syntax.
+- Filter ECS container-credential endpoint variables, scope Cargo target grants
+  to Cargo commands, and resolve unambiguous `gradle.user.home` values from
+  inherited `GRADLE_OPTS` while rejecting shell-expanded forms early.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23
