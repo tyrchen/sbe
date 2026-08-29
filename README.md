@@ -150,8 +150,8 @@ sbe profiles
 
 Standard mode inherits ordinary build configuration such as `RUSTFLAGS`,
 `CFLAGS`, and feature switches, while removing high-confidence credential,
-agent, dynamic-loader, and SBE-reserved variables. Strict mode keeps only a
-small positive baseline. Removed values can be granted explicitly:
+OIDC token-file, agent, dynamic-loader, and SBE-reserved variables. Strict mode
+keeps only a small positive baseline. Removed values can be granted explicitly:
 
 ```bash
 sbe run --keep-env MY_REQUIRED_TOKEN -- cargo build

@@ -1,5 +1,7 @@
+#[cfg(any(target_os = "linux", test))]
+use std::collections::BTreeSet;
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::HashMap,
     ffi::CString,
     os::{
         fd::{AsRawFd, FromRawFd},
@@ -30,7 +32,9 @@ use crate::cli::RunArgs;
 /// sbe exit codes for its own errors (matching docker run / env conventions).
 const EXIT_SBE_ERROR: u8 = 125;
 const EXIT_SANDBOX_FAILED: u8 = 126;
+#[cfg(target_os = "linux")]
 const MAX_SOURCE_SYMLINK_SCAN_ENTRIES: usize = 100_000;
+#[cfg(target_os = "linux")]
 const MAX_SOURCE_SYMLINK_SCAN_DEPTH: usize = 128;
 
 const SAFE_PARENT_ENV: &[&str] = &[
@@ -591,6 +595,7 @@ fn is_sensitive_environment_name(name: &str) -> bool {
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
         "AWS_SESSION_TOKEN",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
         "AZURE_CLIENT_SECRET",
         "CREDENTIAL",
         "CREDENTIALS",
@@ -634,6 +639,7 @@ fn is_sensitive_environment_name(name: &str) -> bool {
         || upper == "LD_LIBRARY_PATH"
         || [
             "_TOKEN",
+            "_TOKEN_FILE",
             "_API_KEY",
             "_SECRET",
             "_PASSWORD",
@@ -903,6 +909,16 @@ fn resolve_standard_path_aliases(
     snapshot_standard_write_aliases(profile, home, project_dir)?;
     snapshot_standard_exec_aliases(profile);
     snapshot_standard_read_aliases(profile);
+    #[cfg(target_os = "linux")]
+    append_standard_workspace_read_aliases(profile, project_dir)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn append_standard_workspace_read_aliases(
+    profile: &mut SandboxProfile,
+    project_dir: &Path,
+) -> anyhow::Result<()> {
     let read_aliases = workspace_read_aliases(profile, project_dir)?;
     for alias in read_aliases {
         if !profile.allow_read.contains(&alias) {
@@ -1121,6 +1137,7 @@ fn grant_covers(grant: &SandboxPath, target: &Path) -> bool {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn workspace_read_aliases(
     profile: &SandboxProfile,
     project_dir: &Path,
@@ -1137,6 +1154,7 @@ fn workspace_read_aliases(
     clippy::disallowed_methods,
     reason = "standard mode snapshots source symlink referents before launching untrusted code"
 )]
+#[cfg(any(target_os = "linux", test))]
 fn workspace_read_aliases_with_limits(
     profile: &SandboxProfile,
     project_dir: &Path,
@@ -1257,6 +1275,7 @@ fn workspace_read_aliases_with_limits(
     clippy::disallowed_methods,
     reason = "standard mode compares source symlink referents with protected paths before launch"
 )]
+#[cfg(any(target_os = "linux", test))]
 fn overlaps_denied_read(profile: &SandboxProfile, candidate: &Path) -> bool {
     profile.deny_read.iter().any(|denied| {
         let denied = resolve_existing_ancestor(&denied.path).unwrap_or_else(|| denied.path.clone());
@@ -2571,6 +2590,14 @@ mod tests {
                 ("RUSTFLAGS".to_owned(), "-Cdebuginfo=1".to_owned()),
                 ("GITHUB_TOKEN".to_owned(), "sentinel".to_owned()),
                 ("AWS_SECRET_ACCESS_KEY".to_owned(), "sentinel".to_owned()),
+                (
+                    "AWS_WEB_IDENTITY_TOKEN_FILE".to_owned(),
+                    "/tmp/aws-oidc-token".to_owned(),
+                ),
+                (
+                    "AZURE_FEDERATED_TOKEN_FILE".to_owned(),
+                    "/tmp/azure-oidc-token".to_owned(),
+                ),
                 ("SSH_AUTH_SOCK".to_owned(), "/tmp/agent".to_owned()),
                 ("SYSTEM_ACCESSTOKEN".to_owned(), "sentinel".to_owned()),
                 ("NPM_TOKEN".to_owned(), "sentinel".to_owned()),
@@ -2930,6 +2957,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     #[allow(
         clippy::disallowed_methods,
