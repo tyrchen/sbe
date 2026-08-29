@@ -160,6 +160,7 @@ Standard mode protects:
 Standard mode deliberately does not protect:
 
 - integrity of the current workspace;
+- confidentiality of files placed inside the selected workspace;
 - integrity or confidentiality of declared package caches and build outputs;
 - future execution of artifacts written during this or an earlier invocation;
 - local development services and build daemons needed by ordinary tooling;
@@ -239,6 +240,12 @@ Standard mode grants writes to:
 It denies writes everywhere else. In particular, home-directory persistence,
 credentials, shell startup, SSH authorization, user service configuration, and
 system locations remain outside the envelope.
+
+The workspace is also readable as one authority root in standard mode. Project
+`.env*` files are therefore not a separate confidentiality boundary: carving
+them on Linux prevents general `O_RDWR` creation of new package-manager files
+and leads back to per-tool precreation. Credentials that must remain secret from
+dependencies belong outside an untrusted workspace or require strict mode.
 
 Recognizing `cargo install` as install intent is acceptable; parsing Cargo
 metadata and recreating Cargo's installation transaction is not. The package
@@ -548,7 +555,8 @@ prevent launch.
 
 ### 14.2 Standard security
 
-Existing hostile fixtures must still fail to read known credential files,
+Existing hostile fixtures must still fail to read known host credential files
+outside the workspace,
 inherit sentinel credential environment variables or descriptors, modify
 shell/SSH persistence targets outside the workspace, invoke privilege
 escalation successfully, or exhaust/crash the trusted proxy. Tests separately

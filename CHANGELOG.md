@@ -13,6 +13,9 @@ All notable changes to this project will be documented in this file. See [conven
   inherit non-sensitive build environment variables, and use local developer
   services while retaining secret-path, descriptor, privilege, and proxy
   protections.
+- Treat the selected workspace as readable input in standard mode, including
+  `.env*`, so Linux can support general file creation without reimplementing
+  each package manager; strict mode retains project secret-file denials.
 - Support globally configured sccache through ordinary executable/cache grants
   and local IPC; no sccache source or managed adapter is shipped by SBE.
 - Follow pre-existing tool and cache symlinks in standard mode while retaining

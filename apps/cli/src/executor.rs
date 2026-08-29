@@ -613,6 +613,7 @@ fn apply_standard_profile(
     home: &Path,
     project_dir: &Path,
 ) {
+    remove_builtin_workspace_read_denials(profile, project_dir);
     let project_outputs = replace_builtin_project_writes(profile, project_dir);
 
     insert_builtin_path_grant(
@@ -663,6 +664,40 @@ fn apply_standard_profile(
             SandboxPath::dir(cargo_root.join("bin")),
         );
     }
+}
+
+fn remove_builtin_workspace_read_denials(profile: &mut SandboxProfile, project_dir: &Path) {
+    let removed: Vec<PathBuf> = profile
+        .deny_read
+        .iter()
+        .filter(|grant| grant.path.parent() == Some(project_dir))
+        .filter(|grant| {
+            grant.path.file_name().is_some_and(|name| {
+                matches!(
+                    name.to_str(),
+                    Some(".env" | ".env.local" | ".env.production")
+                )
+            })
+        })
+        .filter(|grant| {
+            !profile.grant_origins.iter().any(|record| {
+                record.kind == GrantKind::DenyRead
+                    && record.origin != GrantOrigin::BuiltIn
+                    && record.value == grant.path.to_string_lossy()
+            })
+        })
+        .map(|grant| grant.path.clone())
+        .collect();
+    profile
+        .deny_read
+        .retain(|grant| !removed.contains(&grant.path));
+    profile.grant_origins.retain(|record| {
+        record.kind != GrantKind::DenyRead
+            || record.origin != GrantOrigin::BuiltIn
+            || !removed
+                .iter()
+                .any(|path| record.value == path.to_string_lossy())
+    });
 }
 
 fn replace_builtin_project_writes(
@@ -2236,6 +2271,10 @@ mod tests {
                 .allow_exec
                 .contains(&SandboxPath::dir(project.path().join("target")))
         );
+        assert!(!profile.deny_read.iter().any(|grant| {
+            grant.path.parent() == Some(project.path())
+                && grant.path.file_name().is_some_and(|name| name == ".env")
+        }));
         assert!(
             profile.validate_structural_security_invariants().is_err(),
             "standard mode deliberately permits mutable executable build output"
@@ -2289,6 +2328,31 @@ mod tests {
         assert!(!profile.allow_exec.iter().any(|grant| {
             grant.path == project.path().join("target") || grant.path == external.path()
         }));
+    }
+
+    #[test]
+    fn standard_profile_preserves_explicit_workspace_read_denials() {
+        let project = tempfile::tempdir().unwrap();
+        let denied = project.path().join(".env");
+        let mut profile = SandboxProfile::for_ecosystem(
+            Ecosystem::Rust,
+            Path::new("/Users/test"),
+            project.path(),
+        );
+        profile.grant_origins.push(GrantRecord {
+            kind: GrantKind::DenyRead,
+            value: denied.to_string_lossy().into_owned(),
+            origin: GrantOrigin::Project(project.path().join(".sbe.yaml")),
+        });
+
+        apply_standard_profile(
+            &mut profile,
+            &["cargo".to_owned(), "build".to_owned()],
+            Path::new("/Users/test"),
+            project.path(),
+        );
+
+        assert!(profile.deny_read.contains(&SandboxPath::file(denied)));
     }
 
     #[test]

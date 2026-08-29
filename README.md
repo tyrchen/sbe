@@ -26,7 +26,7 @@ or explicitly provisioned high-assurance builds.
 | Capability | macOS | Linux |
 |---|---|---|
 | Filesystem writes | SBPL allowlist | Landlock allowlist |
-| Secret-path reads | SBPL deny rules | Descriptor-based read rules with denied descendants carved out |
+| Host credential reads | SBPL deny rules | Descriptor-based read rules with denied descendants carved out |
 | Executable paths | SBPL allow/deny rules | Landlock allowlist; broad privilege-bearing directories are rejected |
 | Ambient environment | Sensitive/capability variables removed in standard mode; positive allowlist under `--strict` | Same |
 | Ambient file descriptors | `CLOEXEC` before target exec | `close_range(CLOEXEC)` with bounded fallback |
@@ -268,6 +268,12 @@ profiles retain exact output/lockfile grants and source immutability. Shared
 system temporary roots are not granted broadly; every invocation gets a
 canonical private root used for `TMPDIR`, `TMP`, `TEMP`, and
 `XDG_RUNTIME_DIR`.
+
+Standard mode does not hide files inside the selected workspace, including
+`.env*`; dependencies already run with the repository as input, and trying to
+carve individual project files breaks general output creation on Linux. Keep
+real credentials outside untrusted workspaces or use `--strict`. Host SSH,
+cloud, package-registry, browser, and keychain credential paths remain denied.
 
 Standard mode permits expected persistent write/execute overlap and labels the
 result tainted. Strict mode keeps the 0.4 W^X and hard-link checks. Toolchains

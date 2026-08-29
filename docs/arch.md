@@ -102,6 +102,9 @@ tainted. SBE recognizes only top-level install intent; it does not reproduce a
 package manager's lockfile and output grammar. An inherited
 `CARGO_TARGET_DIR` receives matching write and execute authority; otherwise
 standard Rust mode selects `$PWD/target` without parsing layered Cargo config.
+Workspace contents, including `.env*`, are readable in standard mode so Linux
+can grant general create/read/write semantics without package-manager-specific
+precreation. Strict mode retains project secret-file denials.
 
 Under `--strict`, Cargo's stable `build.build-dir` split keeps final artifacts
 in the non-executable `$PWD/target` grant and places intermediate objects, build
