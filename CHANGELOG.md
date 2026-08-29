@@ -114,6 +114,9 @@ All notable changes to this project will be documented in this file. See [conven
 - Deny GitHub CLI credentials beneath an inherited `XDG_CONFIG_HOME`, filter
   custom `GNUPGHOME` locators, and reject Cargo manifests that resolve outside
   the selected workspace while retaining in-workspace `--manifest-path` usage.
+- Filter AzureRM client-certificate and OIDC-token file locators, and discover
+  Node monorepo roots in standard mode so parent workspace inputs, lockfiles,
+  and generated dependencies remain usable from a member package.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23

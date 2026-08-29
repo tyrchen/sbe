@@ -95,8 +95,8 @@ async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
 
     // Build and resolve profile
     let mut profile = SandboxProfile::for_ecosystem(ecosystem, &home, &pwd);
-    if args.strict && ecosystem == Ecosystem::Node {
-        configure_node_workspace(&mut profile, &args.command, &pwd)?;
+    if ecosystem == Ecosystem::Node {
+        configure_node_workspace(&mut profile, &args.command, &pwd, !args.strict)?;
     }
     let configs = load_configs(&pwd, args.config.as_deref(), args.trust_project_config).await?;
     resolve_profile(&mut profile, &configs, &home, &pwd)?;
@@ -627,6 +627,8 @@ fn is_sensitive_environment_name(name: &str) -> bool {
         "AWS_SHARED_CREDENTIALS_FILE",
         "AWS_SESSION_TOKEN",
         "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "ARM_CLIENT_CERTIFICATE_PATH",
+        "ARM_OIDC_TOKEN_FILE_PATH",
         "AZURE_CLIENT_CERTIFICATE_PATH",
         "AZURE_CLIENT_SECRET",
         "AZURE_CONFIG_DIR",
@@ -1337,9 +1339,9 @@ fn resolves_within(path: &Path, root: &Path) -> bool {
 }
 
 fn insert_builtin_path_grant(profile: &mut SandboxProfile, kind: GrantKind, grant: SandboxPath) {
-    // Post-finalization compatibility grants must not undo a higher-precedence
-    // execute denial. Landlock cannot subtract a denied child from an allowed
-    // directory, so any overlap suppresses the complete inferred grant.
+    // Inferred compatibility grants must not undo a higher-precedence execute
+    // denial. Landlock cannot subtract a denied child from an allowed directory,
+    // so any overlap suppresses the complete inferred grant.
     if kind == GrantKind::AllowExec
         && profile
             .deny_exec
@@ -1351,6 +1353,7 @@ fn insert_builtin_path_grant(profile: &mut SandboxProfile, kind: GrantKind, gran
     let paths = match kind {
         GrantKind::AllowWrite => &mut profile.allow_write,
         GrantKind::AllowExec => &mut profile.allow_exec,
+        GrantKind::AllowRead => &mut profile.allow_read,
         _ => return,
     };
     if paths.iter().any(|existing| existing == &grant) {
@@ -1367,6 +1370,11 @@ fn insert_builtin_path_grant(profile: &mut SandboxProfile, kind: GrantKind, gran
             let index = profile.first_user_allow_exec.min(paths.len());
             paths.insert(index, grant);
             profile.first_user_allow_exec = index + 1;
+        }
+        GrantKind::AllowRead => {
+            let index = profile.first_user_allow_read.min(paths.len());
+            paths.insert(index, grant);
+            profile.first_user_allow_read = index + 1;
         }
         _ => return,
     }
@@ -2286,6 +2294,7 @@ fn configure_node_workspace(
     profile: &mut SandboxProfile,
     command: &[String],
     project_dir: &Path,
+    standard: bool,
 ) -> anyhow::Result<()> {
     let program = command
         .first()
@@ -2302,6 +2311,26 @@ fn configure_node_workspace(
     let workspace_root = discover_node_workspace_root(project_dir, manager)?;
     if workspace_root == project_dir {
         return Ok(());
+    }
+
+    if standard {
+        insert_builtin_path_grant(
+            profile,
+            GrantKind::AllowRead,
+            SandboxPath::dir(workspace_root.clone()),
+        );
+        insert_builtin_path_grant(
+            profile,
+            GrantKind::AllowExec,
+            SandboxPath::dir(workspace_root.join("node_modules")),
+        );
+        if manager == "yarn" {
+            insert_builtin_path_grant(
+                profile,
+                GrantKind::AllowExec,
+                SandboxPath::dir(workspace_root.join(".yarn")),
+            );
+        }
     }
 
     let mut grants = vec![SandboxPath::dir(workspace_root.join("node_modules"))];
@@ -3478,6 +3507,14 @@ mod tests {
                 ),
                 ("AWS_SECRET_ACCESS_KEY".to_owned(), "sentinel".to_owned()),
                 ("AWS_CONFIG_FILE".to_owned(), "/tmp/aws-config".to_owned()),
+                (
+                    "ARM_CLIENT_CERTIFICATE_PATH".to_owned(),
+                    "/tmp/arm-client.pem".to_owned(),
+                ),
+                (
+                    "ARM_OIDC_TOKEN_FILE_PATH".to_owned(),
+                    "/tmp/arm-oidc-token".to_owned(),
+                ),
                 ("CI_JOB_JWT".to_owned(), "sentinel".to_owned()),
                 ("CI_JOB_JWT_V2".to_owned(), "sentinel".to_owned()),
                 (
@@ -5585,6 +5622,59 @@ mod tests {
         assert!(!relocated_project.path().join("package-lock.json").exists());
     }
 
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the unit test writes isolated Node workspace metadata"
+    )]
+    fn standard_node_workspace_grants_root_input_and_generated_outputs() {
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repository.path().join(".git")).unwrap();
+        std::fs::write(
+            repository.path().join("package.json"),
+            r#"{"name":"workspace","workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        let member = repository.path().join("packages/app");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(member.join("package.json"), r#"{"name":"app"}"#).unwrap();
+        let mut profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Node, Path::new("/home/test"), &member);
+
+        configure_node_workspace(
+            &mut profile,
+            &["npm".to_owned(), "install".to_owned()],
+            &member,
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            profile
+                .allow_read
+                .contains(&SandboxPath::dir(repository.path().to_path_buf()))
+        );
+        assert!(profile.allow_write.contains(&SandboxPath::file(
+            repository.path().join("package-lock.json")
+        )));
+        assert!(
+            profile
+                .allow_write
+                .contains(&SandboxPath::dir(repository.path().join("node_modules")))
+        );
+        assert!(
+            profile
+                .allow_exec
+                .contains(&SandboxPath::dir(repository.path().join("node_modules")))
+        );
+        assert!(
+            !profile
+                .allow_write
+                .contains(&SandboxPath::dir(repository.path().to_path_buf())),
+            "standard mode keeps root writes scoped to generated workspace outputs"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     #[allow(
@@ -5610,6 +5700,7 @@ mod tests {
             &mut profile,
             &["npm".to_owned(), "install".to_owned()],
             &member,
+            false,
         )
         .unwrap();
         ensure_literal_write_targets(&profile, &["npm".to_owned(), "install".to_owned()], &member)
@@ -5649,6 +5740,7 @@ mod tests {
             &mut standalone_profile,
             &["npm".to_owned(), "install".to_owned()],
             &standalone,
+            false,
         )
         .unwrap();
         ensure_literal_write_targets(

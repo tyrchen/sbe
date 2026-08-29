@@ -268,6 +268,10 @@ The workspace is also readable as one authority root in standard mode. Project
 them on Linux prevents general `O_RDWR` creation of new package-manager files
 and leads back to per-tool precreation. Credentials that must remain secret from
 dependencies belong outside an untrusted workspace or require strict mode.
+When a Node command starts in a declared monorepo member, bounded no-follow
+metadata discovery promotes the matching workspace root to readable input and
+grants only its manager-specific lockfile/dependency outputs for write and
+execution; it does not make the whole parent workspace writable.
 
 Recognizing `cargo install` as install intent is acceptable; parsing Cargo
 metadata and recreating Cargo's installation transaction is not. The package
@@ -431,8 +435,9 @@ feature switches, terminal settings, and tool paths. It removes:
   prefix-encoded forms such as Terraform's `TF_TOKEN_<host>` and concatenated
   platform names such as Azure Pipelines' `SYSTEM_ACCESSTOKEN` and GitLab's
   `CI_JOB_JWT` / `CI_JOB_JWT_V2`, plus OIDC bearer paths such as
-  `AWS_WEB_IDENTITY_TOKEN_FILE` and custom credential stores such
-  as `AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE`, `CLOUDSDK_CONFIG`,
+  `AWS_WEB_IDENTITY_TOKEN_FILE` and `ARM_OIDC_TOKEN_FILE_PATH`, certificate
+  locators such as `ARM_CLIENT_CERTIFICATE_PATH`, and custom credential stores
+  such as `AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE`, `CLOUDSDK_CONFIG`,
   `AZURE_CONFIG_DIR`, Azure
   client certificates selected by `AZURE_CLIENT_CERTIFICATE_PATH`, and Docker
   client TLS key directories selected by `DOCKER_CERT_PATH`, custom GitHub CLI

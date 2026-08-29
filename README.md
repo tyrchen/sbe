@@ -181,8 +181,10 @@ Classic Yarn and the `node-modules` linker remain lockfile-only. Mutating Bun
 commands receive only their own `bun.lock` output, plus `yarn.lock` when Bun's
 `--yarn` compatibility output is requested. SBE walks bounded, no-follow
 workspace metadata up to the Git boundary, including workspace roots between
-the current directory and repository root, and grants/pre-creates outputs at
-exactly one active Node workspace root. `npm --no-package-lock` and
+the current directory and repository root. Standard mode reads the discovered
+Node workspace root and grants executable generated dependency roots, while
+writes remain scoped to the active root's lockfile and dependency outputs.
+`npm --no-package-lock` and
 `--package-lock=false` never create an empty lockfile. Package-manager options
 that relocate the project
 (`--prefix`, `--cwd`, `--dir`, `--directory`, `--project`, and equivalent short
