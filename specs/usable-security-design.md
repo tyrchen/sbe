@@ -277,7 +277,7 @@ as the child environment: trusted configuration and explicit CLI environment
 values override the parent environment. Policy compilation must not authorize
 one Cargo target or install root and then launch Cargo with another.
 Tool-native precedence must be preserved: Cargo `--target-dir` wins first,
-then Cargo target environment variables, then a direct
+then `CARGO_TARGET_DIR`, then `CARGO_BUILD_TARGET_DIR`, then a direct
 `--config build.target-dir='path'`. Gradle's user-home flags and
 `gradle.user.home` system property override `GRADLE_OPTS` and
 `JAVA_OPTS`, then `GRADLE_USER_HOME`. Repeated JVM properties use the last
@@ -420,7 +420,8 @@ feature switches, terminal settings, and tool paths. It removes:
   paths such as `AWS_WEB_IDENTITY_TOKEN_FILE` and custom credential stores such
   as `AWS_SHARED_CREDENTIALS_FILE`, `CLOUDSDK_CONFIG`, `AZURE_CONFIG_DIR`, Azure
   client certificates selected by `AZURE_CLIENT_CERTIFICATE_PATH`, and Docker
-  client TLS key directories selected by `DOCKER_CERT_PATH`;
+  client TLS key directories selected by `DOCKER_CERT_PATH`, plus custom GitHub
+  CLI credential directories selected by `GH_CONFIG_DIR`;
 - agent and credential socket variables;
 - dynamic-loader injection variables; and
 - SBE-reserved proxy, runtime, and policy variables.

@@ -636,6 +636,7 @@ fn is_sensitive_environment_name(name: &str) -> bool {
         "DOCKER_CERT_PATH",
         "DOCKER_CONFIG",
         "GPG_AGENT_INFO",
+        "GH_CONFIG_DIR",
         "GOOGLE_APPLICATION_CREDENTIALS",
         "KUBECONFIG",
         "MONGODB_URI",
@@ -803,12 +804,10 @@ fn apply_standard_profile(
             );
             insert_builtin_path_grant(profile, GrantKind::AllowExec, SandboxPath::dir(path));
         } else {
-            let mut environment_target = false;
-            for name in ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"] {
-                let Some(path) = effective_environment_path(profile, name) else {
-                    continue;
-                };
-                environment_target = true;
+            let environment_target = effective_environment_path(profile, "CARGO_TARGET_DIR")
+                .or_else(|| effective_environment_path(profile, "CARGO_BUILD_TARGET_DIR"));
+            let has_environment_target = environment_target.is_some();
+            if let Some(path) = environment_target {
                 let path = if path.is_absolute() {
                     path
                 } else {
@@ -821,7 +820,7 @@ fn apply_standard_profile(
                 );
                 insert_builtin_path_grant(profile, GrantKind::AllowExec, SandboxPath::dir(path));
             }
-            if !environment_target && let Some(path) = cargo_config_target_dir(command)? {
+            if !has_environment_target && let Some(path) = cargo_config_target_dir(command)? {
                 let path = if path.is_absolute() {
                     path
                 } else {
@@ -3237,6 +3236,7 @@ mod tests {
                     "GOOGLE_APPLICATION_CREDENTIALS".to_owned(),
                     "/tmp/google-credentials.json".to_owned(),
                 ),
+                ("GH_CONFIG_DIR".to_owned(), "/tmp/gh-config".to_owned()),
             ],
             false,
         );
@@ -4445,6 +4445,10 @@ mod tests {
         environment_over_config.env.insert(
             "CARGO_TARGET_DIR".to_owned(),
             target.path().to_string_lossy().into_owned(),
+        );
+        environment_over_config.env.insert(
+            "CARGO_BUILD_TARGET_DIR".to_owned(),
+            config_target.path().to_string_lossy().into_owned(),
         );
         apply_standard_profile(
             &mut environment_over_config,

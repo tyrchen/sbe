@@ -98,6 +98,8 @@ All notable changes to this project will be documented in this file. See [conven
   precedence while rejecting ambiguous option forms.
 - Include `MAVEN_ARGS` and bounded project `.mvn/maven.config` in Maven's local
   repository precedence, and filter Azure client-certificate path locators.
+- Filter custom GitHub CLI credential directories and grant only Cargo's
+  effective target environment path when both target variables are present.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23
