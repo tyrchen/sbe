@@ -255,6 +255,11 @@ An explicit `--root` is the selected install root and takes precedence over
 the selected install root is writable and that the installed result is
 untrusted.
 
+Path grants derived from environment variables use the same final precedence
+as the child environment: trusted configuration and explicit CLI environment
+values override the parent environment. Policy compilation must not authorize
+one Cargo target or install root and then launch Cargo with another.
+
 Built-in profiles should remain small declarations of roots, domains, reserved
 environment names, and optional local IPC needs. They must not contain a second
 grammar for every supported package manager.

@@ -26,6 +26,9 @@ All notable changes to this project will be documented in this file. See [conven
   cache referents require one narrow explicit grant.
 - Allow explicit top-level `cargo install` commands to manage their selected
   install root instead of reimplementing Cargo's transaction format.
+- Derive Cargo target/install grants from the resolved effective environment,
+  and report external output symlinks with a copyable narrow approval instead
+  of a later opaque `EACCES`.
 - Stop requiring `--allow-insecure-linux-network` for standard Linux builds;
   inspection and runtime warnings continue to report that domain egress is
   best-effort on Linux.

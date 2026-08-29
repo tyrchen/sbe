@@ -98,7 +98,7 @@ async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
     if args.strict {
         enable_existing_dependency_execution(&mut profile, &args.command);
     } else {
-        apply_standard_profile(&mut profile, &args.command, &home, &pwd);
+        apply_standard_profile(&mut profile, &args.command, &home, &pwd)?;
         resolve_standard_path_aliases(&mut profile, &home, &pwd)?;
     }
 
@@ -647,12 +647,17 @@ fn is_sensitive_environment_name(name: &str) -> bool {
         .any(|suffix| upper.ends_with(suffix))
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "standard mode resolves conventional outputs before granting their canonical \
+              referents"
+)]
 fn apply_standard_profile(
     profile: &mut SandboxProfile,
     command: &[String],
     home: &Path,
     project_dir: &Path,
-) {
+) -> anyhow::Result<()> {
     remove_builtin_workspace_read_denials(profile, project_dir);
     let project_outputs = replace_builtin_project_writes(profile, project_dir);
 
@@ -661,20 +666,39 @@ fn apply_standard_profile(
         GrantKind::AllowWrite,
         SandboxPath::dir(project_dir.to_path_buf()),
     );
-    for output in project_outputs
-        .into_iter()
-        .filter(|output| resolves_within(output, project_dir))
-    {
-        // The Linux backend must open an executable directory before it
-        // installs Landlock. Keep the narrower write grant alongside the
-        // workspace grant so a missing output root is created safely before
-        // its execute rule is compiled.
-        insert_builtin_path_grant(
-            profile,
-            GrantKind::AllowWrite,
-            SandboxPath::dir(output.clone()),
-        );
-        insert_builtin_path_grant(profile, GrantKind::AllowExec, SandboxPath::dir(output));
+    for output in project_outputs {
+        if resolves_within(&output, project_dir) {
+            // The Linux backend must open an executable directory before it
+            // installs Landlock. Keep the narrower write grant alongside the
+            // workspace grant so a missing output root is created safely
+            // before its execute rule is compiled.
+            insert_builtin_path_grant(
+                profile,
+                GrantKind::AllowWrite,
+                SandboxPath::dir(output.clone()),
+            );
+            insert_builtin_path_grant(profile, GrantKind::AllowExec, SandboxPath::dir(output));
+            continue;
+        }
+
+        let resolved = std::fs::canonicalize(&output).with_context(|| {
+            format!(
+                "could not resolve conventional output path '{}'",
+                output.display()
+            )
+        })?;
+        if !resolved.is_dir() {
+            anyhow::bail!(
+                "conventional output path '{}' must resolve to a directory",
+                output.display()
+            );
+        }
+        if !explicit_write_covers(profile, &resolved) {
+            return Err(external_write_approval_error(&output, &resolved));
+        }
+        // The explicit grant supplies write authority. Output intent also
+        // authorizes execution, but only for the approved canonical subtree.
+        insert_builtin_path_grant(profile, GrantKind::AllowExec, SandboxPath::dir(resolved));
     }
 
     if profile.name == "java" {
@@ -696,7 +720,7 @@ fn apply_standard_profile(
     }
 
     for name in ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"] {
-        if let Some(path) = std::env::var_os(name).map(PathBuf::from) {
+        if let Some(path) = effective_environment_path(profile, name) {
             let path = if path.is_absolute() {
                 path
             } else {
@@ -714,8 +738,8 @@ fn apply_standard_profile(
     if command_is(command, "cargo") && top_level_subcommand(command).is_command(&["install"]) {
         let cargo_root = command_option_value(command, "--root")
             .map(PathBuf::from)
-            .or_else(|| std::env::var_os("CARGO_INSTALL_ROOT").map(PathBuf::from))
-            .or_else(|| std::env::var_os("CARGO_HOME").map(PathBuf::from))
+            .or_else(|| effective_environment_path(profile, "CARGO_INSTALL_ROOT"))
+            .or_else(|| effective_environment_path(profile, "CARGO_HOME"))
             .unwrap_or_else(|| home.join(".cargo"));
         let cargo_root = if cargo_root.is_absolute() {
             cargo_root
@@ -733,6 +757,15 @@ fn apply_standard_profile(
             SandboxPath::dir(cargo_root.join("bin")),
         );
     }
+    Ok(())
+}
+
+fn effective_environment_path(profile: &SandboxProfile, name: &str) -> Option<PathBuf> {
+    profile
+        .env
+        .get(name)
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os(name).map(PathBuf::from))
 }
 
 fn remove_builtin_workspace_read_denials(profile: &mut SandboxProfile, project_dir: &Path) {
@@ -962,21 +995,12 @@ fn validate_standard_write_aliases(
             || built_in_envelopes
                 .iter()
                 .any(|envelope| grant_covers(envelope, &resolved))
-            || profile.allow_write[built_in_boundary..]
-                .iter()
-                .filter_map(resolve_explicit_grant)
-                .any(|explicit| grant_covers(&explicit, &resolved))
+            || explicit_write_covers(profile, &resolved)
         {
             continue;
         }
 
-        anyhow::bail!(
-            "built-in writable path '{}' resolves outside the standard writable envelope to '{}'; \
-             approve that target explicitly with --allow-write '{}'",
-            grant.path.display(),
-            resolved.display(),
-            resolved.display()
-        );
+        return Err(external_write_approval_error(&grant.path, &resolved));
     }
     Ok(())
 }
@@ -1004,10 +1028,34 @@ fn resolve_explicit_grant(grant: &SandboxPath) -> Option<SandboxPath> {
     })
 }
 
+fn explicit_write_covers(profile: &SandboxProfile, target: &Path) -> bool {
+    let built_in_boundary = profile
+        .first_user_allow_write
+        .min(profile.allow_write.len());
+    profile.allow_write[built_in_boundary..]
+        .iter()
+        .filter_map(resolve_explicit_grant)
+        .any(|explicit| grant_covers(&explicit, target))
+}
+
+fn external_write_approval_error(lexical: &Path, resolved: &Path) -> anyhow::Error {
+    let mut approval = resolved.display().to_string();
+    if resolved.is_dir() && !approval.ends_with(std::path::MAIN_SEPARATOR) {
+        approval.push(std::path::MAIN_SEPARATOR);
+    }
+    anyhow::anyhow!(
+        "built-in writable path '{}' resolves outside the standard writable envelope to '{}'; \
+         approve that target explicitly with --allow-write '{}'",
+        lexical.display(),
+        resolved.display(),
+        approval
+    )
+}
+
 fn grant_covers(grant: &SandboxPath, target: &Path) -> bool {
     match grant.kind {
         PathKind::Subpath => target.starts_with(&grant.path),
-        PathKind::Literal => target == grant.path,
+        PathKind::Literal => target == grant.path && !target.is_dir(),
         PathKind::Regex => false,
     }
 }
@@ -2630,7 +2678,8 @@ mod tests {
             &["cargo".to_owned(), "test".to_owned()],
             Path::new("/Users/test"),
             project.path(),
-        );
+        )
+        .unwrap();
 
         assert!(
             profile
@@ -2676,7 +2725,11 @@ mod tests {
     }
 
     #[test]
-    fn standard_profile_does_not_follow_project_output_symlinks_outside_project() {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the unit test builds and resolves an isolated external output symlink"
+    )]
+    fn standard_profile_requires_approval_for_external_project_outputs() {
         let project = tempfile::tempdir().unwrap();
         let external = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(external.path(), project.path().join("target")).unwrap();
@@ -2686,33 +2739,51 @@ mod tests {
             project.path(),
         );
 
-        apply_standard_profile(
+        let error = apply_standard_profile(
             &mut profile,
             &["cargo".to_owned(), "build".to_owned()],
             Path::new("/Users/test"),
             project.path(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("--allow-write"));
+        assert!(error.to_string().contains(&format!(
+            "{}{sep}",
+            external.path().display(),
+            sep = std::path::MAIN_SEPARATOR
+        )));
+
+        let mut approved = SandboxProfile::for_ecosystem(
+            Ecosystem::Rust,
+            Path::new("/Users/test"),
+            project.path(),
         );
-        resolve_standard_path_aliases(&mut profile, Path::new("/Users/test"), project.path())
+        approved
+            .allow_write
+            .push(SandboxPath::dir(external.path().to_path_buf()));
+        apply_standard_profile(
+            &mut approved,
+            &["cargo".to_owned(), "build".to_owned()],
+            Path::new("/Users/test"),
+            project.path(),
+        )
+        .unwrap();
+        resolve_standard_path_aliases(&mut approved, Path::new("/Users/test"), project.path())
             .unwrap();
 
         assert!(
-            profile
+            approved
                 .allow_write
                 .contains(&SandboxPath::dir(project.path().to_path_buf()))
         );
-        assert!(!profile.allow_write.iter().any(|grant| {
-            grant.path == project.path().join("target") || grant.path == external.path()
-        }));
-        assert!(!profile.allow_exec.iter().any(|grant| {
-            grant.path == project.path().join("target") || grant.path == external.path()
-        }));
         assert!(
-            !profile
-                .allow_read
-                .iter()
-                .any(|grant| grant.path == external.path()),
-            "generated output symlinks are not inferred as source read grants"
+            approved
+                .allow_write
+                .contains(&SandboxPath::dir(external.path().to_path_buf()))
         );
+        assert!(approved.allow_exec.contains(&SandboxPath::dir(
+            std::fs::canonicalize(external.path()).unwrap()
+        )));
     }
 
     #[test]
@@ -2735,7 +2806,8 @@ mod tests {
             &["npm".to_owned(), "install".to_owned()],
             &home,
             &project,
-        );
+        )
+        .unwrap();
         let error = resolve_standard_path_aliases(&mut profile, &home, &project).unwrap_err();
         assert!(error.to_string().contains("--allow-write"));
         assert!(
@@ -2753,7 +2825,8 @@ mod tests {
             &["npm".to_owned(), "install".to_owned()],
             &home,
             &project,
-        );
+        )
+        .unwrap();
         resolve_standard_path_aliases(&mut approved, &home, &project).unwrap();
         assert!(
             approved
@@ -2782,7 +2855,8 @@ mod tests {
             &["npm".to_owned(), "install".to_owned()],
             &home,
             &project,
-        );
+        )
+        .unwrap();
         resolve_standard_path_aliases(&mut profile, &home, &project).unwrap();
 
         assert!(
@@ -2818,7 +2892,8 @@ mod tests {
             &["cargo".to_owned(), "build".to_owned()],
             root.path(),
             &project,
-        );
+        )
+        .unwrap();
         resolve_standard_path_aliases(&mut profile, root.path(), &project).unwrap();
 
         assert!(
@@ -2860,7 +2935,8 @@ mod tests {
             &["cargo".to_owned(), "build".to_owned()],
             Path::new("/Users/test"),
             project.path(),
-        );
+        )
+        .unwrap();
 
         assert!(profile.deny_read.contains(&SandboxPath::file(denied)));
     }
@@ -2878,7 +2954,8 @@ mod tests {
             &["sbt".to_owned(), "compile".to_owned()],
             home.path(),
             project.path(),
-        );
+        )
+        .unwrap();
 
         for cache in [".sbt/boot", ".ivy2/cache", ".cache/coursier"] {
             assert!(
@@ -2931,7 +3008,8 @@ mod tests {
             ],
             home,
             project.path(),
-        );
+        )
+        .unwrap();
 
         let cargo_root = std::env::var_os("CARGO_INSTALL_ROOT")
             .or_else(|| std::env::var_os("CARGO_HOME"))
@@ -2955,6 +3033,70 @@ mod tests {
     }
 
     #[test]
+    fn standard_cargo_paths_use_the_resolved_profile_environment() {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let install_root = tempfile::tempdir().unwrap();
+
+        let mut build_profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Rust, home.path(), project.path());
+        build_profile.env.insert(
+            "CARGO_TARGET_DIR".to_owned(),
+            target.path().to_string_lossy().into_owned(),
+        );
+        apply_standard_profile(
+            &mut build_profile,
+            &["cargo".to_owned(), "build".to_owned()],
+            home.path(),
+            project.path(),
+        )
+        .unwrap();
+        assert!(
+            build_profile
+                .allow_write
+                .contains(&SandboxPath::dir(target.path().to_path_buf()))
+        );
+        assert!(
+            build_profile
+                .allow_exec
+                .contains(&SandboxPath::dir(target.path().to_path_buf()))
+        );
+
+        let mut install_profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Rust, home.path(), project.path());
+        install_profile.env.insert(
+            "CARGO_INSTALL_ROOT".to_owned(),
+            install_root.path().to_string_lossy().into_owned(),
+        );
+        install_profile.env.insert(
+            "CARGO_HOME".to_owned(),
+            home.path().join("ignored-cargo-home").display().to_string(),
+        );
+        apply_standard_profile(
+            &mut install_profile,
+            &[
+                "cargo".to_owned(),
+                "install".to_owned(),
+                "ripgrep".to_owned(),
+            ],
+            home.path(),
+            project.path(),
+        )
+        .unwrap();
+        assert!(
+            install_profile
+                .allow_write
+                .contains(&SandboxPath::dir(install_root.path().to_path_buf()))
+        );
+        assert!(
+            install_profile
+                .allow_exec
+                .contains(&SandboxPath::dir(install_root.path().join("bin")))
+        );
+    }
+
+    #[test]
     fn standard_cargo_install_honors_explicit_root() {
         let project = tempfile::tempdir().unwrap();
         let install_root = tempfile::tempdir().unwrap();
@@ -2971,7 +3113,8 @@ mod tests {
             ],
             home,
             project.path(),
-        );
+        )
+        .unwrap();
 
         assert!(
             profile
