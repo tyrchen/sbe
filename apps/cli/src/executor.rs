@@ -1450,6 +1450,10 @@ fn project_relocation_option(command: &[String]) -> Option<&str> {
         .iter()
         .skip(1)
         .take_while(|argument| argument.as_str() != "--")
+        .filter(|argument| {
+            !matches!(program, "mvn" | "mvnw")
+                || !["-fae", "-ff", "-fn"].contains(&argument.as_str())
+        })
         .find_map(|argument| {
             options.iter().copied().find(|option| {
                 argument == *option
@@ -3834,6 +3838,13 @@ mod tests {
             ])
             .is_ok()
         );
+        for flag in ["-fae", "-ff", "-fn"] {
+            assert!(
+                reject_project_relocation(&["mvn".to_owned(), flag.to_owned(), "test".to_owned(),])
+                    .is_ok(),
+                "Maven failure-mode flag was treated as a project path: {flag}"
+            );
+        }
     }
 
     #[test]
