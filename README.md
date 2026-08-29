@@ -291,7 +291,10 @@ On Linux, standard grants follow an existing ordinary symlink to its opened
 referent and install the Landlock rule from that descriptor. Built-in writable
 cache links must resolve within the workspace, a conventional cache namespace,
 or another declared writable root; an external referent fails with a copyable
-`--allow-write` approval. Before launch SBE discovers source-tree symlinks
+`--allow-write` approval. If the final cache or output directory does not exist,
+SBE resolves its nearest existing ancestor and reconstructs the missing suffix
+beneath the approved referent, so symlinked cache roots work on a cold build.
+Before launch SBE discovers source-tree symlinks
 outside generated dependency/output directories, including nested links in an
 external source referent, so a link into an ordinary sibling checkout is
 readable without granting the sibling's parent. Canonical directory identities

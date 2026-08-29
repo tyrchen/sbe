@@ -350,6 +350,12 @@ reopens a mutable lexical link after its referent was approved. On Linux it
 opens the canonical final object with descriptor-relative kernel resolution,
 rejects magic links, validates the opened object's type and boundary, and
 installs the Landlock rule from that file descriptor.
+When the final writable object is missing, policy resolution walks to the
+nearest existing ancestor, canonicalizes that ancestor, appends the unresolved
+suffix, and validates the reconstructed target against the same writable
+envelope. The launcher receives only that snapshot. Thus a cold cache such as
+`~/.cache -> /mnt/cache` with missing `~/.cache/coursier` works after
+`/mnt/cache/` is approved, without reopening the mutable home-directory link.
 For the built-in workspace read grant, standard mode discovers symlinks in the
 source tree without descending into conventional generated dependency and
 output directories, then installs separate read rules for safe external

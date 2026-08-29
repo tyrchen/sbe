@@ -1205,7 +1205,7 @@ fn snapshot_standard_write_aliases(
     let mut records = Vec::new();
 
     for (index, grant) in original.into_iter().enumerate() {
-        let Ok(resolved) = std::fs::canonicalize(&grant.path) else {
+        let Some(resolved) = resolve_existing_ancestor(&grant.path) else {
             snapped.push(grant);
             continue;
         };
@@ -3412,6 +3412,70 @@ mod tests {
                 .iter()
                 .any(|grant| grant.path == home.join(".npm")),
             "the launcher must not reopen the mutable lexical symlink"
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the unit test resolves a missing cache directory beneath an isolated symlink"
+    )]
+    fn standard_profile_resolves_missing_descendants_beneath_approved_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let project = root.path().join("project");
+        let external_cache = root.path().join("external-cache");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&external_cache).unwrap();
+        std::os::unix::fs::symlink(&external_cache, home.join(".cache")).unwrap();
+        let resolved_cache = std::fs::canonicalize(&external_cache)
+            .unwrap()
+            .join("coursier");
+
+        let mut unapproved = SandboxProfile::for_ecosystem(Ecosystem::Java, &home, &project);
+        apply_standard_profile(
+            &mut unapproved,
+            &["sbt".to_owned(), "update".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap();
+        let error = resolve_standard_path_aliases(&mut unapproved, &home, &project).unwrap_err();
+        assert!(error.to_string().contains("--allow-write"));
+        assert!(
+            error
+                .to_string()
+                .contains(&resolved_cache.display().to_string())
+        );
+
+        let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Java, &home, &project);
+        profile
+            .allow_write
+            .push(SandboxPath::dir(external_cache.clone()));
+        apply_standard_profile(
+            &mut profile,
+            &["sbt".to_owned(), "update".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap();
+        resolve_standard_path_aliases(&mut profile, &home, &project).unwrap();
+
+        assert!(!resolved_cache.exists());
+        assert!(
+            profile
+                .allow_write
+                .contains(&SandboxPath::dir(resolved_cache)),
+            "resolved grants: {:?}",
+            profile.allow_write
+        );
+        assert!(
+            !profile
+                .allow_write
+                .iter()
+                .any(|grant| grant.path == home.join(".cache/coursier")),
+            "the launcher must receive the reconstructed canonical target, not its symlinked spelling"
         );
     }
 

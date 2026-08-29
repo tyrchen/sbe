@@ -77,6 +77,9 @@ All notable changes to this project will be documented in this file. See [conven
 - Filter custom Docker credential-directory locators and inject standard-mode
   localhost proxy bypasses, including Java `http.nonProxyHosts`, so permitted
   local developer services do not get rejected by SBE's external proxy.
+- Resolve missing writable descendants through their nearest existing symlink
+  ancestor, validate the reconstructed target, and snapshot it so approved
+  symlinked cache roots also work on cold builds.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23
