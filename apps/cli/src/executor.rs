@@ -788,6 +788,11 @@ fn apply_standard_profile(
             SandboxPath::dir(npm_cache.path),
         );
     }
+    if let Some(bun_cache) = effective_bun_cache(profile, command, project_dir)? {
+        for conventional in [home.join(".bun"), home.join(".cache/bun")] {
+            replace_builtin_write_path(profile, &conventional, SandboxPath::dir(bun_cache.clone()));
+        }
+    }
     if profile.name == "node"
         && (command_is(command, "npm") || command_is(command, "npx") || command_is(command, "pnpm"))
     {
@@ -801,11 +806,14 @@ fn apply_standard_profile(
                 SandboxPath::file(user_config.path),
             );
         }
-        if let Some(global_config) = effective_npm_global_config(profile, command, project_dir)? {
+        if let Some(global_config) = effective_npm_global_config(profile, command, project_dir)?
+            && (global_config.explicit
+                || read_bounded_following_metadata_file(&global_config.path)?.is_some())
+        {
             insert_builtin_path_grant(
                 profile,
                 GrantKind::AllowRead,
-                SandboxPath::file(global_config),
+                SandboxPath::file(global_config.path),
             );
         }
     }
@@ -840,7 +848,7 @@ fn apply_standard_profile(
         }
     }
     if profile.name == "python" && command_uses_pip(command) {
-        for config in effective_pip_config_read_paths(profile, home, project_dir)? {
+        for config in effective_pip_config_read_paths(profile, command, home, project_dir)? {
             insert_builtin_path_grant(profile, GrantKind::AllowRead, SandboxPath::file(config));
         }
     }
@@ -1033,6 +1041,18 @@ struct NpmCacheSelection {
     project_controlled: bool,
 }
 
+fn effective_bun_cache(
+    profile: &SandboxProfile,
+    command: &[String],
+    project_dir: &Path,
+) -> anyhow::Result<Option<PathBuf>> {
+    if profile.name != "node" || !command_is(command, "bun") {
+        return Ok(None);
+    }
+    Ok(command_long_path_option(command, "--cache-dir")?
+        .map(|path| anchor_project_path(path, project_dir)))
+}
+
 fn effective_npm_cache(
     profile: &SandboxProfile,
     command: &[String],
@@ -1163,19 +1183,38 @@ fn effective_npm_user_config(
     })
 }
 
+struct NpmGlobalConfigSelection {
+    path: PathBuf,
+    explicit: bool,
+}
+
 fn effective_npm_global_config(
     profile: &SandboxProfile,
     command: &[String],
     project_dir: &Path,
-) -> anyhow::Result<Option<PathBuf>> {
-    let selected = command_long_path_option(command, "--globalconfig")?.or_else(|| {
+) -> anyhow::Result<Option<NpmGlobalConfigSelection>> {
+    let command_config = command_long_path_option(command, "--globalconfig")?;
+    let environment_config = if command_config.is_none() {
         profile
             .env
             .get("NPM_CONFIG_GLOBALCONFIG")
             .or_else(|| profile.env.get("npm_config_globalconfig"))
             .map(PathBuf::from)
+    } else {
+        None
+    };
+    let explicit = command_config.is_some() || environment_config.is_some();
+    let selected = command_config.or(environment_config).or_else(|| {
+        ["NPM_CONFIG_PREFIX", "npm_config_prefix"]
+            .iter()
+            .find_map(|name| effective_environment_path(profile, name))
+            .filter(|prefix| !prefix.as_os_str().is_empty())
+            .map(|prefix| prefix.join("etc/npmrc"))
     });
-    Ok(selected.map(|path| anchor_project_path(path, project_dir)))
+    Ok(selected.map(|path| NpmGlobalConfigSelection {
+        path: anchor_project_path(path, project_dir),
+        explicit,
+    }))
 }
 
 fn selected_global_npm_config_path(
@@ -1185,16 +1224,19 @@ fn selected_global_npm_config_path(
     project_dir: &Path,
     key: &str,
 ) -> anyhow::Result<Option<PathBuf>> {
-    let Some(path) = effective_npm_global_config(profile, command, project_dir)? else {
+    let Some(selection) = effective_npm_global_config(profile, command, project_dir)? else {
         return Ok(None);
     };
-    let Some(contents) = read_bounded_following_metadata_file(&path)? else {
-        anyhow::bail!(
-            "could not inspect explicit npm global configuration: {}",
-            path.display()
-        );
+    let Some(contents) = read_bounded_following_metadata_file(&selection.path)? else {
+        if selection.explicit {
+            anyhow::bail!(
+                "could not inspect explicit npm global configuration: {}",
+                selection.path.display()
+            );
+        }
+        return Ok(None);
     };
-    npm_config_path_value(&contents, &path, home, key, "global npmrc")
+    npm_config_path_value(&contents, &selection.path, home, key, "global npmrc")
 }
 
 fn user_npm_config_path(
@@ -1411,11 +1453,9 @@ fn effective_python_cache(
         && environment_cache.is_none()
         && default_name == "pip"
     {
-        (
-            effective_pip_config_cache(profile, home, project_dir)?,
-            false,
-            Vec::new(),
-        )
+        let (cache, project_controlled) =
+            effective_pip_config_cache(profile, command, home, project_dir)?;
+        (cache, project_controlled, Vec::new())
     } else if command_cache.is_none() && environment_cache.is_none() && default_name == "pypoetry" {
         let (cache, project_controlled) =
             effective_poetry_config_cache(profile, home, project_dir)?;
@@ -1604,28 +1644,19 @@ fn simple_uv_cache_path(value: &str, source: &Path) -> anyhow::Result<PathBuf> {
 
 fn effective_pip_config_cache(
     profile: &SandboxProfile,
+    command: &[String],
     home: &Path,
     project_dir: &Path,
-) -> anyhow::Result<Option<PathBuf>> {
-    let legacy = home.join(".pip/pip.conf");
-    let mut selected = read_pip_config_cache(&legacy, home, false)?;
-
-    let user_config_root = effective_environment_path(profile, "XDG_CONFIG_HOME")
-        .map(|path| anchor_project_path(path, project_dir))
-        .unwrap_or_else(|| platform_config_home(home));
-    let user_config = user_config_root.join("pip/pip.conf");
-    if let Some(cache) = read_pip_config_cache(&user_config, home, false)? {
-        selected = Some(cache);
+) -> anyhow::Result<(Option<PathBuf>, bool)> {
+    let mut selected = None;
+    let mut project_controlled = false;
+    for candidate in effective_pip_config_candidates(profile, command, home, project_dir)? {
+        if let Some(cache) = read_pip_config_cache(&candidate.path, home, candidate.required)? {
+            selected = Some(cache);
+            project_controlled = candidate.project_controlled;
+        }
     }
-
-    // Ambient PIP_CONFIG_FILE is filtered. If it is present in the resolved profile, the user
-    // explicitly restored it and its final config layer should be honored.
-    if let Some(explicit) = effective_profile_path(profile, "PIP_CONFIG_FILE", project_dir)
-        && let Some(cache) = read_pip_config_cache(&explicit, home, true)?
-    {
-        selected = Some(cache);
-    }
-    Ok(selected)
+    Ok((selected, project_controlled))
 }
 
 fn effective_poetry_config_cache(
@@ -1690,34 +1721,147 @@ fn effective_poetry_config_read_paths(
 
 fn effective_pip_config_read_paths(
     profile: &SandboxProfile,
+    command: &[String],
     home: &Path,
     project_dir: &Path,
 ) -> anyhow::Result<Vec<PathBuf>> {
-    let user_config_root = effective_environment_path(profile, "XDG_CONFIG_HOME")
-        .map(|path| anchor_project_path(path, project_dir))
-        .unwrap_or_else(|| platform_config_home(home));
-    let candidates = [
-        home.join(".pip/pip.conf"),
-        user_config_root.join("pip/pip.conf"),
-    ];
     let mut selected = Vec::new();
-    for path in candidates {
-        if read_bounded_following_metadata_file(&path)?.is_some() {
-            selected.push(path);
+    for candidate in effective_pip_config_candidates(profile, command, home, project_dir)? {
+        if read_bounded_following_metadata_file(&candidate.path)?.is_some() {
+            if !selected.contains(&candidate.path) {
+                selected.push(candidate.path);
+            }
+        } else if candidate.required {
+            anyhow::bail!(
+                "could not inspect explicit pip configuration: {}",
+                candidate.path.display()
+            );
         }
     }
-    if let Some(path) = effective_profile_path(profile, "PIP_CONFIG_FILE", project_dir) {
-        if read_bounded_following_metadata_file(&path)?.is_none() {
+    Ok(selected)
+}
+
+struct PipConfigCandidate {
+    path: PathBuf,
+    required: bool,
+    project_controlled: bool,
+}
+
+fn effective_pip_config_candidates(
+    profile: &SandboxProfile,
+    command: &[String],
+    home: &Path,
+    project_dir: &Path,
+) -> anyhow::Result<Vec<PipConfigCandidate>> {
+    // Ambient PIP_CONFIG_FILE is filtered. A value here was explicitly restored and pip loads it
+    // after global, user, and site configuration. An existing explicit file suppresses the user
+    // layer; /dev/null suppresses every file layer.
+    if profile
+        .env
+        .get("PIP_CONFIG_FILE")
+        .is_some_and(String::is_empty)
+    {
+        anyhow::bail!("PIP_CONFIG_FILE must select a non-empty path");
+    }
+    let explicit = effective_profile_path(profile, "PIP_CONFIG_FILE", project_dir);
+    if let Some(path) = &explicit {
+        if path.as_os_str().is_empty() {
+            anyhow::bail!("PIP_CONFIG_FILE must select a non-empty path");
+        }
+        if path == Path::new("/dev/null") {
+            return Ok(Vec::new());
+        }
+        if read_bounded_following_metadata_file(path)?.is_none() {
             anyhow::bail!(
                 "could not inspect explicit pip configuration: {}",
                 path.display()
             );
         }
-        if !selected.contains(&path) {
-            selected.push(path);
-        }
     }
-    Ok(selected)
+
+    let mut candidates = global_pip_config_paths(profile, project_dir)
+        .into_iter()
+        .map(|path| PipConfigCandidate {
+            path,
+            required: false,
+            project_controlled: false,
+        })
+        .collect::<Vec<_>>();
+
+    if explicit.is_none() {
+        let user_config_root = effective_environment_path(profile, "XDG_CONFIG_HOME")
+            .map(|path| anchor_project_path(path, project_dir))
+            .unwrap_or_else(|| platform_config_home(home));
+        candidates.extend(
+            [
+                home.join(".pip/pip.conf"),
+                user_config_root.join("pip/pip.conf"),
+            ]
+            .into_iter()
+            .map(|path| PipConfigCandidate {
+                path,
+                required: false,
+                project_controlled: false,
+            }),
+        );
+    }
+
+    if let Some(path) = effective_pip_site_config(profile, command, project_dir) {
+        candidates.push(PipConfigCandidate {
+            project_controlled: resolves_within(&path, project_dir),
+            path,
+            required: false,
+        });
+    }
+    if let Some(path) = explicit {
+        candidates.push(PipConfigCandidate {
+            path,
+            required: true,
+            project_controlled: false,
+        });
+    }
+    Ok(candidates)
+}
+
+#[cfg(target_os = "macos")]
+fn global_pip_config_paths(_profile: &SandboxProfile, _project_dir: &Path) -> Vec<PathBuf> {
+    vec![PathBuf::from("/Library/Application Support/pip/pip.conf")]
+}
+
+#[cfg(not(target_os = "macos"))]
+fn global_pip_config_paths(profile: &SandboxProfile, project_dir: &Path) -> Vec<PathBuf> {
+    let directories = profile
+        .env
+        .get("XDG_CONFIG_DIRS")
+        .cloned()
+        .or_else(|| std::env::var("XDG_CONFIG_DIRS").ok())
+        .unwrap_or_else(|| "/etc/xdg".to_owned());
+    let mut paths = std::env::split_paths(&directories)
+        .map(|directory| anchor_project_path(directory, project_dir).join("pip/pip.conf"))
+        .collect::<Vec<_>>();
+    paths.push(PathBuf::from("/etc/pip.conf"));
+    paths
+}
+
+fn effective_pip_site_config(
+    profile: &SandboxProfile,
+    command: &[String],
+    project_dir: &Path,
+) -> Option<PathBuf> {
+    let executable = command.first().map(PathBuf::from)?;
+    let executable = anchor_project_path(executable, project_dir);
+    let executable_environment = executable
+        .parent()
+        .filter(|parent| {
+            parent.file_name().is_some_and(|name| {
+                name == std::ffi::OsStr::new("bin") || name == std::ffi::OsStr::new("Scripts")
+            })
+        })
+        .and_then(Path::parent)
+        .map(Path::to_path_buf);
+    executable_environment
+        .or_else(|| effective_environment_path(profile, "VIRTUAL_ENV"))
+        .map(|path| anchor_project_path(path, project_dir).join("pip.conf"))
 }
 
 fn effective_profile_path(
@@ -5698,12 +5842,53 @@ mod tests {
         assert!(
             pip_config
                 .allow_write
-                .contains(&SandboxPath::dir(pip_config_cache))
+                .contains(&SandboxPath::dir(pip_config_cache.clone()))
         );
         assert!(
             pip_config
                 .allow_read
                 .contains(&SandboxPath::file(pip_config_home.join("pip/pip.conf")))
+        );
+
+        let virtual_environment = root.path().join("external-venv");
+        let site_config = virtual_environment.join("pip.conf");
+        let site_cache = root.path().join("pip-site-cache");
+        std::fs::create_dir_all(virtual_environment.join("bin")).unwrap();
+        std::fs::write(
+            &site_config,
+            format!("[global]\ncache-dir={}\n", site_cache.display()),
+        )
+        .unwrap();
+        let mut pip_site = SandboxProfile::for_ecosystem(Ecosystem::Python, &home, &project);
+        pip_site.env.insert(
+            "XDG_CONFIG_HOME".to_owned(),
+            pip_config_home.to_string_lossy().into_owned(),
+        );
+        apply_standard_profile(
+            &mut pip_site,
+            &[
+                virtual_environment
+                    .join("bin/pip")
+                    .to_string_lossy()
+                    .into_owned(),
+                "install".to_owned(),
+                "build".to_owned(),
+            ],
+            &home,
+            &project,
+        )
+        .unwrap();
+        assert!(pip_site.allow_write.contains(&SandboxPath::dir(site_cache)));
+        assert!(
+            !pip_site
+                .allow_write
+                .contains(&SandboxPath::dir(pip_config_cache)),
+            "virtual-environment site configuration must override user configuration"
+        );
+        assert!(
+            pip_site
+                .allow_read
+                .contains(&SandboxPath::file(site_config))
         );
     }
 
@@ -8027,6 +8212,68 @@ mod tests {
             global_config_selected
                 .allow_write
                 .contains(&SandboxPath::dir(global_config_cache))
+        );
+
+        let prefix = root.path().join("npm-prefix");
+        let prefix_config = prefix.join("etc/npmrc");
+        let prefix_cache = root.path().join("prefix-config-cache");
+        std::fs::create_dir_all(prefix.join("etc")).unwrap();
+        std::fs::write(
+            &prefix_config,
+            format!("cache={}\n", prefix_cache.display()),
+        )
+        .unwrap();
+        let mut prefix_selected = SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &project);
+        prefix_selected.env.insert(
+            "NPM_CONFIG_PREFIX".to_owned(),
+            prefix.to_string_lossy().into_owned(),
+        );
+        apply_standard_profile(
+            &mut prefix_selected,
+            &["npm".to_owned(), "install".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap();
+        assert!(
+            prefix_selected
+                .allow_read
+                .contains(&SandboxPath::file(prefix_config))
+        );
+        assert!(
+            prefix_selected
+                .allow_write
+                .contains(&SandboxPath::dir(prefix_cache))
+        );
+
+        let bun_cache = root.path().join("bun-command-cache");
+        let mut bun_selected = SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &project);
+        apply_standard_profile(
+            &mut bun_selected,
+            &[
+                "bun".to_owned(),
+                "install".to_owned(),
+                "--cache-dir".to_owned(),
+                bun_cache.to_string_lossy().into_owned(),
+            ],
+            &home,
+            &project,
+        )
+        .unwrap();
+        assert!(
+            bun_selected
+                .allow_write
+                .contains(&SandboxPath::dir(bun_cache))
+        );
+        assert!(
+            !bun_selected
+                .allow_write
+                .contains(&SandboxPath::dir(home.join(".bun")))
+        );
+        assert!(
+            !bun_selected
+                .allow_write
+                .contains(&SandboxPath::dir(home.join(".cache/bun")))
         );
 
         let pnpm_home = root.path().join("custom-pnpm-home");
