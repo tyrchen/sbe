@@ -300,6 +300,9 @@ external source referent, so a link into an ordinary sibling checkout is
 readable without granting the sibling's parent. Canonical directory identities
 prevent traversal cycles, while entry and depth budgets bound discovery work.
 Magic links and protected referents remain rejected.
+This validation also applies to built-in readable and executable entries such
+as project-local `gradlew` and `mvnw`; a wrapper symlink cannot turn an execute
+grant into read access to a protected credential.
 Strict mode retains no-follow resolution except for immutable system aliases.
 Denied paths include their current canonical target. Strict mode also retains
 hard-link alias rejection; standard mode does not recursively scan historical

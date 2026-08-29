@@ -1079,8 +1079,8 @@ fn resolve_standard_path_aliases(
     project_dir: &Path,
 ) -> anyhow::Result<()> {
     snapshot_standard_write_aliases(profile, home, project_dir)?;
-    snapshot_standard_exec_aliases(profile);
-    snapshot_standard_read_aliases(profile);
+    snapshot_standard_exec_aliases(profile)?;
+    snapshot_standard_read_aliases(profile)?;
     #[cfg(target_os = "linux")]
     append_standard_workspace_read_aliases(profile, project_dir)?;
     Ok(())
@@ -1109,60 +1109,95 @@ fn append_standard_workspace_read_aliases(
     clippy::disallowed_methods,
     reason = "standard mode snapshots executable symlink referents before launching untrusted code"
 )]
-fn snapshot_standard_exec_aliases(profile: &mut SandboxProfile) {
+fn snapshot_standard_exec_aliases(profile: &mut SandboxProfile) -> anyhow::Result<()> {
+    let built_in_boundary = profile.first_user_allow_exec.min(profile.allow_exec.len());
+    let original = profile.allow_exec.clone();
+    let mut snapped = Vec::with_capacity(original.len());
     let mut records = Vec::new();
-    profile.allow_exec = profile
-        .allow_exec
-        .drain(..)
-        .map(|grant| {
-            let Ok(resolved) = std::fs::canonicalize(&grant.path) else {
-                return grant;
-            };
-            if resolved == grant.path {
-                return grant;
-            }
+    for (index, grant) in original.into_iter().enumerate() {
+        let Ok(resolved) = std::fs::canonicalize(&grant.path) else {
+            snapped.push(grant);
+            continue;
+        };
+        if resolved != grant.path
+            && index < built_in_boundary
+            && overlaps_denied_read(profile, &resolved)
+        {
+            return Err(protected_builtin_alias_error(
+                "executable",
+                &grant.path,
+                &resolved,
+            ));
+        }
+        if resolved != grant.path {
             records.push(GrantRecord {
                 kind: GrantKind::AllowExec,
                 value: resolved.to_string_lossy().into_owned(),
                 origin: GrantOrigin::Runtime,
             });
-            SandboxPath {
+            snapped.push(SandboxPath {
                 path: resolved,
                 kind: grant.kind,
-            }
-        })
-        .collect();
+            });
+        } else {
+            snapped.push(grant);
+        }
+    }
+    profile.allow_exec = snapped;
     profile.grant_origins.extend(records);
+    Ok(())
 }
 
 #[allow(
     clippy::disallowed_methods,
     reason = "standard mode snapshots readable symlink referents before launching untrusted code"
 )]
-fn snapshot_standard_read_aliases(profile: &mut SandboxProfile) {
+fn snapshot_standard_read_aliases(profile: &mut SandboxProfile) -> anyhow::Result<()> {
+    let built_in_boundary = profile.first_user_allow_read.min(profile.allow_read.len());
+    let original = profile.allow_read.clone();
+    let mut snapped = Vec::with_capacity(original.len());
     let mut records = Vec::new();
-    profile.allow_read = profile
-        .allow_read
-        .drain(..)
-        .map(|grant| {
-            let Ok(resolved) = std::fs::canonicalize(&grant.path) else {
-                return grant;
-            };
-            if resolved == grant.path {
-                return grant;
-            }
+    for (index, grant) in original.into_iter().enumerate() {
+        let Ok(resolved) = std::fs::canonicalize(&grant.path) else {
+            snapped.push(grant);
+            continue;
+        };
+        if resolved != grant.path
+            && index < built_in_boundary
+            && overlaps_denied_read(profile, &resolved)
+        {
+            return Err(protected_builtin_alias_error(
+                "readable",
+                &grant.path,
+                &resolved,
+            ));
+        }
+        if resolved != grant.path {
             records.push(GrantRecord {
                 kind: GrantKind::AllowRead,
                 value: resolved.to_string_lossy().into_owned(),
                 origin: GrantOrigin::Runtime,
             });
-            SandboxPath {
+            snapped.push(SandboxPath {
                 path: resolved,
                 kind: grant.kind,
-            }
-        })
-        .collect();
+            });
+        } else {
+            snapped.push(grant);
+        }
+    }
+    profile.allow_read = snapped;
     profile.grant_origins.extend(records);
+    Ok(())
+}
+
+fn protected_builtin_alias_error(kind: &str, lexical: &Path, resolved: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "built-in {kind} path '{}' resolves into protected read path '{}'; protected referents \
+         cannot be inferred from a built-in grant",
+        lexical.display(),
+        resolved.display()
+    )
 }
 
 #[allow(
@@ -1447,7 +1482,6 @@ fn workspace_read_aliases_with_limits(
     clippy::disallowed_methods,
     reason = "standard mode compares source symlink referents with protected paths before launch"
 )]
-#[cfg(any(target_os = "linux", test))]
 fn overlaps_denied_read(profile: &SandboxProfile, candidate: &Path) -> bool {
     profile.deny_read.iter().any(|denied| {
         let denied = resolve_existing_ancestor(&denied.path).unwrap_or_else(|| denied.path.clone());
@@ -3423,6 +3457,45 @@ mod tests {
                 .any(|grant| grant.path == home.join(".npm")),
             "the launcher must not reopen the mutable lexical symlink"
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the unit test resolves isolated malicious wrapper and read symlinks"
+    )]
+    fn standard_profile_rejects_protected_builtin_aliases() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let project = root.path().join("project");
+        let ssh = home.join(".ssh");
+        let private_key = ssh.join("id_rsa");
+        std::fs::create_dir_all(&ssh).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(&private_key, "sentinel").unwrap();
+        std::os::unix::fs::symlink(&private_key, project.join("gradlew")).unwrap();
+
+        let mut executable = SandboxProfile::for_ecosystem(Ecosystem::Java, &home, &project);
+        apply_standard_profile(
+            &mut executable,
+            &["./gradlew".to_owned(), "build".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap();
+        let error = resolve_standard_path_aliases(&mut executable, &home, &project).unwrap_err();
+        assert!(error.to_string().contains("built-in executable"));
+        assert!(error.to_string().contains("gradlew"));
+        assert!(error.to_string().contains("id_rsa"));
+
+        let read_alias = home.join("read-alias");
+        std::os::unix::fs::symlink(&ssh, &read_alias).unwrap();
+        let mut readable = SandboxProfile::for_ecosystem(Ecosystem::Java, &home, &project);
+        readable.allow_read = vec![SandboxPath::dir(read_alias)];
+        readable.first_user_allow_read = 1;
+        let error = snapshot_standard_read_aliases(&mut readable).unwrap_err();
+        assert!(error.to_string().contains("built-in readable"));
+        assert!(error.to_string().contains(".ssh"));
     }
 
     #[test]

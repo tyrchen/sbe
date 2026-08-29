@@ -350,6 +350,11 @@ reopens a mutable lexical link after its referent was approved. On Linux it
 opens the canonical final object with descriptor-relative kernel resolution,
 rejects magic links, validates the opened object's type and boundary, and
 installs the Landlock rule from that file descriptor.
+Before retaining a canonical built-in read or execute alias, SBE compares its
+referent with every protected read denial. This check includes project-local
+wrapper entries such as `gradlew` and `mvnw`, because Landlock execute authority
+also permits reading the executable inode. A built-in alias never overrides a
+protected read denial.
 When the final writable object is missing, policy resolution walks to the
 nearest existing ancestor, canonicalizes that ancestor, appends the unresolved
 suffix, and validates the reconstructed target against the same writable
