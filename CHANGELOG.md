@@ -35,8 +35,9 @@ All notable changes to this project will be documented in this file. See [conven
   W^X, hard-link validation, exact workspace outputs, ambient local-service
   denial, and fail-closed Linux network capability checks.
 - Keep standard-mode symlink referents subject to protected-path denials and
-  filter high-confidence API-key and cloud-credential environment variables,
-  including bare names such as `TOKEN`, `API_KEY`, and `PASSWORD`.
+  filter high-confidence API-key, cloud, and database credential environment
+  variables, including bare or standardized names such as `TOKEN`, `API_KEY`,
+  `PASSWORD`, `PGPASSWORD`, and `MYSQL_PWD`.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23

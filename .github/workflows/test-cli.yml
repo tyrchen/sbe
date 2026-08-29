@@ -121,6 +121,16 @@ jobs:
           echo "got: $out"
           test "$out" = "hello from sbe"
 
+      - name: project relocation fails early in standard mode
+        run: |
+          set -euo pipefail
+          if sbe run --profile node -- npm --prefix "$RUNNER_TEMP/other-project" prefix \
+              >relocation.out 2>&1; then
+            echo "::error::standard mode accepted a project outside its policy root"
+            exit 1
+          fi
+          grep -q "project relocation option" relocation.out
+
       - name: standard reads source symlinks into sibling workspaces
         run: |
           set -euo pipefail

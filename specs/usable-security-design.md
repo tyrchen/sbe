@@ -259,6 +259,11 @@ Built-in profiles should remain small declarations of roots, domains, reserved
 environment names, and optional local IPC needs. They must not contain a second
 grammar for every supported package manager.
 
+Project-relocation options do not silently retarget an already resolved policy.
+Until configuration discovery and every grant are rooted at the requested
+project, both modes reject the option early and tell the user to change
+directory before invoking SBE.
+
 ### 6.2 Strict authority envelope
 
 Strict mode does not infer fine-grained output authority from arbitrary command

@@ -67,9 +67,7 @@ pub async fn execute(args: &RunArgs) -> ExitCode {
 async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
     let pwd = std::env::current_dir().context("failed to get current directory")?;
     let home = dirs::home_dir().context("could not determine home directory")?;
-    if args.strict {
-        reject_project_relocation(&args.command)?;
-    }
+    reject_project_relocation(&args.command)?;
 
     // Determine ecosystem
     let command_name = &args.command[0];
@@ -594,13 +592,20 @@ fn is_sensitive_environment_name(name: &str) -> bool {
         "AZURE_CLIENT_SECRET",
         "CREDENTIAL",
         "CREDENTIALS",
+        "DATABASE_URL",
         "DOCKER_AUTH_CONFIG",
         "GPG_AGENT_INFO",
         "GOOGLE_APPLICATION_CREDENTIALS",
         "KUBECONFIG",
+        "MONGODB_URI",
+        "MONGO_URL",
+        "MYSQL_PWD",
         "PASSWORD",
         "PASSWD",
+        "PGPASSFILE",
+        "PGPASSWORD",
         "PRIVATE_KEY",
+        "REDISCLI_AUTH",
         "SECRET",
         "SSH_AGENT_PID",
         "SSH_AUTH_SOCK",
@@ -632,6 +637,8 @@ fn is_sensitive_environment_name(name: &str) -> bool {
             "_PRIVATE_KEY",
             "_CREDENTIAL",
             "_CREDENTIALS",
+            "_DATABASE_URL",
+            "_DATABASE_URI",
         ]
         .iter()
         .any(|suffix| upper.ends_with(suffix))
@@ -2353,6 +2360,13 @@ mod tests {
                 ("PRIVATE_KEY".to_owned(), "sentinel".to_owned()),
                 ("CREDENTIAL".to_owned(), "sentinel".to_owned()),
                 ("CREDENTIALS".to_owned(), "sentinel".to_owned()),
+                ("DATABASE_URL".to_owned(), "sentinel".to_owned()),
+                ("TEST_DATABASE_URL".to_owned(), "sentinel".to_owned()),
+                ("PGPASSWORD".to_owned(), "sentinel".to_owned()),
+                ("PGPASSFILE".to_owned(), "sentinel".to_owned()),
+                ("MYSQL_PWD".to_owned(), "sentinel".to_owned()),
+                ("REDISCLI_AUTH".to_owned(), "sentinel".to_owned()),
+                ("MONGODB_URI".to_owned(), "sentinel".to_owned()),
                 (
                     "GOOGLE_APPLICATION_CREDENTIALS".to_owned(),
                     "/tmp/google-credentials.json".to_owned(),
