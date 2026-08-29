@@ -216,6 +216,8 @@ simple project `.npmrc` `cache=path`, user `~/.npmrc`, and the default `~/.npm`.
 `--userconfig` or an explicitly restored user-config locator selects that user
 layer. The effective existing user configuration receives an exact read grant
 so npm can consume registry and other settings without exposing its directory.
+An explicitly restored or command-selected global configuration likewise
+receives only an exact file grant.
 For pnpm, `--store-dir`, its configuration environment, project `.npmrc`, and
 user `.npmrc` similarly select the store. Relative paths are anchored to the
 selected project. Without a store override, `PNPM_HOME/store` precedes the XDG
@@ -230,9 +232,11 @@ receives an exact read grant. The XDG or conventional platform cache is the
 final fallback, and the effective cache replaces only that tool's default
 writable grant. Without overrides, macOS uses `~/Library/Caches/{pip,uv}` and
 Linux uses the XDG cache home.
-Poetry similarly follows command `--cache-dir`, `POETRY_CACHE_DIR`, then
-`XDG_CACHE_HOME`; the selected `pypoetry` cache replaces both conventional
-macOS-compatible cache grants.
+Poetry similarly follows command `--cache-dir`, `POETRY_CACHE_DIR`, project
+`poetry.toml`, global `config.toml`, then `XDG_CACHE_HOME`. Its effective global
+configuration receives an exact read grant, while an external project-selected
+cache requires `--allow-write`. The selected `pypoetry` cache replaces both
+conventional macOS-compatible cache grants.
 An external Cargo target can be selected with an inherited `CARGO_TARGET_DIR`
 or a direct `--config build.target-dir='path'` override, or granted explicitly
 with matching `--allow-write` and `--allow-exec` paths. Cargo `--config` file

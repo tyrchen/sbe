@@ -144,6 +144,8 @@ All notable changes to this project will be documented in this file. See [conven
   the sandboxed tools consume the same settings used during policy preparation.
 - Follow Poetry's command, `POETRY_CACHE_DIR`, and XDG cache selection while
   removing stale conventional Poetry cache grants.
+- Filter npm global-config and Poetry config-directory locators, honor Poetry's
+  global/project configured cache, and grant Gradle's selected project cache.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23

@@ -242,7 +242,9 @@ project `.npmrc` `cache=path`, user `~/.npmrc`, then the default `~/.npm`.
 An npm `--userconfig` or explicitly restored user-config locator selects the
 user layer. The effective existing user configuration receives an exact read
 grant so the child npm, npx, or pnpm process sees the same configuration SBE
-used without opening the containing directory.
+used without opening the containing directory. An explicitly restored or
+command-selected global configuration likewise receives only an exact file
+grant.
 pnpm's `--store-dir`, configuration environment, project `.npmrc`, and user
 `.npmrc` select its store in the same manner. The effective cache/store replaces
 the corresponding default writable grant; relative paths are anchored to the
@@ -260,18 +262,22 @@ conventional cache are the final fallback. The selected cache replaces only
 that tool's default grant; a repository-selected uv cache outside the workspace
 requires `--allow-write`. Conventional macOS caches live beneath
 `~/Library/Caches`; Linux follows XDG conventions.
-Poetry follows command `--cache-dir`, `POETRY_CACHE_DIR`, then
-`XDG_CACHE_HOME`; its selected `pypoetry` cache replaces the conventional
-writable grants, including both historical macOS-compatible locations.
+Poetry follows command `--cache-dir`, `POETRY_CACHE_DIR`, project
+`poetry.toml`, global `config.toml`, then `XDG_CACHE_HOME`. The effective global
+configuration receives an exact file read grant. A project-selected external
+cache requires `--allow-write`; the selected `pypoetry` cache replaces the
+conventional writable grants, including both historical macOS-compatible
+locations.
 
 For Gradle commands, the conventional cache grant follows Gradle's effective
 user home: `--gradle-user-home`, every accepted `-g` form including `-g/path`,
 inherited `GRADLE_USER_HOME`, then `~/.gradle`. Relative selections are anchored
-to the command's project. Only runtime subdirectories such as `.tmp`, caches,
-wrapper distributions, daemons, and toolchains are writable; the user-home root
-and `init.d` remain immutable. The effective user-home root is readable so
-Gradle can load root-level properties, initialization scripts, and wrapper
-metadata without making those persistence-capable files writable.
+to the command's project. A direct `--project-cache-dir` receives its selected
+directory as writable authority. Only runtime subdirectories such as `.tmp`,
+caches, wrapper distributions, daemons, and toolchains are writable beneath the
+user home; its root and `init.d` remain immutable. The effective user-home root
+is readable so Gradle can load root-level properties, initialization scripts,
+and wrapper metadata without making those persistence-capable files writable.
 
 For Maven commands, `-D`/`--define maven.repo.local=path` on the actual command
 selects the writable local repository, followed in precedence by `MAVEN_ARGS`,
@@ -492,12 +498,14 @@ feature switches, terminal settings, and tool paths. It removes:
   by `GNUPGHOME`; Cargo credential files beneath the effective `CARGO_HOME` and
   GitHub CLI credentials beneath an inherited `XDG_CONFIG_HOME` receive
   matching path denials rather than withholding those ordinary configuration
-  locators; npm user-config files selected by `NPM_CONFIG_USERCONFIG` are
-  withheld because they commonly contain registry authentication tokens, as
-  are Kerberos ticket-cache/keytab locators `KRB5CCNAME`, `KRB5_KTNAME`, and
+  locators; npm user/global config files selected by
+  `NPM_CONFIG_USERCONFIG`/`NPM_CONFIG_GLOBALCONFIG` are withheld because they
+  commonly contain registry authentication tokens, as are Kerberos
+  ticket-cache/keytab locators `KRB5CCNAME`, `KRB5_KTNAME`, and
   `KRB5_CLIENT_KTNAME`, plus the custom netrc locator `NETRC`;
 - Python package configuration locators `PIP_CONFIG_FILE` and
-  `UV_CONFIG_FILE`, because those files can contain authenticated indexes;
+  `UV_CONFIG_FILE`, and Poetry's `POETRY_CONFIG_DIR`, because those files or
+  directories can contain authenticated indexes;
 - agent and credential socket variables;
 - dynamic-loader injection variables; and
 - SBE-reserved proxy, runtime, and policy variables.

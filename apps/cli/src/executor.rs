@@ -653,12 +653,14 @@ fn is_sensitive_environment_name(name: &str) -> bool {
         "MONGO_URL",
         "MYSQL_PWD",
         "NETRC",
+        "NPM_CONFIG_GLOBALCONFIG",
         "NPM_CONFIG_USERCONFIG",
         "PASSWORD",
         "PASSWD",
         "PGPASSFILE",
         "PGPASSWORD",
         "PIP_CONFIG_FILE",
+        "POETRY_CONFIG_DIR",
         "PRIVATE_KEY",
         "REDISCLI_AUTH",
         "SECRET",
@@ -787,6 +789,13 @@ fn apply_standard_profile(
                 SandboxPath::file(user_config.path),
             );
         }
+        if let Some(global_config) = effective_npm_global_config(profile, command, project_dir)? {
+            insert_builtin_path_grant(
+                profile,
+                GrantKind::AllowRead,
+                SandboxPath::file(global_config),
+            );
+        }
     }
     if let Some(pnpm_store) = effective_pnpm_store(profile, command, home, project_dir)? {
         let conventional = home.join(".local/share/pnpm");
@@ -817,6 +826,11 @@ fn apply_standard_profile(
     }
     if profile.name == "python" && command_uses_pip(command) {
         for config in effective_pip_config_read_paths(profile, home, project_dir)? {
+            insert_builtin_path_grant(profile, GrantKind::AllowRead, SandboxPath::file(config));
+        }
+    }
+    if profile.name == "python" && command_is(command, "poetry") {
+        for config in effective_poetry_config_read_paths(profile, home, project_dir)? {
             insert_builtin_path_grant(profile, GrantKind::AllowRead, SandboxPath::file(config));
         }
     }
@@ -881,6 +895,15 @@ fn apply_standard_profile(
                 );
                 insert_builtin_path_grant(profile, GrantKind::AllowExec, SandboxPath::dir(path));
             }
+        }
+        if (command_is(command, "gradle") || command_is(command, "gradlew"))
+            && let Some(project_cache) = command_long_path_option(command, "--project-cache-dir")?
+        {
+            insert_builtin_path_grant(
+                profile,
+                GrantKind::AllowWrite,
+                SandboxPath::dir(anchor_project_path(project_cache, project_dir)),
+            );
         }
     }
 
@@ -1109,6 +1132,20 @@ fn effective_npm_user_config(
     })
 }
 
+fn effective_npm_global_config(
+    profile: &SandboxProfile,
+    command: &[String],
+    project_dir: &Path,
+) -> anyhow::Result<Option<PathBuf>> {
+    let selected = command_long_path_option(command, "--globalconfig")?.or_else(|| {
+        profile
+            .env
+            .get("NPM_CONFIG_GLOBALCONFIG")
+            .map(PathBuf::from)
+    });
+    Ok(selected.map(|path| anchor_project_path(path, project_dir)))
+}
+
 fn user_npm_config_path(
     selection: &NpmUserConfigSelection,
     home: &Path,
@@ -1308,12 +1345,19 @@ fn effective_python_cache(
     } else {
         None
     };
-    let config_cache =
-        if command_cache.is_none() && environment_cache.is_none() && default_name == "pip" {
-            effective_pip_config_cache(profile, home, project_dir)?
-        } else {
-            None
-        };
+    let (config_cache, config_project_controlled) = if command_cache.is_none()
+        && environment_cache.is_none()
+        && default_name == "pip"
+    {
+        (
+            effective_pip_config_cache(profile, home, project_dir)?,
+            false,
+        )
+    } else if command_cache.is_none() && environment_cache.is_none() && default_name == "pypoetry" {
+        effective_poetry_config_cache(profile, home, project_dir)?
+    } else {
+        (None, false)
+    };
     let project_cache = if command_cache.is_none()
         && environment_cache.is_none()
         && config_cache.is_none()
@@ -1323,7 +1367,7 @@ fn effective_python_cache(
     } else {
         None
     };
-    let project_controlled = project_cache.is_some();
+    let project_controlled = config_project_controlled || project_cache.is_some();
     let conventional = conventional_python_caches(home, default_name);
     let default_cache = effective_environment_path(profile, "XDG_CACHE_HOME")
         .map(|directory| directory.join(default_name))
@@ -1465,6 +1509,66 @@ fn effective_pip_config_cache(
         selected = Some(cache);
     }
     Ok(selected)
+}
+
+fn effective_poetry_config_cache(
+    profile: &SandboxProfile,
+    home: &Path,
+    project_dir: &Path,
+) -> anyhow::Result<(Option<PathBuf>, bool)> {
+    let global = effective_poetry_config_file(profile, home, project_dir);
+    let mut selected = read_poetry_config_cache(&global, home)?;
+    let local = project_dir.join("poetry.toml");
+    if let Some(cache) = read_bounded_project_file(&local)?
+        .map(|contents| {
+            npm_config_path_value(&contents, &local, home, "cache-dir", "project poetry.toml")
+        })
+        .transpose()?
+        .flatten()
+    {
+        selected = Some(cache);
+        return Ok((selected, true));
+    }
+    Ok((selected, false))
+}
+
+fn read_poetry_config_cache(path: &Path, home: &Path) -> anyhow::Result<Option<PathBuf>> {
+    let Some(contents) = read_bounded_following_metadata_file(path)? else {
+        return Ok(None);
+    };
+    npm_config_path_value(&contents, path, home, "cache-dir", "Poetry configuration")
+}
+
+fn effective_poetry_config_file(
+    profile: &SandboxProfile,
+    home: &Path,
+    project_dir: &Path,
+) -> PathBuf {
+    let directory = profile
+        .env
+        .get("POETRY_CONFIG_DIR")
+        .map(PathBuf::from)
+        .map(|path| anchor_project_path(path, project_dir))
+        .unwrap_or_else(|| {
+            effective_environment_path(profile, "XDG_CONFIG_HOME")
+                .map(|path| anchor_project_path(path, project_dir))
+                .unwrap_or_else(|| platform_config_home(home))
+                .join("pypoetry")
+        });
+    directory.join("config.toml")
+}
+
+fn effective_poetry_config_read_paths(
+    profile: &SandboxProfile,
+    home: &Path,
+    project_dir: &Path,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let config = effective_poetry_config_file(profile, home, project_dir);
+    if read_bounded_following_metadata_file(&config)?.is_some() {
+        Ok(vec![config])
+    } else {
+        Ok(Vec::new())
+    }
 }
 
 fn effective_pip_config_read_paths(
@@ -4685,6 +4789,10 @@ mod tests {
                 ("SYSTEM_ACCESSTOKEN".to_owned(), "sentinel".to_owned()),
                 ("NPM_TOKEN".to_owned(), "sentinel".to_owned()),
                 (
+                    "NPM_CONFIG_GLOBALCONFIG".to_owned(),
+                    "/tmp/global-npmrc".to_owned(),
+                ),
+                (
                     "NPM_CONFIG_USERCONFIG".to_owned(),
                     "/tmp/custom-npmrc".to_owned(),
                 ),
@@ -4692,6 +4800,10 @@ mod tests {
                 (
                     "PIP_CONFIG_FILE".to_owned(),
                     "/tmp/custom-pip.conf".to_owned(),
+                ),
+                (
+                    "POETRY_CONFIG_DIR".to_owned(),
+                    "/tmp/custom-poetry".to_owned(),
                 ),
                 (
                     "UV_CONFIG_FILE".to_owned(),
@@ -5126,6 +5238,73 @@ mod tests {
                 .contains(&SandboxPath::dir(poetry_xdg_home.join("pypoetry")))
         );
 
+        let poetry_config_dir = root.path().join("poetry-config");
+        let poetry_config_cache = root.path().join("poetry-config-cache");
+        std::fs::create_dir_all(&poetry_config_dir).unwrap();
+        std::fs::write(
+            poetry_config_dir.join("config.toml"),
+            format!("cache-dir = '{}'\n", poetry_config_cache.display()),
+        )
+        .unwrap();
+        let mut poetry_config = SandboxProfile::for_ecosystem(Ecosystem::Python, &home, &project);
+        poetry_config.env.insert(
+            "POETRY_CONFIG_DIR".to_owned(),
+            poetry_config_dir.to_string_lossy().into_owned(),
+        );
+        apply_standard_profile(
+            &mut poetry_config,
+            &["poetry".to_owned(), "install".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap();
+        assert!(
+            poetry_config
+                .allow_write
+                .contains(&SandboxPath::dir(poetry_config_cache))
+        );
+        assert!(
+            poetry_config
+                .allow_read
+                .contains(&SandboxPath::file(poetry_config_dir.join("config.toml")))
+        );
+
+        let project_poetry_cache = root.path().join("project-poetry-cache");
+        std::fs::create_dir_all(&project_poetry_cache).unwrap();
+        std::fs::write(
+            project.join("poetry.toml"),
+            format!("cache-dir = '{}'\n", project_poetry_cache.display()),
+        )
+        .unwrap();
+        let mut poetry_project_unapproved =
+            SandboxProfile::for_ecosystem(Ecosystem::Python, &home, &project);
+        let error = apply_standard_profile(
+            &mut poetry_project_unapproved,
+            &["poetry".to_owned(), "install".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("--allow-write"));
+
+        let mut poetry_project_approved =
+            SandboxProfile::for_ecosystem(Ecosystem::Python, &home, &project);
+        poetry_project_approved
+            .allow_write
+            .push(SandboxPath::dir(project_poetry_cache.clone()));
+        apply_standard_profile(
+            &mut poetry_project_approved,
+            &["poetry".to_owned(), "install".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap();
+        assert!(
+            poetry_project_approved
+                .allow_write
+                .contains(&SandboxPath::dir(project_poetry_cache))
+        );
+
         let uv_environment_cache = root.path().join("uv-environment-cache");
         let mut uv_environment = SandboxProfile::for_ecosystem(Ecosystem::Python, &home, &project);
         uv_environment.env.insert(
@@ -5403,6 +5582,26 @@ mod tests {
         }
         assert!(cli.allow_read.contains(&SandboxPath::dir(cli_home.clone())));
         assert!(!cli.allow_write.contains(&SandboxPath::dir(cli_home)));
+
+        let project_cache = root.path().join("gradle-project-cache");
+        let mut project_cache_selected =
+            SandboxProfile::for_ecosystem(Ecosystem::Java, &home, &project);
+        apply_standard_profile(
+            &mut project_cache_selected,
+            &[
+                "./gradlew".to_owned(),
+                "build".to_owned(),
+                format!("--project-cache-dir={}", project_cache.display()),
+            ],
+            &home,
+            &project,
+        )
+        .unwrap();
+        assert!(
+            project_cache_selected
+                .allow_write
+                .contains(&SandboxPath::dir(project_cache))
+        );
 
         let attached_home = root.path().join("attached-gradle");
         let mut attached = SandboxProfile::for_ecosystem(Ecosystem::Java, &home, &project);
@@ -7546,6 +7745,27 @@ mod tests {
             command_userconfig_selected
                 .allow_read
                 .contains(&SandboxPath::file(command_userconfig))
+        );
+
+        let global_config = root.path().join("global-npmrc");
+        std::fs::write(&global_config, "registry=https://registry.npmjs.org/\n").unwrap();
+        let mut global_config_selected =
+            SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &project);
+        global_config_selected.env.insert(
+            "NPM_CONFIG_GLOBALCONFIG".to_owned(),
+            global_config.to_string_lossy().into_owned(),
+        );
+        apply_standard_profile(
+            &mut global_config_selected,
+            &["npm".to_owned(), "install".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap();
+        assert!(
+            global_config_selected
+                .allow_read
+                .contains(&SandboxPath::file(global_config))
         );
 
         let pnpm_home = root.path().join("custom-pnpm-home");
