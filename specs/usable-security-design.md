@@ -420,6 +420,13 @@ injected proxy settings, but capability output labels external egress
 `bestEffort`. SBE keeps the filesystem, environment, descriptor, privilege,
 and proxy defenses instead of refusing the entire command.
 
+On Landlock ABI v9 and newer, filesystem-backed Unix-socket resolution remains
+mediated independently of TCP policy. Standard mode grants it only beneath the
+private per-run root used by cooperating build processes; capability brokers
+such as `/var/run/docker.sock` remain outside the envelope. Older kernels
+cannot enforce pathname socket mediation and must report it unavailable rather
+than imply that unrestricted TCP also authorizes ambient filesystem sockets.
+
 Strict Linux domain egress remains unavailable until a destination-aware
 backend exists. This limitation is a capability result, not a command-line
 option named “insecure” that every Linux user must routinely paste.

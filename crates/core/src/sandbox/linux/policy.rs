@@ -85,7 +85,7 @@ pub fn render(
     if probe.abi.supports_ioctl_dev() {
         let _ = writeln!(out, "      - ioctlDev");
     }
-    if probe.abi.supports_unix_path_filter() && effective_network != NetworkMode::AllowAll {
+    if probe.abi.supports_unix_path_filter() {
         let _ = writeln!(out, "      - resolveUnix");
     }
     if features.net_port_filter && effective_network != NetworkMode::AllowAll {
@@ -105,10 +105,20 @@ pub fn render(
 
     let _ = writeln!(out, "  pathBeneath:");
     for sp in &profile.allow_write {
+        let access = if probe.abi.supports_unix_path_filter()
+            && profile
+                .ephemeral_write_exec
+                .iter()
+                .any(|root| sp.path.starts_with(root))
+        {
+            "writeAllowlist+resolveUnix"
+        } else {
+            "writeAllowlist"
+        };
         let _ = writeln!(
             out,
-            "    - path: {}\n      access: writeAllowlist",
-            yaml_string(&sp.path.to_string_lossy())
+            "    - path: {}\n      access: {access}",
+            yaml_string(&sp.path.to_string_lossy()),
         );
     }
     for sp in &profile.allow_exec {
@@ -311,7 +321,7 @@ mod tests {
         let fs = handled["fs"].as_sequence().expect("filesystem rights");
 
         assert!(handled["net"].is_null());
-        assert!(!fs.iter().any(|right| right.as_str() == Some("resolveUnix")));
+        assert!(fs.iter().any(|right| right.as_str() == Some("resolveUnix")));
         let scoped = value["landlock"]["scoped"]
             .as_sequence()
             .expect("signal scope remains active");

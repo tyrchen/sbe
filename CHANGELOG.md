@@ -40,6 +40,9 @@ All notable changes to this project will be documented in this file. See [conven
   variables, including bare or standardized names such as `TOKEN`, `API_KEY`,
   `PASSWORD`, `PGPASSWORD`, `MYSQL_PWD`, Terraform `TF_TOKEN_*`, and npm
   `_authToken` forms.
+- On Landlock ABI v9+, mediate filesystem Unix sockets independently of TCP
+  policy and grant resolution only beneath SBE's private per-run root, keeping
+  capability brokers such as `docker.sock` outside the standard envelope.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23

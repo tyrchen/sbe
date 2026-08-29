@@ -207,15 +207,12 @@ fn effective_network_mode(mode: NetworkMode, security_mode: SecurityMode) -> Net
     }
 }
 
-fn handled_fs_access(abi: ABI, mode: NetworkMode) -> BitFlags<AccessFs> {
-    let mut access = AccessFs::from_all(abi);
-    if mode == NetworkMode::AllowAll {
-        // ResolveUnix is classified as a filesystem right by Landlock, but it
-        // is network mediation. Handling it in allow-all mode would still
-        // block ambient sockets outside the private runtime root.
-        access.remove(AccessFs::ResolveUnix);
-    }
-    access
+fn handled_fs_access(abi: ABI) -> BitFlags<AccessFs> {
+    // ResolveUnix is a filesystem capability even when TCP networking is
+    // unrestricted. Keep it handled so AllowAll cannot implicitly expose
+    // capability brokers such as /var/run/docker.sock. Only per-run private
+    // roots receive ResolveUnix through ephemeral_write_access().
+    AccessFs::from_all(abi)
 }
 
 /// A ready-to-apply Landlock ruleset. Built in the single-threaded launcher;
@@ -249,7 +246,7 @@ pub fn compile(
     let effective_network = effective_network_mode(profile.network_mode, security_mode);
     let ruleset = Ruleset::default()
         .set_compatibility(CompatLevel::HardRequirement)
-        .handle_access(handled_fs_access(abi, effective_network))?;
+        .handle_access(handled_fs_access(abi))?;
     // Signals are a process-isolation capability, not a network capability,
     // so keep them scoped even when the user explicitly requests AllowAll
     // networking. Abstract Unix sockets, on the other hand, are deliberately
@@ -1128,9 +1125,8 @@ mod tests {
     }
 
     #[test]
-    fn allow_all_does_not_handle_unix_socket_resolution() {
-        assert!(handled_fs_access(ABI::V9, NetworkMode::Proxy).contains(AccessFs::ResolveUnix));
-        assert!(!handled_fs_access(ABI::V9, NetworkMode::AllowAll).contains(AccessFs::ResolveUnix));
+    fn allow_all_keeps_unix_socket_resolution_mediated() {
+        assert!(handled_fs_access(ABI::V9).contains(AccessFs::ResolveUnix));
     }
 
     #[test]

@@ -32,7 +32,7 @@ or explicitly provisioned high-assurance builds.
 | Ambient file descriptors | `CLOEXEC` before target exec | `close_range(CLOEXEC)` with bounded fallback |
 | Domain-filtered HTTPS | Enforced through the authenticated proxy; standard mode also permits localhost tooling | Best-effort in standard mode; strict domain mode refuses to run |
 | Restricted TCP/UDP | External traffic remains proxy-mediated | Best-effort in standard mode; Landlock/seccomp restrictions under `--strict` |
-| Same-user signals and Unix sockets | Local services allowed in standard mode; narrow under `--strict` | Signals scoped on ABI v6+; local services allowed in standard mode |
+| Same-user signals and Unix sockets | Local services allowed in standard mode; narrow under `--strict` | Signals scoped on ABI v6+; filesystem sockets limited to private roots on ABI v9+ |
 | Persistent W^X | Allowed and tainted in standard mode; validated under `--strict` | Same |
 | Private temporary storage | Per-run root; other shared temp roots denied | Per-run root; other temp paths omitted from Landlock grants |
 | Violation audit stream | Reported unavailable unless a correlatable source exists | Reported unavailable until kernel-domain correlation is verifiable |
@@ -54,7 +54,10 @@ Linux intentionally exposes only curated public procfs nodes such as
 `/proc/self` inode would not follow spawned descendants to their different proc
 inodes and would create a false guarantee. On kernels before Landlock ABI v6,
 same-user signal and abstract Unix-socket isolation is unavailable; pathname
-Unix-socket mediation requires ABI v9.
+Unix-socket mediation requires ABI v9. On ABI v9+, SBE keeps filesystem-backed
+capability brokers such as `docker.sock` outside the standard envelope and
+permits socket resolution only in its private per-run root. Older kernels
+cannot enforce this distinction and report the capability as unavailable.
 
 `--allow-all-network` remains an explicit request to remove network isolation.
 `--no-proxy` selects direct-TCP-443 compatibility mode and is never described
@@ -367,8 +370,9 @@ target itself returning exit code 126.
   unless the insecure compatibility option is supplied; in that case TCP
   confinement is unavailable and SBE says so. Standard mode already reports
   network restriction as best-effort.
-- Path-based Unix-socket mediation depends on newer Landlock ABIs. Local IPC is
-  a separate capability from Internet egress.
+- Path-based Unix-socket mediation depends on Landlock ABI v9. Where available,
+  it remains active even when TCP is unrestricted and grants only SBE's private
+  per-run socket root; older kernels cannot mediate filesystem socket paths.
 - macOS retains an allow-most/read-deny model for compatibility. The curated
   secret paths, Keychain service, shared temp roots, environment, and inherited
   descriptors are protected, but this is not a complete home-directory read
