@@ -85,7 +85,7 @@ pub async fn execute(args: &RunArgs) -> ExitCode {
 async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
     let pwd = std::env::current_dir().context("failed to get current directory")?;
     let home = dirs::home_dir().context("could not determine home directory")?;
-    reject_project_relocation(&args.command)?;
+    reject_project_relocation(&args.command, &pwd)?;
 
     // Determine ecosystem
     let command_name = &args.command[0];
@@ -113,7 +113,7 @@ async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
         });
     }
     profile.finalize();
-    protect_effective_cargo_credentials(&mut profile, &home, &pwd);
+    protect_effective_credential_paths(&mut profile, &home, &pwd);
     if args.strict {
         enable_existing_dependency_execution(&mut profile, &args.command);
     } else {
@@ -641,6 +641,7 @@ fn is_sensitive_environment_name(name: &str) -> bool {
         "DOCKER_CONFIG",
         "GPG_AGENT_INFO",
         "GH_CONFIG_DIR",
+        "GNUPGHOME",
         "GOOGLE_APPLICATION_CREDENTIALS",
         "KUBECONFIG",
         "MONGODB_URI",
@@ -895,7 +896,7 @@ fn effective_environment_path(profile: &SandboxProfile, name: &str) -> Option<Pa
         .or_else(|| std::env::var_os(name).map(PathBuf::from))
 }
 
-fn protect_effective_cargo_credentials(
+fn protect_effective_credential_paths(
     profile: &mut SandboxProfile,
     home: &Path,
     project_dir: &Path,
@@ -909,6 +910,21 @@ fn protect_effective_cargo_credentials(
     };
     for name in ["credentials.toml", "credentials"] {
         insert_builtin_read_denial(profile, SandboxPath::file(cargo_home.join(name)));
+    }
+
+    // Ambient GH_CONFIG_DIR is filtered as a sensitive locator. When it is absent from the
+    // resolved profile, gh falls back to XDG_CONFIG_HOME/gh before ~/.config/gh.
+    if !profile.env.contains_key("GH_CONFIG_DIR") {
+        let github_config = effective_environment_path(profile, "XDG_CONFIG_HOME")
+            .map(|directory| {
+                if directory.is_absolute() {
+                    directory.join("gh")
+                } else {
+                    project_dir.join(directory).join("gh")
+                }
+            })
+            .unwrap_or_else(|| home.join(".config/gh"));
+        insert_builtin_read_denial(profile, SandboxPath::dir(github_config));
     }
 }
 
@@ -1841,8 +1857,33 @@ fn command_is(command: &[String], expected: &str) -> bool {
         .is_some_and(|name| name == expected)
 }
 
-fn reject_project_relocation(command: &[String]) -> anyhow::Result<()> {
+#[allow(
+    clippy::disallowed_methods,
+    reason = "policy preparation resolves Cargo's selected manifest before comparing its workspace"
+)]
+fn reject_project_relocation(command: &[String], project_dir: &Path) -> anyhow::Result<()> {
     let Some(option) = project_relocation_option(command) else {
+        if command_is(command, "cargo")
+            && let Some(manifest) = command_option_value(command, "--manifest-path")
+        {
+            let manifest = PathBuf::from(manifest);
+            let manifest = if manifest.is_absolute() {
+                manifest
+            } else {
+                project_dir.join(manifest)
+            };
+            let project =
+                std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
+            let resolved = resolve_existing_ancestor(&manifest).unwrap_or(manifest);
+            if !resolved.starts_with(&project) {
+                anyhow::bail!(
+                    "Cargo manifest '{}' resolves outside the sandbox workspace '{}'; change \
+                     directory before invoking sbe",
+                    resolved.display(),
+                    project.display()
+                );
+            }
+        }
         return Ok(());
     };
     anyhow::bail!(
@@ -2672,7 +2713,7 @@ fn ensure_literal_write_targets(
 
     use sbe_core::config::PathKind;
 
-    reject_project_relocation(command)?;
+    reject_project_relocation(command, project_dir)?;
     let program = command
         .first()
         .and_then(|program| Path::new(program).file_name())
@@ -3501,6 +3542,7 @@ mod tests {
                     "/tmp/google-credentials.json".to_owned(),
                 ),
                 ("GH_CONFIG_DIR".to_owned(), "/tmp/gh-config".to_owned()),
+                ("GNUPGHOME".to_owned(), "/tmp/gnupg".to_owned()),
             ],
             false,
         );
@@ -3533,7 +3575,11 @@ mod tests {
             .env
             .insert("CARGO_HOME".to_owned(), "custom-cargo".to_owned());
 
-        protect_effective_cargo_credentials(&mut profile, home.path(), project.path());
+        profile
+            .env
+            .insert("XDG_CONFIG_HOME".to_owned(), "custom-config".to_owned());
+
+        protect_effective_credential_paths(&mut profile, home.path(), project.path());
 
         for name in ["credentials.toml", "credentials"] {
             let denied = SandboxPath::file(project.path().join("custom-cargo").join(name));
@@ -3544,6 +3590,11 @@ mod tests {
                     && record.value == denied.path.to_string_lossy()
             }));
         }
+        assert!(
+            profile
+                .deny_read
+                .contains(&SandboxPath::dir(project.path().join("custom-config/gh")))
+        );
     }
 
     #[tokio::test]
@@ -5291,6 +5342,7 @@ mod tests {
 
     #[test]
     fn project_relocation_options_are_rejected_before_policy_preparation() {
+        let project = tempfile::tempdir().unwrap();
         for command in [
             vec!["npm", "--prefix", "subproject", "install"],
             vec!["npm", "install", "--prefix=subproject"],
@@ -5307,27 +5359,61 @@ mod tests {
         ] {
             let command: Vec<String> = command.into_iter().map(str::to_owned).collect();
             assert!(
-                reject_project_relocation(&command).is_err(),
+                reject_project_relocation(&command, project.path()).is_err(),
                 "relocating command was accepted: {command:?}"
             );
         }
         assert!(
-            reject_project_relocation(&[
-                "npm".to_owned(),
-                "install".to_owned(),
-                "--".to_owned(),
-                "--prefix".to_owned(),
-                "payload".to_owned(),
-            ])
+            reject_project_relocation(
+                &[
+                    "npm".to_owned(),
+                    "install".to_owned(),
+                    "--".to_owned(),
+                    "--prefix".to_owned(),
+                    "payload".to_owned(),
+                ],
+                project.path(),
+            )
             .is_ok()
         );
         for flag in ["-fae", "-ff", "-fn"] {
             assert!(
-                reject_project_relocation(&["mvn".to_owned(), flag.to_owned(), "test".to_owned(),])
-                    .is_ok(),
+                reject_project_relocation(
+                    &["mvn".to_owned(), flag.to_owned(), "test".to_owned(),],
+                    project.path(),
+                )
+                .is_ok(),
                 "Maven failure-mode flag was treated as a project path: {flag}"
             );
         }
+
+        let external = tempfile::tempdir().unwrap();
+        assert!(
+            reject_project_relocation(
+                &[
+                    "cargo".to_owned(),
+                    "build".to_owned(),
+                    "--manifest-path".to_owned(),
+                    external.path().join("Cargo.toml").display().to_string(),
+                ],
+                project.path(),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("outside the sandbox workspace")
+        );
+        assert!(
+            reject_project_relocation(
+                &[
+                    "cargo".to_owned(),
+                    "build".to_owned(),
+                    "--manifest-path=apps/cli/Cargo.toml".to_owned(),
+                ],
+                project.path(),
+            )
+            .is_ok(),
+            "in-workspace manifests used by release workflows must remain supported"
+        );
     }
 
     #[test]

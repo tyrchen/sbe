@@ -111,6 +111,9 @@ All notable changes to this project will be documented in this file. See [conven
 - Deny both Cargo credential-file spellings beneath the effective `CARGO_HOME`,
   including custom and relative locations, without removing ordinary Cargo
   configuration from the child environment.
+- Deny GitHub CLI credentials beneath an inherited `XDG_CONFIG_HOME`, filter
+  custom `GNUPGHOME` locators, and reject Cargo manifests that resolve outside
+  the selected workspace while retaining in-workspace `--manifest-path` usage.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23

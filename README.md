@@ -186,8 +186,9 @@ exactly one active Node workspace root. `npm --no-package-lock` and
 `--package-lock=false` never create an empty lockfile. Package-manager options
 that relocate the project
 (`--prefix`, `--cwd`, `--dir`, `--directory`, `--project`, and equivalent short
-forms) are rejected before policy preparation; change directory before running
-SBE instead.
+forms) are rejected before policy preparation. Cargo `--manifest-path` remains
+supported inside the selected workspace but rejects an external manifest;
+change directory before running SBE instead.
 
 Strict Python installation and synchronization commands similarly keep project
 `.venv`/`venv` directories writable but non-executable. Run/test commands,
@@ -281,8 +282,9 @@ canonical private root used for `TMPDIR`, `TMP`, `TEMP`, and
 
 Workspace grants are anchored to the launch directory. Package-manager project
 relocation options such as npm `--prefix`, Cargo `-C`, Gradle `--project-dir`,
-or Maven `--file` fail early with an actionable error in both modes; change
-directory before invoking SBE.
+or Maven `--file`, plus Cargo manifests outside the selected workspace, fail
+early with an actionable error in both modes; change directory before invoking
+SBE.
 
 Standard mode does not hide files inside the selected workspace, including
 `.env*`; dependencies already run with the repository as input, and trying to

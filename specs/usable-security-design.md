@@ -301,7 +301,9 @@ grammar for every supported package manager.
 Project-relocation options do not silently retarget an already resolved policy.
 Until configuration discovery and every grant are rooted at the requested
 project, both modes reject the option early and tell the user to change
-directory before invoking SBE.
+directory before invoking SBE. Cargo `--manifest-path` remains usable when its
+resolved manifest stays inside the selected workspace, including release
+workflow subcrates, but an external manifest receives the same early guidance.
 
 ### 6.2 Strict authority envelope
 
@@ -433,10 +435,12 @@ feature switches, terminal settings, and tool paths. It removes:
   as `AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE`, `CLOUDSDK_CONFIG`,
   `AZURE_CONFIG_DIR`, Azure
   client certificates selected by `AZURE_CLIENT_CERTIFICATE_PATH`, and Docker
-  client TLS key directories selected by `DOCKER_CERT_PATH`, plus custom GitHub
-  CLI credential directories selected by `GH_CONFIG_DIR`; Cargo credential
-  files beneath the effective `CARGO_HOME` receive matching path denials rather
-  than withholding the ordinary Cargo configuration locator;
+  client TLS key directories selected by `DOCKER_CERT_PATH`, custom GitHub CLI
+  credential directories selected by `GH_CONFIG_DIR`, and GnuPG homes selected
+  by `GNUPGHOME`; Cargo credential files beneath the effective `CARGO_HOME` and
+  GitHub CLI credentials beneath an inherited `XDG_CONFIG_HOME` receive
+  matching path denials rather than withholding those ordinary configuration
+  locators;
 - agent and credential socket variables;
 - dynamic-loader injection variables; and
 - SBE-reserved proxy, runtime, and policy variables.
