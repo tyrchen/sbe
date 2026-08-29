@@ -23,7 +23,8 @@ async fn test_should_reject_non_allowed_domain() {
     stream
         .write_all(
             format!(
-                "CONNECT evil.com:443 HTTP/1.1\r\nHost: evil.com\r\nProxy-Authorization: {}\r\n\r\n",
+                "CONNECT evil.com:443 HTTP/1.1\r\nHost: evil.com\r\nProxy-Authorization: \
+                 {}\r\n\r\n",
                 endpoint.authorization_header()
             )
             .as_bytes(),
@@ -105,7 +106,8 @@ async fn test_should_allow_permitted_domain() {
     stream
         .write_all(
             format!(
-                "CONNECT localhost:{upstream_port} HTTP/1.1\r\nHost: localhost\r\nProxy-Authorization: {}\r\n\r\n",
+                "CONNECT localhost:{upstream_port} HTTP/1.1\r\nHost: \
+                 localhost\r\nProxy-Authorization: {}\r\n\r\n",
                 endpoint.authorization_header()
             )
             .as_bytes(),
@@ -236,7 +238,8 @@ async fn test_should_enforce_header_count_limit() {
     stream
         .write_all(
             format!(
-                "CONNECT registry.npmjs.org:443 HTTP/1.1\r\nProxy-Authorization: {}\r\nX-Extra: rejected\r\n\r\n",
+                "CONNECT registry.npmjs.org:443 HTTP/1.1\r\nProxy-Authorization: {}\r\nX-Extra: \
+                 rejected\r\n\r\n",
                 endpoint.authorization_header()
             )
             .as_bytes(),

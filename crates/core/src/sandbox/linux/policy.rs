@@ -7,7 +7,7 @@ use std::fmt::Write;
 
 use crate::{
     profile::{NetworkMode, SandboxProfile},
-    sandbox::{BackendOptions, linux::probe::ProbeResult},
+    sandbox::{BackendOptions, SecurityMode, linux::probe::ProbeResult},
 };
 
 /// Render the live policy view for the given profile + proxy state.
@@ -16,6 +16,7 @@ pub fn render(
     proxy_port: Option<u16>,
     probe: &ProbeResult,
     options: BackendOptions,
+    security_mode: SecurityMode,
 ) -> String {
     let mut out = String::with_capacity(2048);
 
@@ -23,6 +24,15 @@ pub fn render(
     let _ = writeln!(out, "backend: landlock+seccomp");
     let _ = writeln!(out, "kernel: {}", yaml_string(&probe.kernel));
     let _ = writeln!(out, "landlockAbi: {}", probe.abi.as_str());
+    let _ = writeln!(
+        out,
+        "securityMode: {}",
+        if security_mode.is_strict() {
+            "strict"
+        } else {
+            "standard"
+        }
+    );
     let _ = writeln!(out, "legacyAllowDegraded: {}", options.allow_degraded);
     let _ = writeln!(
         out,
@@ -37,6 +47,12 @@ pub fn render(
         profile.network_mode == NetworkMode::Proxy
     );
     let _ = writeln!(out, "strictDomainEgressEnforced: false");
+    let effective_network =
+        if security_mode.is_strict() || profile.network_mode == NetworkMode::DenyAll {
+            profile.network_mode
+        } else {
+            NetworkMode::AllowAll
+        };
 
     // Resolved features
     let features = probe.features();
@@ -69,10 +85,10 @@ pub fn render(
     if probe.abi.supports_ioctl_dev() {
         let _ = writeln!(out, "      - ioctlDev");
     }
-    if probe.abi.supports_unix_path_filter() && profile.network_mode != NetworkMode::AllowAll {
+    if probe.abi.supports_unix_path_filter() {
         let _ = writeln!(out, "      - resolveUnix");
     }
-    if features.net_port_filter && profile.network_mode != NetworkMode::AllowAll {
+    if features.net_port_filter && effective_network != NetworkMode::AllowAll {
         let _ = writeln!(out, "    net:");
         let _ = writeln!(out, "      - connectTcp");
         let _ = writeln!(out, "      - bindTcp");
@@ -80,7 +96,7 @@ pub fn render(
     if probe.abi.supports_scopes() {
         let _ = writeln!(out, "  scoped:");
         let _ = writeln!(out, "    - signal");
-        if profile.network_mode != NetworkMode::AllowAll {
+        if effective_network != NetworkMode::AllowAll {
             let _ = writeln!(out, "    - abstractUnixSocket");
         }
     } else {
@@ -89,10 +105,20 @@ pub fn render(
 
     let _ = writeln!(out, "  pathBeneath:");
     for sp in &profile.allow_write {
+        let access = if probe.abi.supports_unix_path_filter()
+            && profile
+                .ephemeral_write_exec
+                .iter()
+                .any(|root| sp.path.starts_with(root))
+        {
+            "writeAllowlist+resolveUnix"
+        } else {
+            "writeAllowlist"
+        };
         let _ = writeln!(
             out,
-            "    - path: {}\n      access: writeAllowlist",
-            yaml_string(&sp.path.to_string_lossy())
+            "    - path: {}\n      access: {access}",
+            yaml_string(&sp.path.to_string_lossy()),
         );
     }
     for sp in &profile.allow_exec {
@@ -117,9 +143,9 @@ pub fn render(
         let _ = writeln!(out, "    - {}", yaml_string(&sp.path.to_string_lossy()));
     }
 
-    if features.net_port_filter && profile.network_mode != NetworkMode::AllowAll {
+    if features.net_port_filter && effective_network != NetworkMode::AllowAll {
         let _ = writeln!(out, "  netConnectTcp:");
-        match profile.network_mode {
+        match effective_network {
             NetworkMode::Proxy => {
                 if let Some(port) = proxy_port {
                     let _ = writeln!(out, "    - {port}");
@@ -148,8 +174,8 @@ pub fn render(
     for syscall in super::seccomp::ERRNO_LIST {
         let _ = writeln!(out, "        - {syscall}");
     }
-    if profile.network_mode != NetworkMode::AllowAll {
-        match profile.network_mode {
+    if effective_network != NetworkMode::AllowAll {
+        match effective_network {
             NetworkMode::DenyAll => {
                 let _ = writeln!(out, "        - socket(all families)");
             }
@@ -167,7 +193,7 @@ pub fn render(
     }
     if !features.net_port_filter
         && matches!(
-            profile.network_mode,
+            effective_network,
             NetworkMode::Proxy | NetworkMode::DirectHttps443
         )
     {
@@ -211,6 +237,14 @@ mod tests {
         }
     }
 
+    const fn strict_mode() -> SecurityMode {
+        SecurityMode::Strict
+    }
+
+    fn strict_options() -> BackendOptions {
+        BackendOptions::default()
+    }
+
     #[test]
     fn test_should_render_baseline_yaml() {
         let home = PathBuf::from("/home/test");
@@ -220,7 +254,8 @@ mod tests {
             &profile,
             Some(12345),
             &probe(LandlockAbi::V4),
-            BackendOptions::default(),
+            strict_options(),
+            strict_mode(),
         );
 
         assert!(out.starts_with("# sbe linux backend inspection"));
@@ -240,7 +275,8 @@ mod tests {
             &profile,
             Some(12345),
             &probe(LandlockAbi::V3),
-            BackendOptions::default(),
+            strict_options(),
+            strict_mode(),
         );
 
         assert!(!out.contains("netConnectTcp:"));
@@ -256,7 +292,8 @@ mod tests {
             &profile,
             Some(8000),
             &probe(LandlockAbi::V4),
-            BackendOptions::default(),
+            strict_options(),
+            strict_mode(),
         );
 
         let value: serde_yaml::Value = serde_yaml::from_str(&out).expect("policy YAML parses");
@@ -276,14 +313,15 @@ mod tests {
             &profile,
             None,
             &probe(LandlockAbi::V9),
-            BackendOptions::default(),
+            strict_options(),
+            strict_mode(),
         );
         let value: serde_yaml::Value = serde_yaml::from_str(&out).expect("policy YAML parses");
         let handled = &value["landlock"]["handled"];
         let fs = handled["fs"].as_sequence().expect("filesystem rights");
 
         assert!(handled["net"].is_null());
-        assert!(!fs.iter().any(|right| right.as_str() == Some("resolveUnix")));
+        assert!(fs.iter().any(|right| right.as_str() == Some("resolveUnix")));
         let scoped = value["landlock"]["scoped"]
             .as_sequence()
             .expect("signal scope remains active");
@@ -301,7 +339,8 @@ mod tests {
             &profile,
             Some(12345),
             &probe(LandlockAbi::V9),
-            BackendOptions::default(),
+            strict_options(),
+            strict_mode(),
         );
         let value: serde_yaml::Value = serde_yaml::from_str(&out).expect("policy YAML parses");
         let scoped = value["landlock"]["scoped"]
@@ -334,6 +373,7 @@ mod tests {
             Some(12345),
             &probe(LandlockAbi::V5),
             BackendOptions::default(),
+            SecurityMode::Standard,
         );
         let value: serde_yaml::Value = serde_yaml::from_str(&out).expect("policy YAML parses");
 
@@ -357,6 +397,7 @@ mod tests {
             None,
             &probe(LandlockAbi::V3),
             BackendOptions::default(),
+            SecurityMode::Standard,
         );
 
         assert!(!out.contains("netFallback:"));

@@ -62,9 +62,9 @@ jobs:
       - name: Check code format
         run: cargo fmt --all -- --check
       - name: Check the package for errors
-        run: sbe run --allow-insecure-linux-network -- cargo check --all
+        run: sbe run -- cargo check --all
       - name: Lint rust sources
-        run: sbe run --allow-insecure-linux-network -- cargo clippy --all-targets --all-features --tests --benches -- -D warnings
+        run: sbe run -- cargo clippy --all-targets --all-features --tests --benches -- -D warnings
       - name: Execute rust tests
         run: cargo nextest run --all-features
 

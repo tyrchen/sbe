@@ -219,6 +219,7 @@ profiles:
       - "$PWD/Cargo.lock"
       - "~/.cargo/registry/"
       - "~/.cargo/git/"
+      - "~/.cache/sccache/"
       # NOTE: ~/.cargo/bin/ is NOT writable — prevents trojaning cargo binaries
       - "~/.cache/zig/"
     allowDomains:
@@ -232,6 +233,8 @@ profiles:
     allowExec:
       - "~/.cargo/bin/"
       - "~/.rustup/toolchains/"
+      - "/usr/bin/sccache"
+      - "/usr/local/bin/sccache"
 
   python:
     allowWrite:
@@ -337,8 +340,8 @@ profiles:
       - "$PWD/project/target/"
       - "$PWD/project/project/"
       # Scala / sbt
-      # sbt's XDG runtime socket and tool caches are redirected to SBE's
-      # private per-run directory by the launcher environment.
+      # Standard mode grants the ordinary persistent caches at runtime. Strict
+      # mode redirects sbt, Ivy, and Coursier state into SBE's private root.
     allowDomains:
       - "repo1.maven.org"
       - "repo.maven.apache.org"

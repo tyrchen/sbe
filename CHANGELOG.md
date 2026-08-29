@@ -3,6 +3,159 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [sbexec-v0.4.1](https://github.com/tyrchen/sbe/compare/sbexec-v0.4.0..sbexec-v0.4.1) - 2026-08-28
+
+### Usability
+
+- Make the practical `standard` sandbox the default and preserve the 0.4
+  fail-closed boundary behind `--strict`.
+- Let standard builds write the workspace, execute mutable build outputs,
+  inherit non-sensitive build environment variables, and use local developer
+  services while retaining secret-path, descriptor, privilege, and proxy
+  protections.
+- Treat the selected workspace as readable input in standard mode, including
+  `.env*`, so Linux can support general file creation without reimplementing
+  each package manager; strict mode retains project secret-file denials.
+- Keep executable output roots installable before Linux Landlock enforcement.
+- Let standard sbt builds use persistent boot/dependency caches while keeping
+  the global settings/plugin base private and non-persistent.
+- Support globally configured sccache through ordinary executable/cache grants
+  and local IPC; no sccache source or managed adapter is shipped by SBE.
+- Follow pre-existing tool, cache, and source-tree symlinks in standard mode
+  when their referents stay inside the authorized envelope; external writable
+  cache referents require one narrow explicit grant.
+- Allow explicit top-level `cargo install` commands to manage their selected
+  install root instead of reimplementing Cargo's transaction format.
+- Derive Cargo target/install grants from the resolved effective environment,
+  and report external output symlinks with a copyable narrow approval instead
+  of a later opaque `EACCES`.
+- Stop requiring `--allow-insecure-linux-network` for standard Linux builds;
+  inspection and runtime warnings continue to report that domain egress is
+  best-effort on Linux.
+
+### Security
+
+- Keep strict mode behavior for positive environment allowlisting, persistent
+  W^X, hard-link validation, exact workspace outputs, ambient local-service
+  denial, and fail-closed Linux network capability checks.
+- Keep standard-mode symlink referents subject to protected-path denials and
+  filter high-confidence API-key, cloud, and database credential environment
+  variables, including bare or standardized names such as `TOKEN`, `API_KEY`,
+  `PASSWORD`, `PGPASSWORD`, `MYSQL_PWD`, Terraform `TF_TOKEN_*`, and npm
+  `_authToken` forms.
+- On Landlock ABI v9+, mediate filesystem Unix sockets independently of TCP
+  policy and grant resolution only beneath SBE's private per-run root, keeping
+  capability brokers such as `docker.sock` outside the standard envelope.
+- Replace validated writable and executable symlink grants with canonical
+  snapshots before launch, so a parallel build cannot retarget the lexical
+  link between policy validation and descriptor opening.
+- Create unresolved Linux output grants through the launcher's descriptor-bound
+  no-symlink walk, filter Azure Pipelines `SYSTEM_ACCESSTOKEN` and OIDC token-file
+  variables, and bound Linux source-symlink discovery by entry and depth budgets
+  without scanning macOS workspaces that do not need referent grants.
+- Preserve explicit execute denials when standard mode infers output grants,
+  filter custom AWS shared-credentials paths, and permit ordinary Unix-domain
+  build-service IPC in macOS standard mode while keeping strict mode isolated.
+- Grant only mutable runtime subdirectories beneath the effective Gradle user
+  home for standard `gradle`/`gradlew` commands, honoring the command-line
+  option before inherited `GRADLE_USER_HOME` and the conventional `~/.gradle`
+  default while keeping initialization scripts immutable.
+- Keep macOS `DenyAll` authoritative by withholding standard-mode Unix-socket
+  compatibility grants when the effective network policy denies all traffic.
+- Reject Gradle and Maven project-relocation flags early, with the same
+  actionable working-directory guidance used for other package managers.
+- Honor Cargo's explicit `--target-dir` ahead of its environment/config paths
+  and Gradle's `gradle.user.home` command-line system property ahead of its
+  environment/default home when deriving standard-mode grants.
+- Distinguish Maven's `-fae`, `-ff`, and `-fn` failure-mode flags from attached
+  `-f<project>` relocation syntax.
+- Filter ECS container-credential endpoint variables, scope Cargo target grants
+  to Cargo commands, and resolve unambiguous `gradle.user.home` values from
+  inherited `GRADLE_OPTS` while rejecting shell-expanded forms early.
+- Resolve `gradle.user.home` from inherited `JAVA_OPTS` as well, and honor the
+  JVM's last-value-wins behavior for repeated command-line system properties.
+- Filter custom Docker credential-directory locators and inject standard-mode
+  localhost proxy bypasses, including Java `http.nonProxyHosts`, so permitted
+  local developer services do not get rejected by SBE's external proxy.
+- Resolve missing writable descendants through their nearest existing symlink
+  ancestor, validate the reconstructed target, and snapshot it so approved
+  symlinked cache roots also work on cold builds.
+- Filter custom Google Cloud SDK and Azure CLI configuration directories so
+  their credential databases cannot bypass the default secret-path denials.
+- Reject built-in readable or executable symlink aliases whose canonical
+  referents overlap protected paths, preventing project wrappers from turning
+  execute authority into credential reads.
+- Include Gradle's required `.tmp` runtime directory and recognize its attached
+  `-g/path` user-home form when deriving narrow persistent grants.
+- Honor direct Cargo `--config build.target-dir='path'` overrides when no
+  higher-precedence target CLI/environment selection exists, avoid injecting a
+  fallback that masks the config, and reject opaque config-file overrides with
+  actionable `--target-dir` guidance.
+- Filter Docker client TLS-directory locators and derive Maven's writable local
+  repository from the last `-D`/`--define maven.repo.local` property.
+- Resolve Maven repository overrides from `MAVEN_OPTS` and bounded, no-follow
+  project `.mvn/jvm.config` reads, preserving launcher and last-property
+  precedence while rejecting ambiguous option forms.
+- Include `MAVEN_ARGS` and bounded project `.mvn/maven.config` in Maven's local
+  repository precedence, and filter Azure client-certificate path locators.
+- Filter custom GitHub CLI credential directories and grant only Cargo's
+  effective target environment path when both target variables are present.
+- Require explicit approval when repository-controlled Maven config selects a
+  local repository outside the workspace or conventional Maven cache envelope.
+- Filter custom AWS configuration-file locators and inspect direct symlink
+  entries beneath generated dependency roots so warm linked dependencies remain
+  readable without recursively scanning ordinary generated contents.
+- Filter GitLab job JWT variables, honor direct Cargo
+  `--config install.root='path'` overrides, and reject implicit Cargo-config
+  install roots before launch with explicit `--root` guidance.
+- Deny both Cargo credential-file spellings beneath the effective `CARGO_HOME`,
+  including custom and relative locations, without removing ordinary Cargo
+  configuration from the child environment.
+- Deny GitHub CLI credentials beneath an inherited `XDG_CONFIG_HOME`, filter
+  custom `GNUPGHOME` locators, and reject Cargo manifests that resolve outside
+  the selected workspace while retaining in-workspace `--manifest-path` usage.
+- Filter AzureRM client-certificate and OIDC-token file locators, and discover
+  Node monorepo roots in standard mode so parent workspace inputs, lockfiles,
+  and generated dependencies remain usable from a member package.
+- Pre-create missing Node workspace-root lockfiles on Linux, include that root
+  in bounded linked-dependency discovery, and relocate Cargo registry/Git cache
+  grants beneath the effective `CARGO_HOME` while retaining credential denials.
+- Filter npm's custom `NPM_CONFIG_USERCONFIG` credential-file locator while
+  preserving ordinary npm build configuration variables.
+- Filter Kerberos ticket-cache and keytab locators, and derive Maven's local
+  repository from bounded default/selected `settings.xml` reads after all
+  higher-precedence command, environment, and project JVM properties.
+- Merge explicitly selected Maven global settings beneath user settings and
+  honor the effective JVM `user.home` for settings and repository defaults.
+- Follow npm's command/environment cache selection, and grant read-only access
+  to effective Gradle homes and explicitly selected Maven settings.
+- Resolve project `.npmrc` cache paths behind the external-write gate, and
+  require explicit read approval for project-selected external Maven settings.
+- Filter the custom `NETRC` credential locator, resolve npm user-config cache
+  paths, and follow pnpm store selection across command/configuration sources.
+- Filter pip/uv custom configuration locators and replace their conventional
+  cache grants with command/environment-selected cache directories.
+- Honor command-selected npm user configuration, pip user-config cache paths,
+  and platform-native macOS pip/uv cache locations.
+- Follow `PNPM_HOME/store`, require read approval when project Maven JVM config
+  relocates `.m2` outside the workspace, and resolve uv project-configured cache
+  directories behind the external-write gate.
+- Grant exact read access to effective npm and pip user configuration files so
+  the sandboxed tools consume the same settings used during policy preparation.
+- Follow Poetry's command, `POETRY_CACHE_DIR`, and XDG cache selection while
+  removing stale conventional Poetry cache grants.
+- Filter npm global-config and Poetry config-directory locators, honor Poetry's
+  global/project configured cache, and grant Gradle's selected project cache.
+- Accept both npm global-config environment spellings and resolve cache/store
+  paths from the explicitly selected global npmrc after higher-priority layers.
+- Filter Git's environment-backed configuration transports and replace
+  conventional Coursier cache grants with an inherited `COURSIER_CACHE`.
+- Filter credential-bearing pip/uv index URLs and Git global/system
+  configuration locators from ambient standard-mode inheritance.
+- Filter the credential-bearing `UV_INDEX` input and resolve cache directories
+  from explicit, project, and XDG user uv configuration with exact file grants.
+
+---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23
 
 ### Security

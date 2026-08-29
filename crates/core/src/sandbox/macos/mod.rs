@@ -8,13 +8,14 @@ use std::{collections::HashMap, path::Path, process::ExitStatus};
 use crate::{
     error::CoreError,
     profile::SandboxProfile,
-    sandbox::{BackendFeatures, BackendInfo, BackendOptions, SandboxBackend},
+    sandbox::{BackendFeatures, BackendInfo, BackendOptions, SandboxBackend, SecurityMode},
 };
 
 /// macOS backend wrapping `/usr/bin/sandbox-exec`.
 #[derive(Debug)]
 pub struct MacosSandbox {
     info: BackendInfo,
+    security_mode: SecurityMode,
 }
 
 impl MacosSandbox {
@@ -25,7 +26,15 @@ impl MacosSandbox {
 
     /// Constructor variant that takes [`BackendOptions`]; macOS ignores
     /// `allow_degraded` because there is no degraded path on this platform.
-    pub fn new_with_options(_options: BackendOptions) -> Result<Self, CoreError> {
+    pub fn new_with_options(options: BackendOptions) -> Result<Self, CoreError> {
+        Self::new_with_mode(options, SecurityMode::Standard)
+    }
+
+    /// Constructor variant that selects the product-level security contract.
+    pub fn new_with_mode(
+        _options: BackendOptions,
+        security_mode: SecurityMode,
+    ) -> Result<Self, CoreError> {
         if !Path::new("/usr/bin/sandbox-exec").exists() {
             return Err(CoreError::BackendUnavailable {
                 reason: "sandbox-exec not found at /usr/bin/sandbox-exec; this may indicate \
@@ -50,7 +59,10 @@ impl MacosSandbox {
                 audit_stream: false,
             },
         };
-        Ok(Self { info })
+        Ok(Self {
+            info,
+            security_mode,
+        })
     }
 }
 
@@ -68,7 +80,7 @@ impl SandboxBackend for MacosSandbox {
         profile: &SandboxProfile,
         proxy_port: Option<u16>,
     ) -> Result<String, CoreError> {
-        sbpl::generate(profile, proxy_port)
+        sbpl::generate(profile, proxy_port, self.security_mode)
     }
 
     fn run(
@@ -79,7 +91,14 @@ impl SandboxBackend for MacosSandbox {
         extra_env: &HashMap<String, String>,
         pid_tx: Option<tokio::sync::oneshot::Sender<u32>>,
     ) -> impl std::future::Future<Output = Result<ExitStatus, CoreError>> + Send {
-        exec::run_sandboxed(profile, proxy_port, command, extra_env, pid_tx)
+        exec::run_sandboxed(
+            profile,
+            proxy_port,
+            command,
+            extra_env,
+            self.security_mode,
+            pid_tx,
+        )
     }
 }
 

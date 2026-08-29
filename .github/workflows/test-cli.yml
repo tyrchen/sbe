@@ -6,13 +6,14 @@ name: test-cli
 #     profiles / inspect / --dry-run / minimal `run` / capability hygiene.
 #
 #  2. ecosystem (Linux): for each language ecosystem, run a representative
-#     real-world build under `sbe run --allow-insecure-linux-network` against (a) a fresh "happy path"
+#     real-world build under the default standard mode against (a) a fresh "happy path"
 #     project that depends on a real upstream package, and (b) the hostile
-#     fixture in /fixtures/<eco>/ that exercises every attack in
-#     fixtures/ATTACKS.md. The fixture output must contain zero `PWNED:`
-#     lines and at least one `SAFE:` line for every attack ID.
+#     fixture in /fixtures/<eco>/ that exercises host credential, persistence,
+#     privilege, and egress attacks. Workspace `.env` confidentiality is
+#     verified separately under strict mode because standard deliberately
+#     treats workspace files as readable input.
 #
-#  3. network-filter (Linux compatibility mode): explicit proxy-allowlist tests — `curl` to
+#  3. network-filter (Linux best-effort mode): explicit proxy-allowlist tests — `curl` to
 #     an allowed domain (registry) succeeds; `curl` to an evil domain
 #     gets a non-2xx response. Verifies the two-layer defense.
 #
@@ -34,7 +35,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: never
   # Used by every "verify-fixture-output" step.
-  ATTACK_IDS: "ssh-read aws-read gcloud-read gh-token-read env-read bashrc-write authorized-keys-write sudo-exec pkexec-exec curl-evil"
+  ATTACK_IDS: "ssh-read aws-read gcloud-read gh-token-read bashrc-write authorized-keys-write sudo-exec pkexec-exec curl-evil"
 
 jobs:
   install:
@@ -71,16 +72,17 @@ jobs:
       - name: sbe inspect renders deterministic policy (rust)
         run: |
           set -euo pipefail
-          out=$(sbe inspect -- cargo build 2>/dev/null)
+          out=$(sbe inspect -- cargo build 2>&1)
           test -n "$out"
-          echo "$out" | head -40
+          head -40 <<<"$out"
+          grep -E "^securityMode: standard" <<<"$out" >/dev/null
           if [ "${{ runner.os }}" = "Linux" ]; then
-            echo "$out" | grep -E "^backend: landlock\+seccomp" >/dev/null
-            echo "$out" | grep -E "^landlockAbi: v[0-9]+" >/dev/null
-            echo "$out" | grep -E "^seccomp:" >/dev/null
+            grep -E "^backend: landlock\+seccomp" <<<"$out" >/dev/null
+            grep -E "^landlockAbi: v[0-9]+" <<<"$out" >/dev/null
+            grep -E "^seccomp:" <<<"$out" >/dev/null
           else
-            echo "$out" | grep -E "^\(version 1\)" >/dev/null
-            echo "$out" | grep -E "^\(deny default\)" >/dev/null
+            grep -E "^\(version 1\)" <<<"$out" >/dev/null
+            grep -E "^\(deny default\)" <<<"$out" >/dev/null
           fi
 
       - name: sbe inspect for every ecosystem (smoke)
@@ -108,16 +110,39 @@ jobs:
       - name: dry-run prints policy without spawning the child
         run: |
           set -euo pipefail
-          sbe run --allow-insecure-linux-network --dry-run -- echo hello >/tmp/sbe-dry.out 2>&1 || true
+          sbe run --dry-run -- echo hello >/tmp/sbe-dry.out 2>&1 || true
           test -s /tmp/sbe-dry.out
           head -20 /tmp/sbe-dry.out
 
       - name: real sandbox executes an allowed binary
         run: |
           set -euo pipefail
-          out=$(sbe run --allow-insecure-linux-network --profile rust -- /bin/echo "hello from sbe")
+          out=$(sbe run --profile rust -- /bin/echo "hello from sbe")
           echo "got: $out"
           test "$out" = "hello from sbe"
+
+      - name: project relocation fails early in standard mode
+        run: |
+          set -euo pipefail
+          if sbe run --profile node -- npm --prefix "$RUNNER_TEMP/other-project" prefix \
+              >relocation.out 2>&1; then
+            echo "::error::standard mode accepted a project outside its policy root"
+            exit 1
+          fi
+          grep -q "project relocation option" relocation.out
+
+      - name: standard reads source symlinks into sibling workspaces
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/sbe-source-symlink"
+          rm -rf "$root"
+          mkdir -p "$root/project/src" "$root/shared" "$root/nested"
+          printf 'nested-shared-source\n' >"$root/nested/value.txt"
+          ln -s ../../shared "$root/project/src/shared"
+          ln -s ../nested "$root/shared/nested"
+          cd "$root/project"
+          out=$(sbe run --profile rust -- /bin/cat src/shared/nested/value.txt)
+          test "$out" = nested-shared-source
 
       - name: explicit allow-all-network permits real sockets
         run: |
@@ -152,12 +177,12 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
-          if sbe run --profile rust -- /bin/echo should-not-run >strict.out 2>&1; then
+          if sbe run --strict --profile rust -- /bin/echo should-not-run >strict.out 2>&1; then
             echo "::error::strict Linux proxy mode unexpectedly ran"
             exit 1
           fi
           grep -q "strict-domain-egress" strict.out
-          sbe run --allow-insecure-linux-network --profile rust -- /bin/echo compatibility-ok \
+          sbe run --strict --allow-insecure-linux-network --profile rust -- /bin/echo compatibility-ok \
             2>compatibility.err
           grep -q "WARNING: insecure Linux network compatibility" compatibility.err
 
@@ -243,10 +268,10 @@ jobs:
           mkdir -p "$project"
           printf original >"$project/source.txt"
           cd "$project"
-          sbe run --allow-all-network --profile rust -- /bin/sh -c \
+          sbe run --strict --allow-all-network --profile rust -- /bin/sh -c \
             'printf pwned > source.txt' >/dev/null 2>&1 || true
           test "$(cat source.txt)" = original
-          sbe run --allow-all-network --profile rust -- /bin/sh -c \
+          sbe run --strict --allow-all-network --profile rust -- /bin/sh -c \
             'mkdir -p target && printf output > target/artifact'
           test "$(cat target/artifact)" = output
 
@@ -272,7 +297,7 @@ jobs:
           }
           RS
           cd "$project"
-          sbe run --allow-insecure-linux-network --profile rust \
+          sbe run --strict --allow-insecure-linux-network --profile rust \
             --env RUSTC_WRAPPER= -- cargo build --offline
           test -x target/debug/sbe-build-script-smoke
 
@@ -318,7 +343,7 @@ jobs:
             sleep 0.2
           done
           port=$(head -1 "$RUNNER_TEMP/sbe-local-port")
-          if sbe run --profile rust --allow-exec /usr/bin/curl -- \
+          if sbe run --strict --profile rust --allow-exec /usr/bin/curl -- \
               /usr/bin/curl --noproxy '*' --max-time 2 "http://127.0.0.1:$port/"; then
             echo "::error::proxy-only policy reached unrelated localhost service"
             exit 1
@@ -327,8 +352,8 @@ jobs:
       - name: two ordinary invocations succeed in a row
         run: |
           set -euo pipefail
-          sbe run --allow-insecure-linux-network --profile node -- /bin/echo run-1
-          sbe run --allow-insecure-linux-network --profile node -- /bin/echo run-2
+          sbe run --profile node -- /bin/echo run-1
+          sbe run --profile node -- /bin/echo run-2
 
   # Shared verifier shell. Saved here so all ecosystem jobs use the same logic.
   # Asserts: zero "PWNED:" lines AND a "SAFE:" line for every attack ID.
@@ -412,17 +437,28 @@ jobs:
               println!("{s}");
           }
           RS
-          sbe run --allow-insecure-linux-network -- cargo build --release 2>&1 | tee out.log
+          sbe run -- cargo build --release 2>&1 | tee out.log
           grep -q "Compiling serde" out.log
           ./target/release/real | grep -q '"name":"sbe"'
+          install_root="$RUNNER_TEMP/sbe-explicit-cargo-root"
+          rm -rf "$install_root"
+          sbe run -- cargo install --offline --path . --root "$install_root"
+          "$install_root/bin/real" | grep -q '"name":"sbe"'
 
-      - name: hostile fixture — every attack must be SAFE (10/10)
+      - name: hostile fixture — standard host controls and strict workspace secret
         run: |
           set -euo pipefail
           cd fixtures/rust
           rm -rf target
-          sbe run --allow-insecure-linux-network -- cargo build 2>&1 | tee out.log
+          sbe run -- cargo build 2>&1 | tee out.log
           ${GITHUB_WORKSPACE}/.github/workflows/verify-attacks.sh out.log
+          printf 'strict-workspace-secret\n' >.env
+          rm -rf target
+          sbe run --strict --allow-all-network --env RUSTC_WRAPPER= -- \
+            cargo build --offline 2>&1 | tee strict.out.log
+          ATTACK_IDS=env-read \
+            ${GITHUB_WORKSPACE}/.github/workflows/verify-attacks.sh strict.out.log
+          rm .env
 
   ecosystem-node:
     name: ecosystem / npm
@@ -482,17 +518,17 @@ jobs:
             }
           }
           JSON
-          sbe run --allow-insecure-linux-network -- npm install --install-links --no-audit --no-fund 2>&1 | tee out.log
+          sbe run -- npm install --install-links --no-audit --no-fund 2>&1 | tee out.log
           test -d node_modules/lodash
           test -d node_modules/chalk
-          sbe run --allow-insecure-linux-network -- npm exec --offline -- local-sbe-tool | grep -Fx sbe-local-tool-ok
+          sbe run -- npm exec --offline -- local-sbe-tool | grep -Fx sbe-local-tool-ok
 
-      - name: hostile fixture — every attack must be SAFE (10/10)
+      - name: hostile fixture — standard host controls SAFE (9/9)
         run: |
           set -euo pipefail
           cd fixtures/node
           rm -rf node_modules
-          sbe run --allow-insecure-linux-network -- npm install --no-audit --no-fund 2>&1 | tee out.log || true
+          sbe run -- npm install --no-audit --no-fund 2>&1 | tee out.log || true
           ${GITHUB_WORKSPACE}/.github/workflows/verify-attacks.sh out.log
 
   ecosystem-python:
@@ -535,18 +571,18 @@ jobs:
           cd "$HOME/sbe-uv"
           rm -rf real && mkdir real && cd real
           uv venv .venv
-          sbe run --allow-insecure-linux-network -- uv pip install --python .venv --no-progress requests httpx
+          sbe run -- uv pip install --python .venv --no-progress requests httpx
           test -d .venv/lib
-          sbe run --allow-insecure-linux-network -- .venv/bin/python -c 'import requests; print(requests.__name__)' | grep -Fx requests
+          sbe run -- .venv/bin/python -c 'import requests; print(requests.__name__)' | grep -Fx requests
 
-      - name: hostile fixture — every attack must be SAFE (10/10)
+      - name: hostile fixture — standard host controls SAFE (9/9)
         run: |
           set -euo pipefail
           export UV_CACHE_DIR="$HOME/.cache/uv"
           mkdir -p "$UV_CACHE_DIR"
           cd fixtures/python
           rm -rf dist
-          sbe run --allow-insecure-linux-network -- uv build --no-progress 2>&1 | tee out.log || true
+          sbe run -- uv build --no-progress 2>&1 | tee out.log || true
           ${GITHUB_WORKSPACE}/.github/workflows/verify-attacks.sh out.log
 
   ecosystem-elixir:
@@ -613,15 +649,15 @@ jobs:
           # source-immutable sandbox; dependency compilation remains inside.
           mix deps.get 2>&1 | tee deps.log
           grep -qi "jason" deps.log
-          sbe run --allow-insecure-linux-network -- mix compile 2>&1 | tee compile.log
+          sbe run -- mix compile 2>&1 | tee compile.log
           grep -qE "(Compiled|Generated real)" compile.log
 
-      - name: hostile fixture — every attack must be SAFE (10/10)
+      - name: hostile fixture — standard host controls SAFE (9/9)
         run: |
           set -euo pipefail
           cd fixtures/elixir
           rm -rf _build deps
-          sbe run --allow-insecure-linux-network -- mix compile 2>&1 | tee out.log || true
+          sbe run -- mix compile 2>&1 | tee out.log || true
           ${GITHUB_WORKSPACE}/.github/workflows/verify-attacks.sh out.log
 
   # Java/Scala coverage uses sbt and Maven. Gradle daemon IPC needs separate
@@ -702,7 +738,7 @@ jobs:
               }
           }
           JAVA
-          sbe run --allow-insecure-linux-network -- mvn -q -B compile 2>&1 | tee out.log
+          sbe run -- mvn -q -B compile 2>&1 | tee out.log
           test -f target/classes/com/sbetest/App.class
 
       - name: real-dep happy path — sbt compile a fresh Scala project with cats
@@ -730,7 +766,7 @@ jobs:
               def main(args: Array[String]): Unit = println((1, 2).bimap(_ + 1, _ * 2))
           }
           SCALA
-          sbe run --allow-insecure-linux-network -- sbt -batch compile 2>&1 | tee out.log
+          sbe run -- sbt -batch compile 2>&1 | tee out.log
           grep -qiE "(success|done compiling)" out.log
 
       - name: hostile sbt fixture — cats-effect compile + MUnit test
@@ -739,12 +775,12 @@ jobs:
           cd fixtures/scala
           rm -rf target project/target project/project
           # The build.sbt evaluates on every sbt task and runs the attack
-          # matrix (10 probes, each subprocess capped at 5s via
+          # host-control matrix (9 asserted probes, each subprocess capped at 5s via
           # ProcessBuilder.waitFor). `sbt test` exercises a full compile +
           # MUnit test run for the cats-effect Greeter, so the sandbox
           # actually has work to mediate (dep resolution → ivy2, scalac,
           # MUnit). All 10 attack IDs must come back SAFE.
-          sbe run --allow-insecure-linux-network -- sbt -batch test 2>&1 | tee out.log || true
+          sbe run -- sbt -batch test 2>&1 | tee out.log || true
           ${GITHUB_WORKSPACE}/.github/workflows/verify-attacks.sh out.log
           # Sanity: the MUnit test actually ran.
           grep -qE "GreeterSpec" out.log || {
@@ -772,7 +808,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$HOME/sbe-netfilter" && cd "$HOME/sbe-netfilter"
-          out=$(sbe run --allow-insecure-linux-network --profile rust --allow-fetch registry.npmjs.org -- \
+          out=$(sbe run --profile rust --allow-fetch registry.npmjs.org -- \
                 /usr/bin/curl -sSL --max-time 10 -o /dev/null \
                 -w "%{http_code}" https://registry.npmjs.org/)
           echo "code=$out"
@@ -782,7 +818,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "$HOME/sbe-netfilter"
-          out=$(sbe run --allow-insecure-linux-network --profile rust --allow-fetch registry.npmjs.org -- \
+          out=$(sbe run --profile rust --allow-fetch registry.npmjs.org -- \
                 /usr/bin/curl -sSL --max-time 10 -o /dev/null \
                 -w "%{http_code}" https://evil.example.invalid/ || true)
           echo "code=$out"

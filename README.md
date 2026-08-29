@@ -5,12 +5,11 @@ process, and network policy. SBE supports macOS Seatbelt/SBPL and Linux
 Landlock plus seccomp.
 
 ```bash
-# macOS: strict domain-filtered proxy mode
+# Standard mode: practical containment for everyday builds
 sbe run -- cargo build
 
-# Linux: the current kernel can only enforce the proxy destination port.
-# This explicit compatibility option acknowledges that limitation.
-sbe run --allow-insecure-linux-network -- cargo build
+# Strict mode: retain the fail-closed 0.4 security boundary
+sbe run --strict -- cargo build
 ```
 
 SBE is designed for repositories, dependencies, build scripts, compiler
@@ -19,26 +18,32 @@ SBE executable remain trusted.
 
 ## Security boundary
 
-SBE 0.4 fails closed when a requested guarantee cannot be enforced.
+SBE 0.4.1 defaults to a practical `standard` mode so ordinary build tools,
+compiler wrappers, mutable outputs, and local developer services work without
+broad escape flags. `--strict` retains the fail-closed 0.4 boundary for offline
+or explicitly provisioned high-assurance builds.
 
 | Capability | macOS | Linux |
 |---|---|---|
 | Filesystem writes | SBPL allowlist | Landlock allowlist |
-| Secret-path reads | SBPL deny rules | Descriptor-based read rules with denied descendants carved out |
+| Host credential reads | SBPL deny rules | Descriptor-based read rules with denied descendants carved out |
 | Executable paths | SBPL allow/deny rules | Landlock allowlist; broad privilege-bearing directories are rejected |
-| Ambient environment | Cleared, then rebuilt from a small positive allowlist | Same |
+| Ambient environment | Sensitive/capability variables removed in standard mode; positive allowlist under `--strict` | Same |
 | Ambient file descriptors | `CLOEXEC` before target exec | `close_range(CLOEXEC)` with bounded fallback |
-| Domain-filtered HTTPS | Enforced through the exact authenticated proxy port | Not currently enforceable; strict mode refuses to run |
-| Restricted TCP/UDP | SBPL network policy | Landlock TCP plus seccomp Internet datagram/raw-socket rules |
-| Same-user signals and Unix sockets | SBPL signal/network rules | Landlock ABI v6 signal and abstract-socket scopes; ABI v9 pathname-socket mediation |
-| Persistent W^X | Validated before launch | Validated before launch, including existing symlink aliases |
+| Domain-filtered HTTPS | Enforced through the authenticated proxy; standard mode also permits localhost tooling | Best-effort in standard mode; strict domain mode refuses to run |
+| Restricted TCP/UDP | External traffic remains proxy-mediated | Best-effort in standard mode; Landlock/seccomp restrictions under `--strict` |
+| Same-user signals and Unix sockets | Local services allowed in standard mode; narrow under `--strict` | Signals scoped on ABI v6+; filesystem sockets limited to private roots on ABI v9+ |
+| Persistent W^X | Allowed and tainted in standard mode; validated under `--strict` | Same |
 | Private temporary storage | Per-run root; other shared temp roots denied | Per-run root; other temp paths omitted from Landlock grants |
 | Violation audit stream | Reported unavailable unless a correlatable source exists | Reported unavailable until kernel-domain correlation is verifiable |
 
 Important Linux distinction: Landlock ABI v4 can authorize a destination
 **port**, not a destination IP address. A malicious process that knows the
 proxy's random port can connect to a different host listening on that port.
-SBE therefore does not call this domain confinement. A proxy profile either:
+SBE therefore does not describe Linux standard networking as domain-confined.
+Standard mode keeps the filesystem, environment, descriptor, privilege, and
+proxy protections active and reports the limitation. A strict proxy profile
+either:
 
 - refuses by default; or
 - runs only after `--allow-insecure-linux-network`, with a warning explaining
@@ -49,12 +54,15 @@ Linux intentionally exposes only curated public procfs nodes such as
 `/proc/self` inode would not follow spawned descendants to their different proc
 inodes and would create a false guarantee. On kernels before Landlock ABI v6,
 same-user signal and abstract Unix-socket isolation is unavailable; pathname
-Unix-socket mediation requires ABI v9.
+Unix-socket mediation requires ABI v9. On ABI v9+, SBE keeps filesystem-backed
+capability brokers such as `docker.sock` outside the standard envelope and
+permits socket resolution only in its private per-run root. Older kernels
+cannot enforce this distinction and report the capability as unavailable.
 
 `--allow-all-network` remains an explicit request to remove network isolation.
 `--no-proxy` selects direct-TCP-443 compatibility mode and is never described
 as domain-filtered. On Linux it also permits Internet datagram sockets so libc
-can resolve DNS; use proxy mode when UDP egress must remain blocked.
+can resolve DNS. Only strict proxy mode blocks Internet datagram sockets.
 
 See the [security hardening design](specs/security-hardening-design.md) for the
 threat model, findings, and adversarial verification plan.
@@ -85,7 +93,7 @@ No exact Rust patch version is pinned. CI installs `stable`.
 Release 0.4.0 and newer publishes SHA-256 checksums, an SPDX SBOM, and GitHub
 build-provenance attestations. The composite action verifies both the checksum
 and the attestation before installing the binary. The action defaults to the
-audited `0.4.0` release; pass `version: latest` only when intentionally opting
+audited `0.4.1` release; pass `version: latest` only when intentionally opting
 into automatic release upgrades.
 
 ```yaml
@@ -94,11 +102,11 @@ permissions:
 
 steps:
   - uses: actions/checkout@<full-commit-sha>
-  - uses: tyrchen/sbe@sbexec-v0.4.0
+  - uses: tyrchen/sbe@sbexec-v0.4.1
     with:
-      version: '0.4.0'
+      version: '0.4.1'
   - run: sbe --version
-  - run: sbe run --allow-insecure-linux-network -- cargo build
+  - run: sbe run -- cargo build
 ```
 
 For high-assurance workflows, replace the SBE release tag in `uses:` with the
@@ -106,8 +114,8 @@ full commit SHA belonging to that tag. Supported release targets are
 `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, and
 `aarch64-apple-darwin`.
 
-The action accepts `0.4.0`, `v0.4.0`, or `sbexec-v0.4.0` and reports the
-resolved `sbexec-v0.4.0` tag through its `version` output. Releases older than
+The action accepts `0.4.1`, `v0.4.1`, or `sbexec-v0.4.1` and reports the
+resolved `sbexec-v0.4.1` tag through its `version` output. Releases older than
 0.4.0 are rejected because they do not provide the required checksum and
 provenance artifacts.
 
@@ -118,8 +126,8 @@ provenance artifacts.
 sbe run -- npm install
 sbe run -- cargo build
 
-# Linux proxy compatibility (required for current networked defaults)
-sbe run --allow-insecure-linux-network -- npm install
+# Opt into the high-assurance boundary for an offline build
+sbe run --strict -- cargo build --offline
 
 # Explicit profile
 sbe run --profile python -- uv build
@@ -140,10 +148,10 @@ sbe profiles
 
 ### Environment grants
 
-The child does not inherit the complete parent environment. SBE keeps only a
-small CLI baseline such as `PATH`, `HOME`, locale, terminal, and selected tool
-home variables. Credential variables and agent sockets are absent unless the
-user grants them explicitly:
+Standard mode inherits ordinary build configuration such as `RUSTFLAGS`,
+`CFLAGS`, and feature switches, while removing high-confidence credential,
+OIDC token-file, agent, dynamic-loader, and SBE-reserved variables. Strict mode
+keeps only a small positive baseline. Removed values can be granted explicitly:
 
 ```bash
 sbe run --keep-env MY_REQUIRED_TOKEN -- cargo build
@@ -154,14 +162,15 @@ Proxy, temporary-directory, and SBE-controlled build-output variables are
 reserved and cannot be replaced through configuration or CLI flags. `inspect`
 prints effective variable names and origins, but all values are redacted.
 
-On current stable Cargo, SBE keeps final Rust artifacts in `$PWD/target` while
+Under `--strict`, SBE keeps final Rust artifacts in `$PWD/target` while
 placing intermediate artifacts and executable build scripts in the private
 per-run tree through `CARGO_BUILD_BUILD_DIR`. This preserves persistent W^X
 without discarding the final build output. Commands that execute target
 artifacts—including `cargo test`, `cargo run`, and `cargo nextest`—instead use
 the private executable `CARGO_TARGET_DIR`.
 
-Node dependency installation keeps `node_modules` writable but non-executable.
+In strict mode, Node dependency installation keeps `node_modules` writable but
+non-executable.
 Commands that explicitly run already-installed tools, such as `npm test`,
 `npm exec`, `npx`, and corresponding Yarn/pnpm/Bun forms, switch the built-in
 dependency-tree grant to read/execute and remove its write grant for that
@@ -172,25 +181,84 @@ Classic Yarn and the `node-modules` linker remain lockfile-only. Mutating Bun
 commands receive only their own `bun.lock` output, plus `yarn.lock` when Bun's
 `--yarn` compatibility output is requested. SBE walks bounded, no-follow
 workspace metadata up to the Git boundary, including workspace roots between
-the current directory and repository root, and grants/pre-creates outputs at
-exactly one active Node workspace root. `npm --no-package-lock` and
+the current directory and repository root. Standard mode reads the discovered
+Node workspace root and grants executable generated dependency roots, while
+writes remain scoped to the active root's lockfile and dependency outputs.
+Linux pre-creates a selected missing root lockfile before Landlock enforcement
+and scans root-level linked dependencies with the same bounded symlink walk.
+`npm --no-package-lock` and
 `--package-lock=false` never create an empty lockfile. Package-manager options
 that relocate the project
 (`--prefix`, `--cwd`, `--dir`, `--directory`, `--project`, and equivalent short
-forms) are rejected before policy preparation; change directory before running
-SBE instead.
+forms) are rejected before policy preparation. Cargo `--manifest-path` remains
+supported inside the selected workspace but rejects an external manifest;
+change directory before running SBE instead.
 
-Python installation and synchronization commands similarly keep project
+Strict Python installation and synchronization commands similarly keep project
 `.venv`/`venv` directories writable but non-executable. Run/test commands,
 including `uv run`, `poetry run`, activated entry points, and direct
 `.venv/bin/...` paths, switch those built-in grants to read/execute without
 write. This mode is for an already-installed environment; synchronize it in a
 separate invocation before running tools.
 
+In standard mode the workspace and conventional package caches are writable,
+and expected build/dependency roots are executable. This makes install-then-run
+workflows, sccache, Gradle daemons, virtual environments, and normal incremental
+builds usable in one invocation. Top-level `cargo install` also receives its
+selected install root from `--root`, `CARGO_INSTALL_ROOT`, a direct
+`--config install.root='path'`, or the Cargo-home default; the installed binary
+is not made trustworthy by SBE. An implicit `[install] root` in Cargo config is
+rejected with `--root` guidance instead of failing later inside the sandbox.
+Registry and Git dependency caches follow the effective `CARGO_HOME`; its two
+credential-file spellings remain denied.
+For npm/npx, a command `--cache` selection overrides `NPM_CONFIG_CACHE`, then a
+simple project `.npmrc` `cache=path`, user `~/.npmrc`, an explicitly selected
+global npmrc, and the default `~/.npm`.
+`--userconfig` or an explicitly restored user-config locator selects that user
+layer. The effective existing user configuration receives an exact read grant
+so npm can consume registry and other settings without exposing its directory.
+An explicitly restored or command-selected global configuration likewise
+receives only an exact file grant.
+For pnpm, `--store-dir`, its configuration environment, project `.npmrc`, and
+user `.npmrc`, then an explicitly selected global npmrc similarly select the
+store. Relative paths are anchored to the selected project. Without a store
+override, `PNPM_HOME/store` precedes the XDG and conventional defaults. An
+external project-selected cache/store requires explicit `--allow-write`
+approval.
+For uv and pip, command `--cache-dir` overrides `UV_CACHE_DIR` or
+`PIP_CACHE_DIR`. uv then reads project `uv.toml`, or `[tool.uv]` in
+`pyproject.toml` when no `uv.toml` exists, followed by its XDG user `uv.toml`.
+An explicit `--config-file` or restored `UV_CONFIG_FILE` replaces discovery.
+Selected user/explicit files receive exact read grants; an external
+project-selected cache requires explicit `--allow-write` approval. pip reads
+its legacy/current user configuration for `cache-dir`; each effective existing
+user configuration file receives an exact read grant. The XDG or conventional
+platform cache is the final fallback, and the effective cache replaces only
+that tool's default writable grant. Without overrides, macOS uses
+`~/Library/Caches/{pip,uv}` and Linux uses the XDG cache home.
+Poetry similarly follows command `--cache-dir`, `POETRY_CACHE_DIR`, project
+`poetry.toml`, global `config.toml`, then `XDG_CACHE_HOME`. Its effective global
+configuration receives an exact read grant, while an external project-selected
+cache requires `--allow-write`. The selected `pypoetry` cache replaces both
+conventional macOS-compatible cache grants.
+Java/sbt commands likewise follow an inherited `COURSIER_CACHE`, replacing the
+conventional Coursier cache grants; relative paths are anchored to the selected
+project.
+An external Cargo target can be selected with an inherited `CARGO_TARGET_DIR`
+or a direct `--config build.target-dir='path'` override, or granted explicitly
+with matching `--allow-write` and `--allow-exec` paths. Cargo `--config` file
+paths are rejected because SBE cannot determine their effective target or
+install root without reimplementing Cargo's layered configuration; use
+`--target-dir` or `--root` instead.
+Without an explicit or inherited override, standard mode selects `$PWD/target`
+instead of trying to reproduce Cargo's layered configuration rules.
+
 Persistent outputs and package caches are still attacker-controlled data after
-an untrusted build. W^X prevents direct execution during that invocation; it
-does not make generated binaries, scripts, dynamic libraries, or interpreted
-packages trustworthy. Review or discard them before running them outside SBE.
+an untrusted build. Strict W^X prevents direct execution during that invocation;
+standard mode deliberately allows expected mutable build outputs to execute.
+Neither mode makes generated binaries, scripts, dynamic libraries, or
+interpreted packages trustworthy. Review or discard them before running them
+outside SBE.
 
 Stdin, stdout, and stderr are intentional capabilities. For example,
 `sbe run -- tool < secret.txt` explicitly gives that file's contents to the
@@ -244,28 +312,76 @@ project, explicit-file, CLI, parent-environment, or runtime origin.
 
 ## Filesystem and process policy
 
-Built-in profiles grant specific outputs and lockfiles rather than the entire
-working tree. Source, `.git`, workflow definitions, manifests, and SBE policy
-remain non-writable unless explicitly granted. Shared system temporary roots
-are not writable; every invocation gets a canonical private root used for
-`TMPDIR`, `TMP`, `TEMP`, and `XDG_RUNTIME_DIR`.
+Standard profiles grant the working tree and conventional tool data so package
+managers can evolve without SBE reimplementing their command grammars. Strict
+profiles retain exact output/lockfile grants and source immutability. Shared
+system temporary roots are not granted broadly; every invocation gets a
+canonical private root used for `TMPDIR`, `TMP`, `TEMP`, and
+`XDG_RUNTIME_DIR`.
 
-Persistent write and execute grants may not overlap. The only default W+X
-exception is the private per-run root, which is deleted when the invocation
-finishes. Toolchains such as `~/.rustup` are executable/readable but not
-writable. Mutable caches are readable/writable but not executable. Before
-launch, SBE also rejects a writable regular file unless all of its hard-link
-pathnames are contained in writable roots. This prevents a writable cache
-alias from mutating executable tools, source, workflows, or any other protected
-path. Hard links wholly contained in writable roots remain valid.
+Workspace grants are anchored to the launch directory. Package-manager project
+relocation options such as npm `--prefix`, Cargo `-C`, Gradle `--project-dir`,
+or Maven `--file`, plus Cargo manifests outside the selected workspace, fail
+early with an actionable error in both modes; change directory before invoking
+SBE.
 
-On Linux, paths are opened with descriptor-relative `openat2` resolution using
-`RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and
-`RESOLVE_NO_MAGICLINKS`. Writable directories are created component by
-component with directory FDs. Root-owned immutable distribution symlinks are
-the only symlink exception. Because Landlock authorizes inodes rather than
-pathnames, SBE fails closed if a denied regular file—or a file below a denied
-directory—has multiple hard links.
+Standard mode does not hide files inside the selected workspace, including
+`.env*`; dependencies already run with the repository as input, and trying to
+carve individual project files breaks general output creation on Linux. Keep
+real credentials outside untrusted workspaces or use `--strict`. Host SSH,
+cloud, package-registry, browser, and keychain credential paths remain denied.
+Cargo credential files remain denied beneath the effective `CARGO_HOME`,
+including a custom or relative location.
+
+Standard mode permits expected persistent write/execute overlap and labels the
+result tainted. Strict mode keeps the 0.4 W^X and hard-link checks. Toolchains
+such as `~/.rustup` remain non-writable during ordinary builds in both modes.
+
+On Linux, standard grants follow an existing ordinary symlink to its opened
+referent and install the Landlock rule from that descriptor. Built-in writable
+cache links must resolve within the workspace, a conventional cache namespace,
+or another declared writable root; an external referent fails with a copyable
+`--allow-write` approval. If the final cache or output directory does not exist,
+SBE resolves its nearest existing ancestor and reconstructs the missing suffix
+beneath the approved referent, so symlinked cache roots work on a cold build.
+Before launch SBE discovers source-tree symlinks, including direct linked
+dependency entries beneath generated roots such as `node_modules` and nested
+links in an external source referent, so a link into an ordinary sibling
+checkout is readable without granting the sibling's parent. Generated roots
+receive only a shallow symlink-entry check; their ordinary contents are not
+recursively scanned. Canonical directory identities prevent traversal cycles,
+while entry and depth budgets bound discovery work.
+Magic links and protected referents remain rejected.
+This validation also applies to built-in readable and executable entries such
+as project-local `gradlew` and `mvnw`; a wrapper symlink cannot turn an execute
+grant into read access to a protected credential.
+Strict mode retains no-follow resolution except for immutable system aliases.
+Denied paths include their current canonical target. Strict mode also retains
+hard-link alias rejection; standard mode does not recursively scan historical
+caches before every launch.
+
+For sbt, standard keeps boot, Ivy, and Coursier dependency caches persistent,
+but places the mutable global base in the private per-run directory. This keeps
+`~/.sbt` settings and global-plugin locations from becoming a persistence path.
+Maven command properties, `MAVEN_ARGS`, project `.mvn/maven.config`,
+`MAVEN_OPTS`, and project `.mvn/jvm.config` can select a replacement for the
+default writable local repository. SBE follows Maven's source precedence,
+resolves relative paths from the project, and rejects ambiguous option forms.
+Repository-controlled Maven config can select an external local repository only
+when that target is explicitly approved with `--allow-write`.
+When no property overrides it, SBE also reads a bounded default user
+`~/.m2/settings.xml` or settings selected by command, `MAVEN_ARGS`, or
+`.mvn/maven.config`, and resolves a simple `<localRepository>` value. Ambiguous
+settings values fail early with `-Dmaven.repo.local` guidance. Explicit
+`-gs`/`--global-settings` files provide the fallback when user settings do not
+select a repository. `-Duser.home` in `MAVEN_OPTS` or `.mvn/jvm.config` changes
+both the default user-settings location and Maven's default repository; a
+repository-controlled home or settings selection retains the external-write
+approval gate. Explicit user/global settings files and an alternate effective
+user `.m2` directory receive read-only grants so Maven can consume the same
+configuration SBE inspected. A project-selected external settings file requires
+explicit `--allow-read` approval; actual command and host-environment settings
+selections remain direct user intent.
 
 On macOS, secret read denials include both the configured pathname and its
 canonical target. A symlinked `~/.ssh`, `.aws`, or similar protected directory
@@ -325,14 +441,17 @@ target itself returning exit code 126.
 
 ## Limitations
 
-- Linux has no strict domain-egress backend yet. The explicit port-only mode is
-  bypassable and should be combined with a network namespace, firewall, or
-  trusted CI egress controls when the repository may be malicious.
-- On Linux kernels before Landlock ABI v4, restricted TCP modes refuse unless
-  the same insecure compatibility option is supplied; in that case TCP
-  confinement is unavailable and SBE says so.
-- Path-based Unix-socket mediation depends on newer Landlock ABIs. Local IPC is
-  a separate capability from Internet egress.
+- Linux has no strict domain-egress backend yet. Standard mode permits local
+  developer services and cannot force hostile TCP through the proxy. Use
+  strict offline mode or combine SBE with a network namespace/firewall in
+  hostile CI.
+- On Linux kernels before Landlock ABI v4, strict restricted TCP modes refuse
+  unless the insecure compatibility option is supplied; in that case TCP
+  confinement is unavailable and SBE says so. Standard mode already reports
+  network restriction as best-effort.
+- Path-based Unix-socket mediation depends on Landlock ABI v9. Where available,
+  it remains active even when TCP is unrestricted and grants only SBE's private
+  per-run socket root; older kernels cannot mediate filesystem socket paths.
 - macOS retains an allow-most/read-deny model for compatibility. The curated
   secret paths, Keychain service, shared temp roots, environment, and inherited
   descriptors are protected, but this is not a complete home-directory read
@@ -359,13 +478,15 @@ Run `sbe run --help` and `sbe inspect --help` for the complete current
 reference. Security-relevant options include:
 
 ```text
---allow-insecure-linux-network  Explicit port-only Linux compatibility
+--allow-insecure-linux-network  Strict port-only Linux compatibility
+--strict                        Require the fail-closed 0.4 boundary
 --allow-all-network             Remove network confinement
 --no-proxy                      Direct-TCP-443 compatibility
 --trust-project-config          Let auto-discovered project policy add grants
 --keep-env NAME                 Preserve one parent variable
 --env NAME=VALUE                Add one explicit variable
 --allow-write PATH              Add a writable path
+--allow-read PATH               Add a readable path; secret denials still win
 --deny-read PATH                Add a protected read path
 --allow-exec PATH               Add an executable path
 --allow-fetch DOMAIN            Add downloader execution and proxy destination

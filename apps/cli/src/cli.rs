@@ -31,6 +31,11 @@ pub enum Commands {
 /// Arguments shared between `run` and `inspect`.
 #[derive(Debug, Parser)]
 pub struct RunArgs {
+    /// Require the fail-closed 0.4 security boundary. The default standard
+    /// mode favors compatibility while preserving core host protections.
+    #[arg(long)]
+    pub strict: bool,
+
     /// Use a specific profile (overrides auto-detect).
     #[arg(short = 'p', long)]
     pub profile: Option<String>,
@@ -46,6 +51,10 @@ pub struct RunArgs {
     /// Add writable path (repeatable).
     #[arg(short = 'w', long = "allow-write", action = clap::ArgAction::Append)]
     pub allow_write: Vec<PathBuf>,
+
+    /// Add readable path (repeatable). Built-in secret denials still win.
+    #[arg(long = "allow-read", action = clap::ArgAction::Append)]
+    pub allow_read: Vec<PathBuf>,
 
     /// Add read-denied path (repeatable).
     #[arg(short = 'r', long = "deny-read", action = clap::ArgAction::Append)]
@@ -120,6 +129,10 @@ pub struct RunArgs {
 
 #[derive(Debug, Parser)]
 pub struct InspectArgs {
+    /// Inspect the fail-closed strict policy instead of the standard policy.
+    #[arg(long)]
+    pub strict: bool,
+
     /// Use a specific profile (overrides auto-detect).
     #[arg(short = 'p', long)]
     pub profile: Option<String>,
@@ -135,6 +148,10 @@ pub struct InspectArgs {
     /// Add writable path (repeatable).
     #[arg(short = 'w', long = "allow-write", action = clap::ArgAction::Append)]
     pub allow_write: Vec<PathBuf>,
+
+    /// Add readable path (repeatable). Built-in secret denials still win.
+    #[arg(long = "allow-read", action = clap::ArgAction::Append)]
+    pub allow_read: Vec<PathBuf>,
 
     /// Add read-denied path (repeatable).
     #[arg(short = 'r', long = "deny-read", action = clap::ArgAction::Append)]
@@ -193,10 +210,12 @@ impl InspectArgs {
     /// Convert inspect args into equivalent run args for profile resolution.
     pub fn as_run_args(&self) -> RunArgs {
         RunArgs {
+            strict: self.strict,
             profile: self.profile.clone(),
             allow_domain: self.allow_domain.clone(),
             deny_domain: self.deny_domain.clone(),
             allow_write: self.allow_write.clone(),
+            allow_read: self.allow_read.clone(),
             deny_read: self.deny_read.clone(),
             allow_exec: self.allow_exec.clone(),
             deny_exec: self.deny_exec.clone(),

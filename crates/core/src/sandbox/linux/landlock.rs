@@ -32,7 +32,7 @@ use crate::{
     error::CoreError,
     profile::{NetworkMode, SandboxProfile},
     sandbox::{
-        BackendOptions,
+        BackendOptions, SecurityMode,
         linux::probe::{LandlockAbi, ProbeResult},
     },
 };
@@ -97,6 +97,7 @@ const MAX_CARVED_READ_ENTRIES: usize = 100_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UntrustedSymlinkBehavior {
+    Follow,
     Reject,
     Skip,
 }
@@ -198,15 +199,20 @@ fn highest_abi(probe: &ProbeResult) -> ABI {
     }
 }
 
-fn handled_fs_access(abi: ABI, mode: NetworkMode) -> BitFlags<AccessFs> {
-    let mut access = AccessFs::from_all(abi);
-    if mode == NetworkMode::AllowAll {
-        // ResolveUnix is classified as a filesystem right by Landlock, but it
-        // is network mediation. Handling it in allow-all mode would still
-        // block ambient sockets outside the private runtime root.
-        access.remove(AccessFs::ResolveUnix);
+fn effective_network_mode(mode: NetworkMode, security_mode: SecurityMode) -> NetworkMode {
+    if security_mode.is_strict() || mode == NetworkMode::DenyAll {
+        mode
+    } else {
+        NetworkMode::AllowAll
     }
-    access
+}
+
+fn handled_fs_access(abi: ABI) -> BitFlags<AccessFs> {
+    // ResolveUnix is a filesystem capability even when TCP networking is
+    // unrestricted. Keep it handled so AllowAll cannot implicitly expose
+    // capability brokers such as /var/run/docker.sock. Only per-run private
+    // roots receive ResolveUnix through ephemeral_write_access().
+    AccessFs::from_all(abi)
 }
 
 /// A ready-to-apply Landlock ruleset. Built in the single-threaded launcher;
@@ -229,16 +235,18 @@ pub fn compile(
     proxy_port: Option<u16>,
     probe: &ProbeResult,
     options: BackendOptions,
+    security_mode: SecurityMode,
 ) -> Result<CompiledLandlock, CoreError> {
     // 1. Lints.
     lint_allow_exec_for_priv_escalation(profile, options)?;
-    let forbidden_reads = build_forbidden_reads(profile)?;
-    lint_forbidden_reads_against_grants(profile, &forbidden_reads, options)?;
+    let forbidden_reads = build_forbidden_reads(profile, security_mode)?;
+    lint_forbidden_reads_against_grants(profile, &forbidden_reads, security_mode)?;
 
     let abi = highest_abi(probe);
+    let effective_network = effective_network_mode(profile.network_mode, security_mode);
     let ruleset = Ruleset::default()
         .set_compatibility(CompatLevel::HardRequirement)
-        .handle_access(handled_fs_access(abi, profile.network_mode))?;
+        .handle_access(handled_fs_access(abi))?;
     // Signals are a process-isolation capability, not a network capability,
     // so keep them scoped even when the user explicitly requests AllowAll
     // networking. Abstract Unix sockets, on the other hand, are deliberately
@@ -246,7 +254,7 @@ pub fn compile(
     // Landlock domain and can signal/connect to one another.
     let ruleset = if probe.abi.supports_scopes() {
         let ruleset = ruleset.scope(Scope::Signal)?;
-        if profile.network_mode == NetworkMode::AllowAll {
+        if effective_network == NetworkMode::AllowAll {
             ruleset
         } else {
             ruleset.scope(Scope::AbstractUnixSocket)?
@@ -255,7 +263,7 @@ pub fn compile(
         ruleset
     };
     let ruleset =
-        if probe.abi.supports_net_port_filter() && profile.network_mode != NetworkMode::AllowAll {
+        if probe.abi.supports_net_port_filter() && effective_network != NetworkMode::AllowAll {
             ruleset.handle_access(AccessNet::ConnectTcp | AccessNet::BindTcp)?
         } else {
             ruleset
@@ -286,10 +294,18 @@ pub fn compile(
             &forbidden_reads,
             abi,
             &mut carved_entries,
+            UntrustedSymlinkBehavior::Reject,
         )?;
     }
     for sp in &profile.allow_read {
-        created = add_read_rule(created, sp, &forbidden_reads, abi, &mut carved_entries)?;
+        created = add_read_rule(
+            created,
+            sp,
+            &forbidden_reads,
+            abi,
+            &mut carved_entries,
+            UntrustedSymlinkBehavior::Reject,
+        )?;
     }
 
     for sp in &profile.allow_write {
@@ -302,14 +318,19 @@ pub fn compile(
         } else {
             write_access(abi)
         };
-        created = add_write_rule(created, sp, access, abi)?;
+        // Standard mode has already replaced existing symlink grants with
+        // canonical snapshots. Reject here so missing paths are created via
+        // the descriptor-relative no-symlink walk and a parallel build cannot
+        // insert a late symlink between profile resolution and compilation.
+        created = add_write_rule(created, sp, access, abi, UntrustedSymlinkBehavior::Reject)?;
         // Mutable caches and outputs must be readable to be useful, but they
         // remain non-executable. The forbidden-read lint rejects overlaps.
-        created = add_path_rules(
+        created = add_read_rule(
             created,
-            std::slice::from_ref(&sp.path),
-            read_access(abi),
+            sp,
+            &forbidden_reads,
             abi,
+            &mut carved_entries,
             UntrustedSymlinkBehavior::Reject,
         )?;
     }
@@ -319,22 +340,21 @@ pub fn compile(
             &SandboxPath::file(PathBuf::from(path)),
             write_access(abi),
             abi,
+            UntrustedSymlinkBehavior::Reject,
         )?;
     }
 
-    // Exec allowlist (read+exec); covers shared libraries too. Per-entry
-    // policy: Follow for root-owned system paths (/lib, /usr/, /bin, …)
-    // because those are symlinks on usr-merge distros and only root can
-    // tamper with them; Refuse for anything else (notably $HOME-relative
-    // entries like ~/.cargo/bin/, ~/.nvm/) because a hostile earlier
-    // build can plant a symlink there.
+    // Exec allowlist (read+exec); covers shared libraries too. Standard mode
+    // supplies canonical snapshots, while strict mode skips unsafe optional
+    // built-in alternatives and rejects user/runtime aliases.
     for (index, sp) in profile.allow_exec.iter().enumerate() {
         // Built-in profiles list alternatives for multiple distributions and
         // tool managers. If an optional alias exists under a mutable parent,
         // omitting its rule is fail-closed and lets unrelated commands use
         // the profile. User/runtime grants remain strict because silently
         // ignoring an explicitly requested capability would be misleading.
-        let symlink_behavior = if index < profile.first_user_allow_exec {
+        let symlink_behavior = if security_mode.is_strict() && index < profile.first_user_allow_exec
+        {
             UntrustedSymlinkBehavior::Skip
         } else {
             UntrustedSymlinkBehavior::Reject
@@ -350,7 +370,7 @@ pub fn compile(
 
     // Net rules — only on v4+. Loopback (proxy) or :443 fallback.
     if probe.abi.supports_net_port_filter() {
-        match profile.network_mode {
+        match effective_network {
             NetworkMode::Proxy => {
                 let port = proxy_port.ok_or_else(|| {
                     CoreError::Backend("proxy network mode has no live proxy port".to_owned())
@@ -377,25 +397,31 @@ fn add_read_rule(
     forbidden: &BTreeSet<PathBuf>,
     abi: ABI,
     visited: &mut usize,
+    symlink_behavior: UntrustedSymlinkBehavior,
 ) -> Result<RulesetCreated, CoreError> {
     use crate::config::PathKind;
 
+    let comparison_path = if symlink_behavior == UntrustedSymlinkBehavior::Follow {
+        canonicalize_if_present(&path.path)?
+    } else {
+        path.path.clone()
+    };
     if forbidden
         .iter()
-        .any(|denied| path_is_under(&path.path, denied))
+        .any(|denied| path_is_under(&comparison_path, denied))
     {
         return Ok(created);
     }
     let has_denied_descendant = forbidden
         .iter()
-        .any(|denied| denied != &path.path && path_is_under(denied, &path.path));
+        .any(|denied| denied != &comparison_path && path_is_under(denied, &comparison_path));
     if !has_denied_descendant {
         return add_path_rules(
             created,
             std::slice::from_ref(&path.path),
             read_access(abi),
             abi,
-            UntrustedSymlinkBehavior::Reject,
+            symlink_behavior,
         );
     }
     if !matches!(path.kind, PathKind::Subpath) {
@@ -404,10 +430,22 @@ fn add_read_rule(
             path.path.display()
         )));
     }
-    let Some(fd) = open_existing_safely(&path.path)? else {
+    let Some(fd) = open_existing_safely_with(&path.path, symlink_behavior)? else {
         return Ok(created);
     };
-    add_carved_read_directory(created, fd, &path.path, forbidden, abi, visited)
+    add_carved_read_directory(created, fd, &comparison_path, forbidden, abi, visited)
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "standard mode compares the opened referent with protected paths before launch"
+)]
+fn canonicalize_if_present(path: &Path) -> Result<PathBuf, CoreError> {
+    match std::fs::canonicalize(path) {
+        Ok(resolved) => Ok(resolved),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Err(error) => Err(CoreError::Io(error)),
+    }
 }
 
 #[allow(
@@ -509,11 +547,12 @@ fn add_write_rule(
     path: &SandboxPath,
     access: BitFlags<AccessFs>,
     abi: ABI,
+    symlink_behavior: UntrustedSymlinkBehavior,
 ) -> Result<RulesetCreated, CoreError> {
     use crate::config::PathKind;
     let fd = match path.kind {
-        PathKind::Subpath => Some(open_or_create_directory(&path.path)?),
-        PathKind::Literal => open_existing_safely(&path.path)?,
+        PathKind::Subpath => Some(open_or_create_directory(&path.path, symlink_behavior)?),
+        PathKind::Literal => open_existing_safely_with(&path.path, symlink_behavior)?,
         PathKind::Regex => {
             return Err(CoreError::ProfileLint(format!(
                 "regex write grants are not safely enforceable on Linux: '{}'",
@@ -553,13 +592,6 @@ fn access_for_fd(
     }
 }
 
-/// Open an existing path with no symlink or magic-link traversal. A distro
-/// symlink is accepted only if every original and canonical ancestor is
-/// root-owned and not group/world writable.
-fn open_existing_safely(path: &Path) -> Result<Option<OwnedFd>, CoreError> {
-    open_existing_safely_with(path, UntrustedSymlinkBehavior::Reject)
-}
-
 #[allow(
     clippy::disallowed_methods,
     reason = "the policy compiler runs synchronously in the pre-runtime Linux launcher"
@@ -582,6 +614,11 @@ fn open_existing_safely_with(
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(error) => return Err(CoreError::Io(error)),
             };
+            if symlink_behavior == UntrustedSymlinkBehavior::Follow {
+                return open_no_symlinks(&canonical, false)
+                    .map(Some)
+                    .map_err(CoreError::Io);
+            }
             if let Err(reason) = root_owned_chain(path) {
                 return handle_untrusted_symlink(path, &reason, symlink_behavior);
             }
@@ -603,6 +640,7 @@ fn handle_untrusted_symlink(
     behavior: UntrustedSymlinkBehavior,
 ) -> Result<Option<OwnedFd>, CoreError> {
     match behavior {
+        UntrustedSymlinkBehavior::Follow => unreachable!("follow is handled before validation"),
         UntrustedSymlinkBehavior::Reject => Err(CoreError::ProfileLint(format!(
             "allowlist path '{}' traverses an untrusted symlink: {reason}",
             path.display()
@@ -621,7 +659,18 @@ fn handle_untrusted_symlink(
 /// Atomically walk and create a writable directory using directory FDs. No
 /// component may be a symlink, so a concurrent rename cannot redirect the
 /// grant outside the requested path.
-fn open_or_create_directory(path: &Path) -> Result<OwnedFd, CoreError> {
+fn open_or_create_directory(
+    path: &Path,
+    symlink_behavior: UntrustedSymlinkBehavior,
+) -> Result<OwnedFd, CoreError> {
+    if symlink_behavior == UntrustedSymlinkBehavior::Follow {
+        let resolved = resolve_for_creation(path)?;
+        return open_or_create_directory_no_symlinks(&resolved);
+    }
+    open_or_create_directory_no_symlinks(path)
+}
+
+fn open_or_create_directory_no_symlinks(path: &Path) -> Result<OwnedFd, CoreError> {
     if !path.is_absolute() {
         return Err(CoreError::ProfileLint(format!(
             "sandbox path must be absolute: '{}'",
@@ -661,6 +710,41 @@ fn open_or_create_directory(path: &Path) -> Result<OwnedFd, CoreError> {
         current = next;
     }
     Ok(current)
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "standard mode snapshots trusted pre-existing symlinks before launching the child"
+)]
+fn resolve_for_creation(path: &Path) -> Result<PathBuf, CoreError> {
+    let mut existing = path;
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::canonicalize(existing) {
+            Ok(mut resolved) => {
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = existing.file_name().ok_or_else(|| {
+                    CoreError::ProfileLint(format!(
+                        "sandbox path has no existing ancestor: '{}'",
+                        path.display()
+                    ))
+                })?;
+                missing.push(name.to_os_string());
+                existing = existing.parent().ok_or_else(|| {
+                    CoreError::ProfileLint(format!(
+                        "sandbox path has no parent: '{}'",
+                        path.display()
+                    ))
+                })?;
+            }
+            Err(error) => return Err(CoreError::Io(error)),
+        }
+    }
 }
 
 fn open_no_symlinks(path: &Path, directory: bool) -> std::io::Result<OwnedFd> {
@@ -767,19 +851,38 @@ fn root_owned_chain(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn build_forbidden_reads(profile: &SandboxProfile) -> Result<BTreeSet<PathBuf>, CoreError> {
+#[allow(
+    clippy::disallowed_methods,
+    reason = "standard mode snapshots an existing denied symlink referent before launch"
+)]
+fn build_forbidden_reads(
+    profile: &SandboxProfile,
+    security_mode: SecurityMode,
+) -> Result<BTreeSet<PathBuf>, CoreError> {
     let mut set = BTreeSet::new();
     let mut inspected = 0_usize;
     for sp in &profile.deny_read {
         match open_no_symlinks(&sp.path, false) {
-            Ok(fd) => reject_aliased_forbidden_tree(&fd, &sp.path, &mut inspected)?,
+            Ok(fd) if security_mode.is_strict() => {
+                reject_aliased_forbidden_tree(&fd, &sp.path, &mut inspected)?;
+            }
+            Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
-                return Err(CoreError::ProfileLint(format!(
-                    "denyRead path '{}' traverses a symlink; refusing a policy whose canonical \
-                     target could receive a read grant",
-                    sp.path.display()
-                )));
+                if security_mode.is_strict() {
+                    return Err(CoreError::ProfileLint(format!(
+                        "denyRead path '{}' traverses a symlink; refusing a policy whose \
+                         canonical target could receive a read grant",
+                        sp.path.display()
+                    )));
+                }
+                match std::fs::canonicalize(&sp.path) {
+                    Ok(resolved) => {
+                        set.insert(resolved);
+                    }
+                    Err(resolve_error) if resolve_error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(resolve_error) => return Err(CoreError::Io(resolve_error)),
+                }
             }
             Err(error) => return Err(CoreError::Io(error)),
         }
@@ -809,8 +912,8 @@ fn reject_aliased_forbidden_tree(
     if file_type == libc::S_IFREG {
         if stat.st_nlink > 1 {
             return Err(CoreError::ProfileLint(format!(
-                "denyRead file '{}' has {} hard links; Landlock cannot deny one pathname while \
-                 an alias grants the same inode",
+                "denyRead file '{}' has {} hard links; Landlock cannot deny one pathname while an \
+                 alias grants the same inode",
                 logical_path.display(),
                 stat.st_nlink,
             )));
@@ -867,12 +970,16 @@ fn reject_aliased_forbidden_tree(
 /// (indices `>= first_user_*`). Built-in defaults intentionally overlap
 /// denyRead in places such as `$PWD/.env`; those built-in read roots are
 /// compiled as carved descriptor rules instead of a broad parent grant.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "standard mode compares pre-existing grant referents with protected paths before \
+              launch"
+)]
 fn lint_forbidden_reads_against_grants(
     profile: &SandboxProfile,
     forbidden: &BTreeSet<PathBuf>,
-    options: BackendOptions,
+    security_mode: SecurityMode,
 ) -> Result<(), CoreError> {
-    let _ = options;
     let user_slices: [(&str, &[SandboxPath]); 3] = [
         (
             "allowWrite",
@@ -889,8 +996,18 @@ fn lint_forbidden_reads_against_grants(
     ];
     for (field, paths) in user_slices {
         for sp in paths {
+            let resolved = if security_mode.is_strict() {
+                None
+            } else {
+                std::fs::canonicalize(&sp.path).ok()
+            };
             for f in forbidden {
-                if path_is_under(f, &sp.path) || path_is_under(&sp.path, f) {
+                let overlaps = path_is_under(f, &sp.path)
+                    || path_is_under(&sp.path, f)
+                    || resolved
+                        .as_ref()
+                        .is_some_and(|path| path_is_under(f, path) || path_is_under(path, f));
+                if overlaps {
                     return Err(CoreError::ProfileLint(format!(
                         "denyRead path '{}' overlaps user-supplied {} entry '{}'. Landlock grants \
                          on allowWrite and allowExec include data-read, so this would silently \
@@ -998,9 +1115,8 @@ mod tests {
     }
 
     #[test]
-    fn allow_all_does_not_handle_unix_socket_resolution() {
-        assert!(handled_fs_access(ABI::V9, NetworkMode::Proxy).contains(AccessFs::ResolveUnix));
-        assert!(!handled_fs_access(ABI::V9, NetworkMode::AllowAll).contains(AccessFs::ResolveUnix));
+    fn allow_all_keeps_unix_socket_resolution_mediated() {
+        assert!(handled_fs_access(ABI::V9).contains(AccessFs::ResolveUnix));
     }
 
     #[test]
@@ -1053,7 +1169,11 @@ mod tests {
         symlink(outside.path(), temp.path().join("redirect")).unwrap();
 
         let missing = temp.path().join("redirect/missing");
-        assert!(open_existing_safely(&missing).unwrap().is_none());
+        assert!(
+            open_existing_safely_with(&missing, UntrustedSymlinkBehavior::Reject)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1066,11 +1186,17 @@ mod tests {
         symlink(target.path(), temp.path().join("redirect")).unwrap();
 
         let redirect = temp.path().join("redirect");
-        assert!(open_existing_safely(&redirect).is_err());
+        assert!(open_existing_safely_with(&redirect, UntrustedSymlinkBehavior::Reject).is_err());
         assert!(
             open_existing_safely_with(&redirect, UntrustedSymlinkBehavior::Skip)
                 .unwrap()
                 .is_none()
+        );
+        assert!(
+            open_existing_safely_with(&redirect, UntrustedSymlinkBehavior::Follow)
+                .unwrap()
+                .is_some(),
+            "standard mode should authorize the opened referent"
         );
     }
 
@@ -1128,9 +1254,9 @@ mod tests {
             path: PathBuf::from("/etc/ssh"),
             kind: PathKind::Subpath,
         });
-        let forbidden = build_forbidden_reads(&profile).unwrap();
+        let forbidden = build_forbidden_reads(&profile, SecurityMode::Standard).unwrap();
         let lint =
-            lint_forbidden_reads_against_grants(&profile, &forbidden, BackendOptions::default());
+            lint_forbidden_reads_against_grants(&profile, &forbidden, SecurityMode::Standard);
         assert!(lint.is_ok(), "baseline anchor overlap must not lint");
     }
 
@@ -1151,10 +1277,9 @@ mod tests {
             path: PathBuf::from("/home/test"),
             kind: PathKind::Subpath,
         });
-        let forbidden = build_forbidden_reads(&profile).unwrap();
-        let err =
-            lint_forbidden_reads_against_grants(&profile, &forbidden, BackendOptions::default())
-                .unwrap_err();
+        let forbidden = build_forbidden_reads(&profile, SecurityMode::Standard).unwrap();
+        let err = lint_forbidden_reads_against_grants(&profile, &forbidden, SecurityMode::Standard)
+            .unwrap_err();
         assert!(format!("{err}").contains("denyRead"));
         assert!(format!("{err}").contains("allowRead"));
     }
@@ -1179,10 +1304,9 @@ mod tests {
             path: PathBuf::from("/home/test"),
             kind: PathKind::Subpath,
         });
-        let forbidden = build_forbidden_reads(&profile).unwrap();
-        let err =
-            lint_forbidden_reads_against_grants(&profile, &forbidden, BackendOptions::default())
-                .unwrap_err();
+        let forbidden = build_forbidden_reads(&profile, SecurityMode::Standard).unwrap();
+        let err = lint_forbidden_reads_against_grants(&profile, &forbidden, SecurityMode::Standard)
+            .unwrap_err();
         assert!(format!("{err}").contains("denyRead"));
         assert!(format!("{err}").contains("allowWrite"));
     }
@@ -1205,11 +1329,44 @@ mod tests {
             path: PathBuf::from("/home/test/.aws"),
             kind: PathKind::Subpath,
         });
-        let forbidden = build_forbidden_reads(&profile).unwrap();
-        let err =
-            lint_forbidden_reads_against_grants(&profile, &forbidden, BackendOptions::default())
-                .unwrap_err();
+        let forbidden = build_forbidden_reads(&profile, SecurityMode::Standard).unwrap();
+        let err = lint_forbidden_reads_against_grants(&profile, &forbidden, SecurityMode::Standard)
+            .unwrap_err();
         assert!(format!("{err}").contains("allowExec"));
+    }
+
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous filesystem setup is isolated to this Linux policy unit test"
+    )]
+    fn standard_symlink_grants_cannot_bypass_a_forbidden_referent() {
+        use std::os::unix::fs::symlink;
+
+        let home = tempfile::tempdir().unwrap();
+        let protected = home.path().join("protected");
+        std::fs::create_dir(&protected).unwrap();
+        let alias = home.path().join("ordinary-alias");
+        symlink(&protected, &alias).unwrap();
+
+        for field in ["allowRead", "allowWrite", "allowExec"] {
+            let mut profile =
+                SandboxProfile::for_ecosystem(Ecosystem::Rust, home.path(), home.path());
+            profile.deny_read = vec![SandboxPath::dir(protected.clone())];
+            let grant = SandboxPath::dir(alias.clone());
+            match field {
+                "allowRead" => profile.allow_read.push(grant),
+                "allowWrite" => profile.allow_write.push(grant),
+                "allowExec" => profile.allow_exec.push(grant),
+                _ => unreachable!(),
+            }
+
+            let forbidden = build_forbidden_reads(&profile, SecurityMode::Standard).unwrap();
+            let error =
+                lint_forbidden_reads_against_grants(&profile, &forbidden, SecurityMode::Standard)
+                    .unwrap_err();
+            assert!(format!("{error}").contains(field));
+        }
     }
 
     #[test]
@@ -1232,13 +1389,10 @@ mod tests {
                 _ => unreachable!(),
             }
 
-            let forbidden = build_forbidden_reads(&profile).unwrap();
-            let error = lint_forbidden_reads_against_grants(
-                &profile,
-                &forbidden,
-                BackendOptions::default(),
-            )
-            .unwrap_err();
+            let forbidden = build_forbidden_reads(&profile, SecurityMode::Standard).unwrap();
+            let error =
+                lint_forbidden_reads_against_grants(&profile, &forbidden, SecurityMode::Standard)
+                    .unwrap_err();
             assert!(format!("{error}").contains(field));
         }
     }
@@ -1260,8 +1414,12 @@ mod tests {
             SandboxProfile::for_ecosystem(Ecosystem::Rust, project.path(), project.path());
         profile.deny_read = vec![SandboxPath::file(denied)];
 
-        let error = build_forbidden_reads(&profile).unwrap_err();
+        let error = build_forbidden_reads(&profile, SecurityMode::Strict).unwrap_err();
         assert!(format!("{error}").contains("traverses a symlink"));
+
+        let standard = build_forbidden_reads(&profile, SecurityMode::Standard).unwrap();
+        assert!(standard.contains(&target));
+        assert!(standard.contains(&project.path().join(".env")));
     }
 
     #[test]
@@ -1279,7 +1437,7 @@ mod tests {
             SandboxProfile::for_ecosystem(Ecosystem::Rust, project.path(), project.path());
         profile.deny_read = vec![SandboxPath::file(denied)];
 
-        let error = build_forbidden_reads(&profile).unwrap_err();
+        let error = build_forbidden_reads(&profile, SecurityMode::Strict).unwrap_err();
         assert!(format!("{error}").contains("hard links"));
     }
 
@@ -1299,12 +1457,12 @@ mod tests {
             SandboxProfile::for_ecosystem(Ecosystem::Rust, project.path(), project.path());
         profile.deny_read = vec![SandboxPath::dir(denied_directory)];
 
-        let error = build_forbidden_reads(&profile).unwrap_err();
+        let error = build_forbidden_reads(&profile, SecurityMode::Strict).unwrap_err();
         assert!(format!("{error}").contains("hard links"));
     }
 
     #[test]
-    fn test_should_not_bypass_forbidden_read_overlap_under_allow_degraded() {
+    fn test_should_reject_forbidden_read_overlap_in_standard_mode() {
         let mut profile = SandboxProfile::for_ecosystem(
             Ecosystem::Rust,
             &PathBuf::from("/home/test"),
@@ -1319,16 +1477,12 @@ mod tests {
             path: PathBuf::from("/home/test"),
             kind: PathKind::Subpath,
         });
-        let forbidden = build_forbidden_reads(&profile).unwrap();
-        let res = lint_forbidden_reads_against_grants(
-            &profile,
-            &forbidden,
-            BackendOptions {
-                allow_degraded: true,
-                ..BackendOptions::default()
-            },
+        let forbidden = build_forbidden_reads(&profile, SecurityMode::Standard).unwrap();
+        let res = lint_forbidden_reads_against_grants(&profile, &forbidden, SecurityMode::Standard);
+        assert!(
+            res.is_err(),
+            "standard symlink support must not bypass denyRead"
         );
-        assert!(res.is_err(), "allow_degraded must not bypass the seal lint");
     }
 
     #[test]
@@ -1338,7 +1492,7 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         symlink(outside.path(), temp.path().join("redirect")).unwrap();
         let target = temp.path().join("redirect/cache");
-        assert!(open_or_create_directory(&target).is_err());
+        assert!(open_or_create_directory(&target, UntrustedSymlinkBehavior::Reject).is_err());
         assert!(!outside.path().join("cache").exists());
     }
 }

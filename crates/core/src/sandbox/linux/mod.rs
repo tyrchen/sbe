@@ -23,7 +23,7 @@ pub use probe::ProbeResult;
 use crate::{
     error::CoreError,
     profile::SandboxProfile,
-    sandbox::{BackendInfo, BackendOptions, SandboxBackend},
+    sandbox::{BackendInfo, BackendOptions, SandboxBackend, SecurityMode},
 };
 
 /// Linux backend wrapping Landlock + seccomp-bpf.
@@ -31,6 +31,7 @@ use crate::{
 pub struct LinuxSandbox {
     info: BackendInfo,
     options: BackendOptions,
+    security_mode: SecurityMode,
     probe: ProbeResult,
 }
 
@@ -43,6 +44,14 @@ impl LinuxSandbox {
 
     /// Constructor with capability-specific runtime options.
     pub fn new_with_options(options: BackendOptions) -> Result<Self, CoreError> {
+        Self::new_with_mode(options, SecurityMode::Standard)
+    }
+
+    /// Constructor variant that selects the product-level security contract.
+    pub fn new_with_mode(
+        options: BackendOptions,
+        security_mode: SecurityMode,
+    ) -> Result<Self, CoreError> {
         let probe = probe::run()?;
         let features = probe.features();
         let info = BackendInfo {
@@ -53,6 +62,7 @@ impl LinuxSandbox {
         Ok(Self {
             info,
             options,
+            security_mode,
             probe,
         })
     }
@@ -82,6 +92,7 @@ impl SandboxBackend for LinuxSandbox {
             proxy_port,
             &self.probe,
             self.options,
+            self.security_mode,
         ))
     }
 
@@ -94,7 +105,7 @@ impl SandboxBackend for LinuxSandbox {
         pid_tx: Option<tokio::sync::oneshot::Sender<u32>>,
     ) -> impl std::future::Future<Output = Result<ExitStatus, CoreError>> + Send {
         let probe = self.probe.clone();
-        let options = self.options;
+        let options = exec::LauncherOptions::new(self.options, self.security_mode);
         let profile = profile.clone();
         let command = command.to_vec();
         let extra_env = extra_env.clone();
