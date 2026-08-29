@@ -273,8 +273,9 @@ canonical private root used for `TMPDIR`, `TMP`, `TEMP`, and
 `XDG_RUNTIME_DIR`.
 
 Workspace grants are anchored to the launch directory. Package-manager project
-relocation options such as npm `--prefix` or Cargo `-C` fail early with an
-actionable error in both modes; change directory before invoking SBE.
+relocation options such as npm `--prefix`, Cargo `-C`, Gradle `--project-dir`,
+or Maven `--file` fail early with an actionable error in both modes; change
+directory before invoking SBE.
 
 Standard mode does not hide files inside the selected workspace, including
 `.env*`; dependencies already run with the repository as input, and trying to

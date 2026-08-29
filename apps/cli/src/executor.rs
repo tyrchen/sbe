@@ -1423,6 +1423,8 @@ fn project_relocation_option(command: &[String]) -> Option<&str> {
         "pnpm" => &["--dir", "-C"],
         "uv" => &["--directory", "--project"],
         "poetry" | "pdm" => &["--directory", "--project", "-C", "-P", "-p"],
+        "gradle" | "gradlew" => &["--project-dir", "-p"],
+        "mvn" | "mvnw" => &["--file", "-f"],
         _ => return None,
     };
     command
@@ -3703,6 +3705,10 @@ mod tests {
             vec!["uv", "--project", "subproject", "sync"],
             vec!["poetry", "-P", "subproject", "install"],
             vec!["cargo", "-Csubproject", "build"],
+            vec!["./gradlew", "--project-dir", "subproject", "build"],
+            vec!["gradle", "-psubproject", "build"],
+            vec!["./mvnw", "--file=subproject/pom.xml", "package"],
+            vec!["mvn", "-fsubproject/pom.xml", "package"],
         ] {
             let command: Vec<String> = command.into_iter().map(str::to_owned).collect();
             assert!(

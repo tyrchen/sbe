@@ -62,6 +62,8 @@ All notable changes to this project will be documented in this file. See [conven
   default while keeping initialization scripts immutable.
 - Keep macOS `DenyAll` authoritative by withholding standard-mode Unix-socket
   compatibility grants when the effective network policy denies all traffic.
+- Reject Gradle and Maven project-relocation flags early, with the same
+  actionable working-directory guidance used for other package managers.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23
