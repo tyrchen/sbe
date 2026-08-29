@@ -127,6 +127,8 @@ All notable changes to this project will be documented in this file. See [conven
   higher-precedence command, environment, and project JVM properties.
 - Merge explicitly selected Maven global settings beneath user settings and
   honor the effective JVM `user.home` for settings and repository defaults.
+- Follow npm's command/environment cache selection, and grant read-only access
+  to effective Gradle homes and explicitly selected Maven settings.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23

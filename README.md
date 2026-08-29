@@ -211,6 +211,9 @@ is not made trustworthy by SBE. An implicit `[install] root` in Cargo config is
 rejected with `--root` guidance instead of failing later inside the sandbox.
 Registry and Git dependency caches follow the effective `CARGO_HOME`; its two
 credential-file spellings remain denied.
+For npm/npx, a command `--cache` selection overrides `NPM_CONFIG_CACHE` and
+replaces the default `~/.npm` write grant; relative cache paths are anchored to
+the selected project.
 An external Cargo target can be selected with an inherited `CARGO_TARGET_DIR`
 or a direct `--config build.target-dir='path'` override, or granted explicitly
 with matching `--allow-write` and `--allow-exec` paths. Cargo `--config` file
@@ -344,7 +347,9 @@ settings values fail early with `-Dmaven.repo.local` guidance. Explicit
 select a repository. `-Duser.home` in `MAVEN_OPTS` or `.mvn/jvm.config` changes
 both the default user-settings location and Maven's default repository; a
 repository-controlled home or settings selection retains the external-write
-approval gate.
+approval gate. Explicit user/global settings files and an alternate effective
+user `.m2` directory receive read-only grants so Maven can consume the same
+configuration SBE inspected.
 
 On macOS, secret read denials include both the configured pathname and its
 canonical target. A symlinked `~/.ssh`, `.aws`, or similar protected directory

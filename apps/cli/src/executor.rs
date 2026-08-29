@@ -757,7 +757,14 @@ fn apply_standard_profile(
         insert_builtin_path_grant(profile, GrantKind::AllowExec, SandboxPath::dir(resolved));
     }
 
+    if let Some(npm_cache) = effective_npm_cache(profile, command, home, project_dir)? {
+        replace_builtin_write_path(profile, &home.join(".npm"), SandboxPath::dir(npm_cache));
+    }
+
     if profile.name == "java" {
+        for settings in effective_maven_settings_read_paths(profile, command, home, project_dir)? {
+            insert_builtin_path_grant(profile, GrantKind::AllowRead, settings);
+        }
         if let Some(repository) =
             effective_maven_local_repository(profile, command, home, project_dir)?
         {
@@ -797,6 +804,11 @@ fn apply_standard_profile(
 
         if let Some(gradle_home) = effective_gradle_user_home(profile, command, home, project_dir)?
         {
+            insert_builtin_path_grant(
+                profile,
+                GrantKind::AllowRead,
+                SandboxPath::dir(gradle_home.clone()),
+            );
             // Keep init.d and root-level initialization scripts immutable.
             // Standard mode accepts cache poisoning, but should not provide a
             // direct unsandboxed-startup persistence mechanism.
@@ -912,6 +924,51 @@ fn effective_environment_path(profile: &SandboxProfile, name: &str) -> Option<Pa
         .or_else(|| std::env::var_os(name).map(PathBuf::from))
 }
 
+fn effective_npm_cache(
+    profile: &SandboxProfile,
+    command: &[String],
+    home: &Path,
+    project_dir: &Path,
+) -> anyhow::Result<Option<PathBuf>> {
+    if profile.name != "node" || (!command_is(command, "npm") && !command_is(command, "npx")) {
+        return Ok(None);
+    }
+    let mut command_cache = None;
+    let mut arguments = command
+        .iter()
+        .skip(1)
+        .take_while(|argument| argument.as_str() != "--");
+    while let Some(argument) = arguments.next() {
+        let value = if argument == "--cache" {
+            Some(
+                arguments
+                    .next()
+                    .map(String::as_str)
+                    .context("npm --cache requires a value")?,
+            )
+        } else {
+            argument.strip_prefix("--cache=")
+        };
+        if let Some(value) = value {
+            if value.is_empty() || value.chars().any(char::is_control) {
+                anyhow::bail!("npm --cache must select a non-empty unambiguous path");
+            }
+            command_cache = Some(PathBuf::from(value));
+        }
+    }
+    let selected = command_cache
+        .or_else(|| effective_environment_path(profile, "NPM_CONFIG_CACHE"))
+        .unwrap_or_else(|| home.join(".npm"));
+    if selected.as_os_str().is_empty() {
+        anyhow::bail!("NPM_CONFIG_CACHE must select a non-empty path");
+    }
+    Ok(Some(if selected.is_absolute() {
+        selected
+    } else {
+        project_dir.join(selected)
+    }))
+}
+
 fn effective_cargo_home(profile: &SandboxProfile, home: &Path, project_dir: &Path) -> PathBuf {
     let cargo_home =
         effective_environment_path(profile, "CARGO_HOME").unwrap_or_else(|| home.join(".cargo"));
@@ -1009,6 +1066,32 @@ struct MavenSettingsSelection {
 struct MavenSettingsRepository {
     path: PathBuf,
     user_home_dependent: bool,
+}
+
+fn effective_maven_settings_read_paths(
+    profile: &SandboxProfile,
+    command: &[String],
+    home: &Path,
+    project_dir: &Path,
+) -> anyhow::Result<Vec<SandboxPath>> {
+    if !command_is(command, "mvn") && !command_is(command, "mvnw") {
+        return Ok(Vec::new());
+    }
+    let (user_home, _) = effective_maven_user_home(profile, home, project_dir)?;
+    let mut paths = Vec::new();
+    if user_home != home {
+        paths.push(SandboxPath::dir(user_home.join(".m2")));
+    }
+    for settings in [
+        selected_maven_settings(profile, command, project_dir, "--global-settings", "-gs")?,
+        selected_maven_settings(profile, command, project_dir, "--settings", "-s")?,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        paths.push(SandboxPath::file(settings.path));
+    }
+    Ok(paths)
 }
 
 fn effective_maven_local_repository(
@@ -4267,6 +4350,11 @@ mod tests {
             assert!(inherited.allow_exec.contains(&SandboxPath::dir(path)));
         }
         assert!(
+            inherited
+                .allow_read
+                .contains(&SandboxPath::dir(inherited_home.clone()))
+        );
+        assert!(
             !inherited
                 .allow_write
                 .contains(&SandboxPath::dir(inherited_home.clone()))
@@ -4320,6 +4408,7 @@ mod tests {
             assert!(cli.allow_write.contains(&SandboxPath::dir(path.clone())));
             assert!(cli.allow_exec.contains(&SandboxPath::dir(path)));
         }
+        assert!(cli.allow_read.contains(&SandboxPath::dir(cli_home.clone())));
         assert!(!cli.allow_write.contains(&SandboxPath::dir(cli_home)));
 
         let attached_home = root.path().join("attached-gradle");
@@ -4351,6 +4440,11 @@ mod tests {
             );
             assert!(attached.allow_exec.contains(&SandboxPath::dir(path)));
         }
+        assert!(
+            attached
+                .allow_read
+                .contains(&SandboxPath::dir(attached_home))
+        );
 
         let property_home = root.path().join("property-gradle");
         let mut property = SandboxProfile::for_ecosystem(Ecosystem::Java, &home, &project);
@@ -4988,7 +5082,8 @@ mod tests {
         );
 
         let explicit_repository = tempfile::tempdir().unwrap();
-        let explicit_settings = project.path().join("explicit-settings.xml");
+        let explicit_settings_root = tempfile::tempdir().unwrap();
+        let explicit_settings = explicit_settings_root.path().join("settings.xml");
         std::fs::write(
             &explicit_settings,
             format!(
@@ -5016,10 +5111,16 @@ mod tests {
                 .allow_write
                 .contains(&SandboxPath::dir(explicit_repository.path().to_path_buf()))
         );
+        assert!(
+            explicit
+                .allow_read
+                .contains(&SandboxPath::file(explicit_settings.clone()))
+        );
 
         std::fs::write(home.path().join(".m2/settings.xml"), "<settings/>").unwrap();
         let global_repository = tempfile::tempdir().unwrap();
-        let global_settings = project.path().join("global-settings.xml");
+        let global_settings_root = tempfile::tempdir().unwrap();
+        let global_settings = global_settings_root.path().join("settings.xml");
         std::fs::write(
             &global_settings,
             format!(
@@ -5046,6 +5147,11 @@ mod tests {
             explicit_global
                 .allow_write
                 .contains(&SandboxPath::dir(global_repository.path().to_path_buf()))
+        );
+        assert!(
+            explicit_global
+                .allow_read
+                .contains(&SandboxPath::file(global_settings.clone()))
         );
 
         std::fs::write(
@@ -5132,6 +5238,11 @@ mod tests {
         assert!(alternate_user_home.allow_write.contains(&SandboxPath::dir(
             alternate_home_repository.path().to_path_buf()
         )));
+        assert!(
+            alternate_user_home
+                .allow_read
+                .contains(&SandboxPath::dir(alternate_home.path().join(".m2")))
+        );
 
         let alternate_default_home = tempfile::tempdir().unwrap();
         let mut alternate_default =
@@ -6229,6 +6340,74 @@ mod tests {
             .is_err()
         );
         assert!(!relocated_project.path().join("package-lock.json").exists());
+    }
+
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the unit test creates isolated npm home and project fixtures"
+    )]
+    fn standard_npm_profile_uses_the_effective_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let project = root.path().join("project");
+        let environment_cache = root.path().join("environment-cache");
+        let command_cache = root.path().join("command-cache");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+
+        let mut command_selected = SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &project);
+        command_selected.env.insert(
+            "NPM_CONFIG_CACHE".to_owned(),
+            environment_cache.to_string_lossy().into_owned(),
+        );
+        apply_standard_profile(
+            &mut command_selected,
+            &[
+                "npm".to_owned(),
+                "install".to_owned(),
+                format!("--cache={}", command_cache.display()),
+            ],
+            &home,
+            &project,
+        )
+        .unwrap();
+        assert!(
+            command_selected
+                .allow_write
+                .contains(&SandboxPath::dir(command_cache.clone()))
+        );
+        assert!(
+            !command_selected
+                .allow_write
+                .contains(&SandboxPath::dir(environment_cache.clone())),
+            "the npm command option must override NPM_CONFIG_CACHE"
+        );
+        assert!(
+            !command_selected
+                .allow_write
+                .contains(&SandboxPath::dir(home.join(".npm"))),
+            "the effective npm cache must replace the default grant"
+        );
+
+        let mut environment_selected =
+            SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &project);
+        environment_selected.env.insert(
+            "NPM_CONFIG_CACHE".to_owned(),
+            "relative-npm-cache".to_owned(),
+        );
+        apply_standard_profile(
+            &mut environment_selected,
+            &["npm".to_owned(), "install".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap();
+        assert!(
+            environment_selected
+                .allow_write
+                .contains(&SandboxPath::dir(project.join("relative-npm-cache")))
+        );
     }
 
     #[test]

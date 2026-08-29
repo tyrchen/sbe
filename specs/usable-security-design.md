@@ -237,12 +237,18 @@ Standard mode grants writes to:
 - an installation root only when the user's top-level command clearly requests
   an install operation.
 
+For npm and npx commands, `--cache` overrides `NPM_CONFIG_CACHE`, then the
+default `~/.npm`. The effective cache replaces the default writable grant;
+relative paths are anchored to the command project.
+
 For Gradle commands, the conventional cache grant follows Gradle's effective
 user home: `--gradle-user-home`, every accepted `-g` form including `-g/path`,
 inherited `GRADLE_USER_HOME`, then `~/.gradle`. Relative selections are anchored
 to the command's project. Only runtime subdirectories such as `.tmp`, caches,
 wrapper distributions, daemons, and toolchains are writable; the user-home root
-and `init.d` remain immutable.
+and `init.d` remain immutable. The effective user-home root is readable so
+Gradle can load root-level properties, initialization scripts, and wrapper
+metadata without making those persistence-capable files writable.
 
 For Maven commands, `-D`/`--define maven.repo.local=path` on the actual command
 selects the writable local repository, followed in precedence by `MAVEN_ARGS`,
@@ -264,6 +270,8 @@ their selected repository, settings, or effective home may expand authority
 automatically only inside the workspace or conventional `~/.m2/repository`
 namespace. An external referent requires a matching explicit writable grant;
 command and host-environment sources continue to represent direct user intent.
+Explicit user/global settings files and the effective user `.m2` directory are
+granted read-only access; only the selected repository receives write access.
 
 It denies writes everywhere else. In particular, home-directory persistence,
 credentials, shell startup, SSH authorization, user service configuration, and
