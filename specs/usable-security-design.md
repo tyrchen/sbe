@@ -249,18 +249,21 @@ selects the writable local repository, followed in precedence by `MAVEN_ARGS`,
 project `.mvn/maven.config`, `MAVEN_OPTS`, project `.mvn/jvm.config`, and the
 effective settings `<localRepository>`, then the default `~/.m2/repository`.
 Settings selection follows the actual command, `MAVEN_ARGS`, project
-`.mvn/maven.config`, then the default user settings. Within each source the
-last property wins. This
+`.mvn/maven.config`, then the default user settings. An explicit
+`-gs`/`--global-settings` selection is read as the fallback when the effective
+user settings do not provide `<localRepository>`. The effective default user
+settings and repository roots follow `-Duser.home` from `MAVEN_OPTS`, then
+project `.mvn/jvm.config`. Within each source the last property wins. This
 matches Maven's CLI merge, where environment arguments precede actual CLI
 arguments and CLI user properties override project configuration and JVM system
 properties. Relative selections are anchored to the command project; quoted,
 expanded, or otherwise ambiguous option values fail with guidance to use a
 direct unambiguous command property.
 Because `.mvn/maven.config` and `.mvn/jvm.config` are repository-controlled,
-their selected repository may expand authority automatically only inside the
-workspace or conventional `~/.m2/repository` namespace. An external referent
-requires a matching explicit writable grant; command and host-environment
-sources continue to represent direct user intent.
+their selected repository, settings, or effective home may expand authority
+automatically only inside the workspace or conventional `~/.m2/repository`
+namespace. An external referent requires a matching explicit writable grant;
+command and host-environment sources continue to represent direct user intent.
 
 It denies writes everywhere else. In particular, home-directory persistence,
 credentials, shell startup, SSH authorization, user service configuration, and

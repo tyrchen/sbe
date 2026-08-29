@@ -1000,6 +1000,17 @@ struct MavenRepositorySelection {
     project_controlled: bool,
 }
 
+struct MavenSettingsSelection {
+    path: PathBuf,
+    project_controlled: bool,
+    explicit: bool,
+}
+
+struct MavenSettingsRepository {
+    path: PathBuf,
+    user_home_dependent: bool,
+}
+
 fn effective_maven_local_repository(
     profile: &SandboxProfile,
     command: &[String],
@@ -1133,8 +1144,60 @@ fn effective_maven_settings_repository(
     home: &Path,
     project_dir: &Path,
 ) -> anyhow::Result<Option<MavenRepositorySelection>> {
-    let command_settings =
-        command_aliased_option_value(command, "--settings", "-s").map(str::to_owned);
+    let (user_home, user_home_project_controlled) =
+        effective_maven_user_home(profile, home, project_dir)?;
+    let global_settings =
+        selected_maven_settings(profile, command, project_dir, "--global-settings", "-gs")?;
+    let user_settings = selected_maven_settings(profile, command, project_dir, "--settings", "-s")?;
+
+    let user_settings = user_settings.unwrap_or_else(|| MavenSettingsSelection {
+        path: user_home.join(".m2/settings.xml"),
+        project_controlled: user_home_project_controlled,
+        explicit: false,
+    });
+    let user_repository =
+        read_maven_settings_repository(&user_settings, &user_home, home, user_settings.explicit)?
+            .map(|repository| MavenRepositorySelection {
+                project_controlled: user_settings.project_controlled
+                    || (repository.user_home_dependent && user_home_project_controlled),
+                path: repository.path,
+            });
+    if user_repository.is_some() {
+        return Ok(user_repository);
+    }
+
+    let global_repository = global_settings
+        .as_ref()
+        .map(|settings| {
+            read_maven_settings_repository(settings, &user_home, home, settings.explicit).map(
+                |repository| {
+                    repository.map(|repository| MavenRepositorySelection {
+                        project_controlled: settings.project_controlled
+                            || (repository.user_home_dependent && user_home_project_controlled),
+                        path: repository.path,
+                    })
+                },
+            )
+        })
+        .transpose()?
+        .flatten();
+
+    Ok(global_repository.or_else(|| {
+        (user_home != home).then(|| MavenRepositorySelection {
+            path: user_home.join(".m2/repository"),
+            project_controlled: user_home_project_controlled,
+        })
+    }))
+}
+
+fn selected_maven_settings(
+    profile: &SandboxProfile,
+    command: &[String],
+    project_dir: &Path,
+    long: &str,
+    short: &str,
+) -> anyhow::Result<Option<MavenSettingsSelection>> {
+    let command_settings = command_aliased_option_value(command, long, short).map(str::to_owned);
     let maven_args_settings = if command_settings.is_none() {
         let arguments = profile
             .env
@@ -1143,7 +1206,7 @@ fn effective_maven_settings_repository(
             .or_else(|| std::env::var("MAVEN_ARGS").ok());
         arguments
             .as_deref()
-            .and_then(maven_settings_option_value)
+            .and_then(|arguments| maven_settings_option_value(arguments, long, short))
             .map(str::to_owned)
     } else {
         None
@@ -1161,7 +1224,9 @@ fn effective_maven_settings_repository(
                     .filter(|line| !line.is_empty() && !line.starts_with('#'))
                     .collect::<Vec<_>>()
                     .join(" ");
-                Ok::<_, anyhow::Error>(maven_settings_option_value(&arguments).map(str::to_owned))
+                Ok::<_, anyhow::Error>(
+                    maven_settings_option_value(&arguments, long, short).map(str::to_owned),
+                )
             })
             .transpose()?
             .flatten()
@@ -1178,53 +1243,44 @@ fn effective_maven_settings_repository(
                 .chars()
                 .any(|character| matches!(character, '$' | '`' | '\'' | '"'))
     }) {
-        anyhow::bail!(
-            "Maven settings path must be unambiguous; use --settings=/absolute/settings.xml"
-        );
+        anyhow::bail!("Maven settings path must be unambiguous; use {long}=/absolute/settings.xml");
     }
-    let path = selected
-        .as_deref()
-        .map_or_else(|| home.join(".m2/settings.xml"), PathBuf::from);
-    let path = if path.is_absolute() {
-        path
-    } else {
-        project_dir.join(path)
-    };
-    let Some(contents) = read_bounded_following_metadata_file(&path)? else {
-        if selected.is_some() {
-            anyhow::bail!(
-                "could not inspect explicit Maven settings file: {}",
-                path.display()
-            );
+    Ok(selected.map(|path| {
+        let path = PathBuf::from(path);
+        MavenSettingsSelection {
+            path: if path.is_absolute() {
+                path
+            } else {
+                project_dir.join(path)
+            },
+            project_controlled,
+            explicit: true,
         }
-        return Ok(None);
-    };
-    let Some(repository) = maven_settings_local_repository(&contents, &path, home)? else {
-        return Ok(None);
-    };
-    Ok(Some(MavenRepositorySelection {
-        path: repository,
-        project_controlled,
     }))
 }
 
-fn maven_settings_option_value(arguments: &str) -> Option<&str> {
+fn maven_settings_option_value<'a>(arguments: &'a str, long: &str, short: &str) -> Option<&'a str> {
     let mut selected = None;
     let mut arguments = arguments.split_whitespace();
     while let Some(argument) = arguments.next() {
-        if argument == "--settings" || argument == "-s" {
+        if argument == long || argument == short {
             selected = arguments.next();
             continue;
         }
         if let Some(value) = argument
-            .strip_prefix("--settings=")
-            .or_else(|| argument.strip_prefix("-s="))
+            .strip_prefix(long)
+            .and_then(|suffix| suffix.strip_prefix('='))
+            .or_else(|| {
+                argument
+                    .strip_prefix(short)
+                    .and_then(|suffix| suffix.strip_prefix('='))
+            })
         {
             selected = Some(value);
             continue;
         }
         if let Some(value) = argument
-            .strip_prefix("-s")
+            .strip_prefix(short)
             .filter(|value| !value.is_empty())
         {
             selected = Some(value);
@@ -1233,11 +1289,73 @@ fn maven_settings_option_value(arguments: &str) -> Option<&str> {
     selected
 }
 
+fn effective_maven_user_home(
+    profile: &SandboxProfile,
+    home: &Path,
+    project_dir: &Path,
+) -> anyhow::Result<(PathBuf, bool)> {
+    let maven_opts = profile
+        .env
+        .get("MAVEN_OPTS")
+        .cloned()
+        .or_else(|| std::env::var("MAVEN_OPTS").ok());
+    let maven_opts_home = maven_opts
+        .as_deref()
+        .map(|options| maven_options_user_home(options, "MAVEN_OPTS"))
+        .transpose()?
+        .flatten();
+    let project_home = if maven_opts_home.is_none() {
+        let path = project_dir.join(".mvn/jvm.config");
+        read_bounded_project_file(&path)?
+            .map(|contents| {
+                let contents = std::str::from_utf8(&contents).with_context(|| {
+                    format!("Maven JVM config is not UTF-8: {}", path.display())
+                })?;
+                maven_options_user_home(contents, ".mvn/jvm.config")
+            })
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    let project_controlled = project_home.is_some();
+    let selected = maven_opts_home
+        .or(project_home)
+        .unwrap_or_else(|| home.to_path_buf());
+    Ok((
+        if selected.is_absolute() {
+            selected
+        } else {
+            project_dir.join(selected)
+        },
+        project_controlled,
+    ))
+}
+
+fn read_maven_settings_repository(
+    settings: &MavenSettingsSelection,
+    user_home: &Path,
+    environment_home: &Path,
+    required: bool,
+) -> anyhow::Result<Option<MavenSettingsRepository>> {
+    let Some(contents) = read_bounded_following_metadata_file(&settings.path)? else {
+        if required {
+            anyhow::bail!(
+                "could not inspect explicit Maven settings file: {}",
+                settings.path.display()
+            );
+        }
+        return Ok(None);
+    };
+    maven_settings_local_repository(&contents, &settings.path, user_home, environment_home)
+}
+
 fn maven_settings_local_repository(
     contents: &[u8],
     path: &Path,
-    home: &Path,
-) -> anyhow::Result<Option<PathBuf>> {
+    user_home: &Path,
+    environment_home: &Path,
+) -> anyhow::Result<Option<MavenSettingsRepository>> {
     let contents = std::str::from_utf8(contents)
         .with_context(|| format!("Maven settings are not UTF-8: {}", path.display()))?;
     let contents = xml_without_comments(contents, path)?;
@@ -1270,10 +1388,11 @@ fn maven_settings_local_repository(
                 path.display()
             )
         })?;
-    let value = contents[value_start..end]
-        .trim()
-        .replace("${user.home}", &home.to_string_lossy())
-        .replace("${env.HOME}", &home.to_string_lossy());
+    let raw_value = contents[value_start..end].trim();
+    let user_home_dependent = raw_value.contains("${user.home}");
+    let value = raw_value
+        .replace("${user.home}", &user_home.to_string_lossy())
+        .replace("${env.HOME}", &environment_home.to_string_lossy());
     if value.is_empty()
         || value
             .chars()
@@ -1285,7 +1404,10 @@ fn maven_settings_local_repository(
             path.display()
         );
     }
-    Ok(Some(PathBuf::from(value)))
+    Ok(Some(MavenSettingsRepository {
+        path: PathBuf::from(value),
+        user_home_dependent,
+    }))
 }
 
 fn xml_without_comments(contents: &str, path: &Path) -> anyhow::Result<String> {
@@ -1382,6 +1504,33 @@ fn maven_options_local_repository(options: &str, source: &str) -> anyhow::Result
         anyhow::bail!(
             "{source} selects maven.repo.local in an unsupported form; use \
              -Dmaven.repo.local=/unambiguous/path"
+        );
+    }
+    Ok(selected)
+}
+
+fn maven_options_user_home(options: &str, source: &str) -> anyhow::Result<Option<PathBuf>> {
+    let mut selected = None;
+    for token in options.split_whitespace() {
+        let Some(value) = token.strip_prefix("-Duser.home=") else {
+            continue;
+        };
+        if value.is_empty()
+            || value.chars().any(|character| {
+                matches!(character, '$' | '`' | '\\' | '\'' | '"' | '*' | '?' | '[')
+            })
+        {
+            anyhow::bail!(
+                "{source} selects user.home in a form that sbe cannot resolve safely; use an \
+                 unambiguous -Duser.home=/absolute/path"
+            );
+        }
+        selected = Some(PathBuf::from(value));
+    }
+    if selected.is_none() && options.contains("-Duser.home") {
+        anyhow::bail!(
+            "{source} selects user.home in an unsupported form; use an unambiguous \
+             -Duser.home=/absolute/path"
         );
     }
     Ok(selected)
@@ -4868,6 +5017,72 @@ mod tests {
                 .contains(&SandboxPath::dir(explicit_repository.path().to_path_buf()))
         );
 
+        std::fs::write(home.path().join(".m2/settings.xml"), "<settings/>").unwrap();
+        let global_repository = tempfile::tempdir().unwrap();
+        let global_settings = project.path().join("global-settings.xml");
+        std::fs::write(
+            &global_settings,
+            format!(
+                "<settings><localRepository>{}</localRepository></settings>",
+                global_repository.path().display()
+            ),
+        )
+        .unwrap();
+        let mut explicit_global =
+            SandboxProfile::for_ecosystem(Ecosystem::Java, home.path(), project.path());
+        apply_standard_profile(
+            &mut explicit_global,
+            &[
+                "mvn".to_owned(),
+                "-gs".to_owned(),
+                global_settings.display().to_string(),
+                "validate".to_owned(),
+            ],
+            home.path(),
+            project.path(),
+        )
+        .unwrap();
+        assert!(
+            explicit_global
+                .allow_write
+                .contains(&SandboxPath::dir(global_repository.path().to_path_buf()))
+        );
+
+        std::fs::write(
+            home.path().join(".m2/settings.xml"),
+            format!(
+                "<settings><localRepository>{}</localRepository></settings>",
+                settings_repository.path().display()
+            ),
+        )
+        .unwrap();
+        let mut user_over_global =
+            SandboxProfile::for_ecosystem(Ecosystem::Java, home.path(), project.path());
+        apply_standard_profile(
+            &mut user_over_global,
+            &[
+                "mvn".to_owned(),
+                "--global-settings".to_owned(),
+                global_settings.display().to_string(),
+                "validate".to_owned(),
+            ],
+            home.path(),
+            project.path(),
+        )
+        .unwrap();
+        assert!(
+            user_over_global
+                .allow_write
+                .contains(&SandboxPath::dir(settings_repository.path().to_path_buf()))
+        );
+        assert!(
+            !user_over_global
+                .allow_write
+                .contains(&SandboxPath::dir(global_repository.path().to_path_buf())),
+            "effective user settings must override the global localRepository"
+        );
+        std::fs::write(home.path().join(".m2/settings.xml"), "<settings/>").unwrap();
+
         std::fs::create_dir_all(project.path().join(".mvn")).unwrap();
         std::fs::write(
             project.path().join(".mvn/maven.config"),
@@ -4878,6 +5093,87 @@ mod tests {
             SandboxProfile::for_ecosystem(Ecosystem::Java, home.path(), project.path());
         let error = apply_standard_profile(
             &mut project_selected_settings,
+            &["mvn".to_owned(), "validate".to_owned()],
+            home.path(),
+            project.path(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("--allow-write"));
+
+        std::fs::write(
+            project.path().join(".mvn/maven.config"),
+            "# no settings override\n",
+        )
+        .unwrap();
+        let alternate_home = tempfile::tempdir().unwrap();
+        let alternate_home_repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(alternate_home.path().join(".m2")).unwrap();
+        std::fs::write(
+            alternate_home.path().join(".m2/settings.xml"),
+            format!(
+                "<settings><localRepository>{}</localRepository></settings>",
+                alternate_home_repository.path().display()
+            ),
+        )
+        .unwrap();
+        let mut alternate_user_home =
+            SandboxProfile::for_ecosystem(Ecosystem::Java, home.path(), project.path());
+        alternate_user_home.env.insert(
+            "MAVEN_OPTS".to_owned(),
+            format!("-Duser.home={}", alternate_home.path().display()),
+        );
+        apply_standard_profile(
+            &mut alternate_user_home,
+            &["mvn".to_owned(), "validate".to_owned()],
+            home.path(),
+            project.path(),
+        )
+        .unwrap();
+        assert!(alternate_user_home.allow_write.contains(&SandboxPath::dir(
+            alternate_home_repository.path().to_path_buf()
+        )));
+
+        let alternate_default_home = tempfile::tempdir().unwrap();
+        let mut alternate_default =
+            SandboxProfile::for_ecosystem(Ecosystem::Java, home.path(), project.path());
+        alternate_default.env.insert(
+            "MAVEN_OPTS".to_owned(),
+            format!("-Duser.home={}", alternate_default_home.path().display()),
+        );
+        apply_standard_profile(
+            &mut alternate_default,
+            &["mvn".to_owned(), "validate".to_owned()],
+            home.path(),
+            project.path(),
+        )
+        .unwrap();
+        assert!(alternate_default.allow_write.contains(&SandboxPath::dir(
+            alternate_default_home.path().join(".m2/repository")
+        )));
+
+        let project_home = tempfile::tempdir().unwrap();
+        let project_home_repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project_home.path().join(".m2")).unwrap();
+        std::fs::write(
+            project_home.path().join(".m2/settings.xml"),
+            format!(
+                "<settings><localRepository>{}</localRepository></settings>",
+                project_home_repository.path().display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            project.path().join(".mvn/jvm.config"),
+            format!("-Duser.home={}\n", project_home.path().display()),
+        )
+        .unwrap();
+        let mut project_selected_home =
+            SandboxProfile::for_ecosystem(Ecosystem::Java, home.path(), project.path());
+        project_selected_home
+            .env
+            .insert("MAVEN_OPTS".to_owned(), "-Xmx1g".to_owned());
+        let error = apply_standard_profile(
+            &mut project_selected_home,
             &["mvn".to_owned(), "validate".to_owned()],
             home.path(),
             project.path(),

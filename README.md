@@ -339,7 +339,12 @@ when that target is explicitly approved with `--allow-write`.
 When no property overrides it, SBE also reads a bounded default user
 `~/.m2/settings.xml` or settings selected by command, `MAVEN_ARGS`, or
 `.mvn/maven.config`, and resolves a simple `<localRepository>` value. Ambiguous
-settings values fail early with `-Dmaven.repo.local` guidance.
+settings values fail early with `-Dmaven.repo.local` guidance. Explicit
+`-gs`/`--global-settings` files provide the fallback when user settings do not
+select a repository. `-Duser.home` in `MAVEN_OPTS` or `.mvn/jvm.config` changes
+both the default user-settings location and Maven's default repository; a
+repository-controlled home or settings selection retains the external-write
+approval gate.
 
 On macOS, secret read denials include both the configured pathname and its
 canonical target. A symlinked `~/.ssh`, `.aws`, or similar protected directory
