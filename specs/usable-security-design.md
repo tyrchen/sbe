@@ -237,6 +237,10 @@ Standard mode grants writes to:
 - an installation root only when the user's top-level command clearly requests
   an install operation.
 
+For Gradle commands, the conventional cache grant follows Gradle's effective
+user home: `--gradle-user-home`/`-g`, inherited `GRADLE_USER_HOME`, then
+`~/.gradle`. Relative selections are anchored to the command's project.
+
 It denies writes everywhere else. In particular, home-directory persistence,
 credentials, shell startup, SSH authorization, user service configuration, and
 system locations remain outside the envelope.

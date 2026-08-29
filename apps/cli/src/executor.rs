@@ -728,6 +728,18 @@ fn apply_standard_profile(
             GrantKind::AllowWrite,
             SandboxPath::dir(home.join("Library/Caches/Coursier")),
         );
+
+        if let Some(gradle_home) = effective_gradle_user_home(profile, command, home, project_dir) {
+            // Wrapper distributions, dependency caches, and daemon state all
+            // live here. Gradle also executes wrapper/worker code from this
+            // tree, so standard mode needs both halves of its mutable output.
+            insert_builtin_path_grant(
+                profile,
+                GrantKind::AllowWrite,
+                SandboxPath::dir(gradle_home.clone()),
+            );
+            insert_builtin_path_grant(profile, GrantKind::AllowExec, SandboxPath::dir(gradle_home));
+        }
     }
 
     for name in ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"] {
@@ -777,6 +789,28 @@ fn effective_environment_path(profile: &SandboxProfile, name: &str) -> Option<Pa
         .get(name)
         .map(PathBuf::from)
         .or_else(|| std::env::var_os(name).map(PathBuf::from))
+}
+
+fn effective_gradle_user_home(
+    profile: &SandboxProfile,
+    command: &[String],
+    home: &Path,
+    project_dir: &Path,
+) -> Option<PathBuf> {
+    if !command_is(command, "gradle") && !command_is(command, "gradlew") {
+        return None;
+    }
+    let selected = command_option_value(command, "--gradle-user-home")
+        .or_else(|| command_option_value(command, "-g"))
+        .map(PathBuf::from)
+        .or_else(|| effective_environment_path(profile, "GRADLE_USER_HOME"))
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| home.join(".gradle"));
+    Some(if selected.is_absolute() {
+        selected
+    } else {
+        project_dir.join(selected)
+    })
 }
 
 fn remove_builtin_workspace_read_denials(profile: &mut SandboxProfile, project_dir: &Path) {
@@ -2866,6 +2900,71 @@ mod tests {
                 .any(|allowed| paths_overlap(&allowed.path, &output)),
             "an inferred output grant must not override an explicit execute denial"
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the unit test creates an isolated Gradle home and project fixture"
+    )]
+    fn standard_gradle_profile_grants_the_effective_user_home() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let project = root.path().join("project");
+        let inherited_home = root.path().join("inherited-gradle");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+
+        let mut inherited = SandboxProfile::for_ecosystem(Ecosystem::Java, &home, &project);
+        inherited.env.insert(
+            "GRADLE_USER_HOME".to_owned(),
+            inherited_home.to_string_lossy().into_owned(),
+        );
+        apply_standard_profile(
+            &mut inherited,
+            &["./gradlew".to_owned(), "build".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap();
+        assert!(
+            inherited
+                .allow_write
+                .contains(&SandboxPath::dir(inherited_home.clone()))
+        );
+        assert!(
+            inherited
+                .allow_exec
+                .contains(&SandboxPath::dir(inherited_home))
+        );
+
+        let cli_home = PathBuf::from(".cache/gradle-cli");
+        let mut cli = SandboxProfile::for_ecosystem(Ecosystem::Java, &home, &project);
+        cli.env.insert(
+            "GRADLE_USER_HOME".to_owned(),
+            root.path()
+                .join("ignored-gradle")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        apply_standard_profile(
+            &mut cli,
+            &[
+                "gradle".to_owned(),
+                "--gradle-user-home".to_owned(),
+                cli_home.to_string_lossy().into_owned(),
+                "build".to_owned(),
+            ],
+            &home,
+            &project,
+        )
+        .unwrap();
+        let cli_home = project.join(cli_home);
+        assert!(
+            cli.allow_write
+                .contains(&SandboxPath::dir(cli_home.clone()))
+        );
+        assert!(cli.allow_exec.contains(&SandboxPath::dir(cli_home)));
     }
 
     #[test]

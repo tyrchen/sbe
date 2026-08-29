@@ -56,6 +56,9 @@ All notable changes to this project will be documented in this file. See [conven
 - Preserve explicit execute denials when standard mode infers output grants,
   filter custom AWS shared-credentials paths, and permit ordinary Unix-domain
   build-service IPC in macOS standard mode while keeping strict mode isolated.
+- Grant the effective Gradle user home for standard `gradle`/`gradlew` commands,
+  honoring the command-line option before inherited `GRADLE_USER_HOME` and the
+  conventional `~/.gradle` default.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23
