@@ -72,6 +72,8 @@ All notable changes to this project will be documented in this file. See [conven
 - Filter ECS container-credential endpoint variables, scope Cargo target grants
   to Cargo commands, and resolve unambiguous `gradle.user.home` values from
   inherited `GRADLE_OPTS` while rejecting shell-expanded forms early.
+- Resolve `gradle.user.home` from inherited `JAVA_OPTS` as well, and honor the
+  JVM's last-value-wins behavior for repeated command-line system properties.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23

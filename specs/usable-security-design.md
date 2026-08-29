@@ -268,8 +268,9 @@ one Cargo target or install root and then launch Cargo with another.
 Explicit tool arguments remain higher precedence still: Cargo `--target-dir`
 overrides target environment/config paths, while Gradle's user-home flags and
 `gradle.user.home` system property override `GRADLE_OPTS` and
-`GRADLE_USER_HOME`. A `GRADLE_OPTS` value requiring shell expansion is rejected
-with guidance to use an explicit, unambiguous user-home mechanism.
+`JAVA_OPTS`, then `GRADLE_USER_HOME`. Repeated JVM properties use the last
+value. An inherited JVM-option value requiring shell expansion is rejected with
+guidance to use an explicit, unambiguous user-home mechanism.
 
 Built-in profiles should remain small declarations of roots, domains, reserved
 environment names, and optional local IPC needs. They must not contain a second

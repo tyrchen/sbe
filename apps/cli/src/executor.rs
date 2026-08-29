@@ -840,13 +840,18 @@ fn effective_gradle_user_home(
         .or_else(|| command_option_value(command, "-g"))
         .map(PathBuf::from)
         .or_else(|| command_system_property(command, "gradle.user.home").map(PathBuf::from));
-    let gradle_opts_home = if command_home.is_none() {
-        gradle_opts_user_home(profile)?
+    let inherited_jvm_home = if command_home.is_none() {
+        let gradle_opts = jvm_options_gradle_user_home(profile, "GRADLE_OPTS")?;
+        if gradle_opts.is_some() {
+            gradle_opts
+        } else {
+            jvm_options_gradle_user_home(profile, "JAVA_OPTS")?
+        }
     } else {
         None
     };
     let selected = command_home
-        .or(gradle_opts_home)
+        .or(inherited_jvm_home)
         .or_else(|| effective_environment_path(profile, "GRADLE_USER_HOME"))
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| home.join(".gradle"));
@@ -857,12 +862,15 @@ fn effective_gradle_user_home(
     }))
 }
 
-fn gradle_opts_user_home(profile: &SandboxProfile) -> anyhow::Result<Option<PathBuf>> {
+fn jvm_options_gradle_user_home(
+    profile: &SandboxProfile,
+    variable: &str,
+) -> anyhow::Result<Option<PathBuf>> {
     let Some(options) = profile
         .env
-        .get("GRADLE_OPTS")
+        .get(variable)
         .cloned()
-        .or_else(|| std::env::var("GRADLE_OPTS").ok())
+        .or_else(|| std::env::var(variable).ok())
     else {
         return Ok(None);
     };
@@ -877,7 +885,7 @@ fn gradle_opts_user_home(profile: &SandboxProfile) -> anyhow::Result<Option<Path
                 .any(|character| matches!(character, '$' | '`' | '\\' | '\'' | '"'))
         {
             anyhow::bail!(
-                "GRADLE_OPTS selects gradle.user.home with quoting or expansion that sbe cannot \
+                "{variable} selects gradle.user.home with quoting or expansion that sbe cannot \
                  resolve safely; use --gradle-user-home or GRADLE_USER_HOME"
             );
         }
@@ -886,7 +894,7 @@ fn gradle_opts_user_home(profile: &SandboxProfile) -> anyhow::Result<Option<Path
     }
     if selected.is_none() && options.contains("-Dgradle.user.home") {
         anyhow::bail!(
-            "GRADLE_OPTS selects gradle.user.home in an unsupported form; use --gradle-user-home \
+            "{variable} selects gradle.user.home in an unsupported form; use --gradle-user-home \
              or GRADLE_USER_HOME"
         );
     }
@@ -1541,6 +1549,7 @@ fn command_system_property<'a>(command: &'a [String], name: &str) -> Option<&'a 
         .iter()
         .skip(1)
         .take_while(|argument| argument.as_str() != "--");
+    let mut selected = None;
     while let Some(argument) = arguments.next() {
         let property = if argument == "-D" || argument == "--system-prop" {
             arguments.next().map(String::as_str)
@@ -1554,10 +1563,10 @@ fn command_system_property<'a>(command: &'a [String], name: &str) -> Option<&'a 
                 .strip_prefix(name)
                 .and_then(|suffix| suffix.strip_prefix('='))
         }) {
-            return Some(value);
+            selected = Some(value);
         }
     }
-    None
+    selected
 }
 
 #[cfg(target_os = "linux")]
@@ -3149,6 +3158,10 @@ mod tests {
             &mut property,
             &[
                 "gradle".to_owned(),
+                format!(
+                    "-Dgradle.user.home={}",
+                    root.path().join("ignored-first-property").display()
+                ),
                 format!("-Dgradle.user.home={}", property_home.display()),
                 "build".to_owned(),
             ],
@@ -3186,6 +3199,36 @@ mod tests {
             let path = opts_home.join(name);
             assert!(opts.allow_write.contains(&SandboxPath::dir(path.clone())));
             assert!(opts.allow_exec.contains(&SandboxPath::dir(path)));
+        }
+
+        let java_opts_home = root.path().join("java-opts-gradle");
+        let mut java_opts = SandboxProfile::for_ecosystem(Ecosystem::Java, &home, &project);
+        java_opts.env.insert(
+            "JAVA_OPTS".to_owned(),
+            format!("-Dgradle.user.home={}", java_opts_home.display()),
+        );
+        java_opts.env.insert(
+            "GRADLE_USER_HOME".to_owned(),
+            root.path()
+                .join("ignored-environment-home")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        apply_standard_profile(
+            &mut java_opts,
+            &["gradle".to_owned(), "build".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap();
+        for name in STANDARD_GRADLE_MUTABLE_SUBDIRECTORIES {
+            let path = java_opts_home.join(name);
+            assert!(
+                java_opts
+                    .allow_write
+                    .contains(&SandboxPath::dir(path.clone()))
+            );
+            assert!(java_opts.allow_exec.contains(&SandboxPath::dir(path)));
         }
 
         let mut ambiguous = SandboxProfile::for_ecosystem(Ecosystem::Java, &home, &project);
