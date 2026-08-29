@@ -220,7 +220,7 @@ fn section_network(
         }
     }
 
-    if !security_mode.is_strict() {
+    if !security_mode.is_strict() && profile.network_mode != NetworkMode::DenyAll {
         // Standard mode intentionally trusts ordinary same-user local build
         // services. Keep IP traffic constrained by the mode-specific rules
         // above while allowing pathname Unix-domain clients and servers.
@@ -442,6 +442,13 @@ mod tests {
 
         assert!(sbpl.contains("(deny network*)"));
         assert!(!sbpl.contains("(remote tcp \"*:443\")"));
+        assert!(!sbpl.contains("(local unix-socket)"));
+        assert!(!sbpl.contains("(remote unix-socket)"));
+
+        let standard = generate(&profile, None, SecurityMode::Standard).unwrap();
+        assert!(standard.contains("(deny network*)"));
+        assert!(!standard.contains("(local unix-socket)"));
+        assert!(!standard.contains("(remote unix-socket)"));
     }
 
     #[test]

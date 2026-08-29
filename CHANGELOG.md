@@ -59,6 +59,8 @@ All notable changes to this project will be documented in this file. See [conven
 - Grant the effective Gradle user home for standard `gradle`/`gradlew` commands,
   honoring the command-line option before inherited `GRADLE_USER_HOME` and the
   conventional `~/.gradle` default.
+- Keep macOS `DenyAll` authoritative by withholding standard-mode Unix-socket
+  compatibility grants when the effective network policy denies all traffic.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23
