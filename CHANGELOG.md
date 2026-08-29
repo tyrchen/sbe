@@ -137,6 +137,9 @@ All notable changes to this project will be documented in this file. See [conven
   cache grants with command/environment-selected cache directories.
 - Honor command-selected npm user configuration, pip user-config cache paths,
   and platform-native macOS pip/uv cache locations.
+- Follow `PNPM_HOME/store`, require read approval when project Maven JVM config
+  relocates `.m2` outside the workspace, and resolve uv project-configured cache
+  directories behind the external-write gate.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23

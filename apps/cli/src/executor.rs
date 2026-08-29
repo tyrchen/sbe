@@ -798,6 +798,13 @@ fn apply_standard_profile(
         replace_builtin_write_path(profile, &conventional, SandboxPath::dir(pnpm_store.path));
     }
     if let Some(cache) = effective_python_cache(profile, command, home, project_dir)? {
+        if cache.project_controlled
+            && !project_write_path_is_approved(profile, &cache.selected, project_dir)
+        {
+            let resolved = resolve_existing_ancestor(&cache.selected)
+                .unwrap_or_else(|| cache.selected.clone());
+            return Err(external_write_approval_error(&cache.selected, &resolved));
+        }
         replace_builtin_write_path(
             profile,
             &cache.conventional,
@@ -1236,8 +1243,12 @@ fn effective_pnpm_store(
             None
         };
     let project_controlled = project_store.is_some();
-    let default_store = effective_environment_path(profile, "XDG_DATA_HOME")
-        .map(|directory| directory.join("pnpm"))
+    let default_store = effective_environment_path(profile, "PNPM_HOME")
+        .map(|directory| directory.join("store"))
+        .or_else(|| {
+            effective_environment_path(profile, "XDG_DATA_HOME")
+                .map(|directory| directory.join("pnpm"))
+        })
         .unwrap_or_else(|| home.join(".local/share/pnpm"));
     let selected = command_store
         .or(environment_store)
@@ -1260,6 +1271,7 @@ fn effective_pnpm_store(
 struct CacheReplacement {
     conventional: PathBuf,
     selected: PathBuf,
+    project_controlled: bool,
 }
 
 fn effective_python_cache(
@@ -1291,6 +1303,16 @@ fn effective_python_cache(
         } else {
             None
         };
+    let project_cache = if command_cache.is_none()
+        && environment_cache.is_none()
+        && config_cache.is_none()
+        && default_name == "uv"
+    {
+        effective_project_uv_cache(project_dir)?
+    } else {
+        None
+    };
+    let project_controlled = project_cache.is_some();
     let conventional = home.join(".cache").join(default_name);
     let default_cache = effective_environment_path(profile, "XDG_CACHE_HOME")
         .map(|directory| directory.join(default_name))
@@ -1298,6 +1320,7 @@ fn effective_python_cache(
     let selected = command_cache
         .or(environment_cache)
         .or(config_cache)
+        .or(project_cache)
         .unwrap_or(default_cache);
     if selected.as_os_str().is_empty() {
         anyhow::bail!("{environment_name} must select a non-empty path");
@@ -1309,7 +1332,93 @@ fn effective_python_cache(
         } else {
             project_dir.join(selected)
         },
+        project_controlled,
     }))
+}
+
+fn effective_project_uv_cache(project_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
+    let uv_toml = project_dir.join("uv.toml");
+    if let Some(contents) = read_bounded_project_file(&uv_toml)? {
+        // uv.toml takes precedence over an adjacent pyproject.toml even when it does not set
+        // cache-dir, so do not fall through once the higher-priority file exists.
+        return uv_config_cache_path(&contents, &uv_toml, false);
+    }
+
+    let pyproject = project_dir.join("pyproject.toml");
+    let Some(contents) = read_bounded_project_file(&pyproject)? else {
+        return Ok(None);
+    };
+    uv_config_cache_path(&contents, &pyproject, true)
+}
+
+fn uv_config_cache_path(
+    contents: &[u8],
+    path: &Path,
+    pyproject: bool,
+) -> anyhow::Result<Option<PathBuf>> {
+    let contents = std::str::from_utf8(contents)
+        .with_context(|| format!("uv configuration is not UTF-8: {}", path.display()))?;
+    let mut selected = None;
+    let mut in_selected_table = !pyproject;
+    for raw_line in contents.lines() {
+        let line = strip_toml_comment(raw_line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            let table = line.trim_matches(['[', ']']).trim();
+            in_selected_table =
+                pyproject && simple_toml_key_path(table).is_some_and(|path| path == ["tool", "uv"]);
+            continue;
+        }
+        if !in_selected_table {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if !simple_toml_key_path(key.trim()).is_some_and(|path| path == ["cache-dir"]) {
+            continue;
+        }
+        if selected.is_some() {
+            anyhow::bail!(
+                "uv configuration '{}' defines cache-dir more than once; use an explicit uv \
+                 --cache-dir path",
+                path.display()
+            );
+        }
+        selected = Some(simple_uv_cache_path(value.trim(), path)?);
+    }
+    Ok(selected)
+}
+
+fn simple_uv_cache_path(value: &str, source: &Path) -> anyhow::Result<PathBuf> {
+    let unquoted = if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
+        &value[1..value.len() - 1]
+    } else if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+        let unquoted = &value[1..value.len() - 1];
+        if unquoted.contains('\\') || unquoted.contains('"') {
+            anyhow::bail!(
+                "uv configuration '{}' uses an escaped or multiline cache-dir; use an explicit \
+                 uv --cache-dir path",
+                source.display()
+            );
+        }
+        unquoted
+    } else {
+        anyhow::bail!(
+            "uv configuration '{}' selects cache-dir in a form sbe cannot resolve safely; use an \
+             explicit uv --cache-dir path",
+            source.display()
+        );
+    };
+    if unquoted.is_empty() || unquoted.chars().any(char::is_control) {
+        anyhow::bail!(
+            "uv configuration '{}' must select a non-empty unambiguous cache-dir",
+            source.display()
+        );
+    }
+    Ok(PathBuf::from(unquoted))
 }
 
 fn effective_pip_config_cache(
@@ -1425,6 +1534,17 @@ fn project_cache_is_approved(
         || explicit_write_covers(profile, &resolved)
 }
 
+fn project_write_path_is_approved(
+    profile: &SandboxProfile,
+    path: &Path,
+    project_dir: &Path,
+) -> bool {
+    let resolved = resolve_existing_ancestor(path).unwrap_or_else(|| path.to_path_buf());
+    let project =
+        resolve_existing_ancestor(project_dir).unwrap_or_else(|| project_dir.to_path_buf());
+    resolved.starts_with(project) || explicit_write_covers(profile, &resolved)
+}
+
 fn effective_cargo_home(profile: &SandboxProfile, home: &Path, project_dir: &Path) -> PathBuf {
     let cargo_home =
         effective_environment_path(profile, "CARGO_HOME").unwrap_or_else(|| home.join(".cargo"));
@@ -1533,10 +1653,21 @@ fn effective_maven_settings_read_paths(
     if !command_is(command, "mvn") && !command_is(command, "mvnw") {
         return Ok(Vec::new());
     }
-    let (user_home, _) = effective_maven_user_home(profile, home, project_dir)?;
+    let (user_home, user_home_project_controlled) =
+        effective_maven_user_home(profile, home, project_dir)?;
     let mut paths = Vec::new();
     if user_home != home {
-        paths.push(SandboxPath::dir(user_home.join(".m2")));
+        let maven_config = user_home.join(".m2");
+        if user_home_project_controlled {
+            let resolved =
+                resolve_existing_ancestor(&maven_config).unwrap_or_else(|| maven_config.clone());
+            let project =
+                resolve_existing_ancestor(project_dir).unwrap_or_else(|| project_dir.to_path_buf());
+            if !resolved.starts_with(project) && !explicit_read_covers(profile, &resolved) {
+                return Err(external_read_approval_error(&maven_config, &resolved));
+            }
+        }
+        paths.push(SandboxPath::dir(maven_config));
     }
     for settings in [
         selected_maven_settings(profile, command, project_dir, "--global-settings", "-gs")?,
@@ -4900,6 +5031,82 @@ mod tests {
                 .contains(&SandboxPath::dir(project.join("relative-uv-cache")))
         );
 
+        let project_uv_cache = root.path().join("project-uv-cache");
+        let ignored_pyproject_cache = root.path().join("ignored-pyproject-cache");
+        std::fs::create_dir_all(&project_uv_cache).unwrap();
+        std::fs::write(
+            project.join("uv.toml"),
+            format!("cache-dir = '{}'\n", project_uv_cache.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("pyproject.toml"),
+            format!(
+                "[tool.uv]\ncache-dir = '{}'\n",
+                ignored_pyproject_cache.display()
+            ),
+        )
+        .unwrap();
+        let mut uv_project_unapproved =
+            SandboxProfile::for_ecosystem(Ecosystem::Python, &home, &project);
+        let error = apply_standard_profile(
+            &mut uv_project_unapproved,
+            &["uv".to_owned(), "sync".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("--allow-write"));
+        assert!(
+            error
+                .to_string()
+                .contains(&project_uv_cache.display().to_string())
+        );
+
+        let mut uv_project_approved =
+            SandboxProfile::for_ecosystem(Ecosystem::Python, &home, &project);
+        uv_project_approved
+            .allow_write
+            .push(SandboxPath::dir(project_uv_cache.clone()));
+        apply_standard_profile(
+            &mut uv_project_approved,
+            &["uv".to_owned(), "sync".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap();
+        assert!(
+            uv_project_approved
+                .allow_write
+                .contains(&SandboxPath::dir(project_uv_cache))
+        );
+        assert!(
+            !uv_project_approved
+                .allow_write
+                .contains(&SandboxPath::dir(ignored_pyproject_cache)),
+            "uv.toml must take precedence over an adjacent pyproject.toml"
+        );
+
+        let pyproject_only = root.path().join("pyproject-only");
+        std::fs::create_dir_all(&pyproject_only).unwrap();
+        std::fs::write(
+            pyproject_only.join("pyproject.toml"),
+            "[tool.uv]\ncache-dir = 'relative-project-cache'\n",
+        )
+        .unwrap();
+        let mut uv_pyproject =
+            SandboxProfile::for_ecosystem(Ecosystem::Python, &home, &pyproject_only);
+        apply_standard_profile(
+            &mut uv_pyproject,
+            &["uv".to_owned(), "sync".to_owned()],
+            &home,
+            &pyproject_only,
+        )
+        .unwrap();
+        assert!(uv_pyproject.allow_write.contains(&SandboxPath::dir(
+            pyproject_only.join("relative-project-cache")
+        )));
+
         let pip_cache = root.path().join("pip-environment-cache");
         let mut pip = SandboxProfile::for_ecosystem(Ecosystem::Python, &home, &project);
         pip.env.insert(
@@ -5957,6 +6164,23 @@ mod tests {
             .insert("MAVEN_OPTS".to_owned(), "-Xmx1g".to_owned());
         let error = apply_standard_profile(
             &mut project_selected_home,
+            &["mvn".to_owned(), "validate".to_owned()],
+            home.path(),
+            project.path(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("--allow-read"));
+
+        let mut project_home_read_approved =
+            SandboxProfile::for_ecosystem(Ecosystem::Java, home.path(), project.path());
+        project_home_read_approved
+            .allow_read
+            .push(SandboxPath::dir(project_home.path().join(".m2")));
+        project_home_read_approved
+            .env
+            .insert("MAVEN_OPTS".to_owned(), "-Xmx1g".to_owned());
+        let error = apply_standard_profile(
+            &mut project_home_read_approved,
             &["mvn".to_owned(), "validate".to_owned()],
             home.path(),
             project.path(),
@@ -7168,6 +7392,26 @@ mod tests {
             command_userconfig_selected
                 .allow_read
                 .contains(&SandboxPath::file(command_userconfig))
+        );
+
+        let pnpm_home = root.path().join("custom-pnpm-home");
+        let mut pnpm_home_selected =
+            SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &project);
+        pnpm_home_selected.env.insert(
+            "PNPM_HOME".to_owned(),
+            pnpm_home.to_string_lossy().into_owned(),
+        );
+        apply_standard_profile(
+            &mut pnpm_home_selected,
+            &["pnpm".to_owned(), "install".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap();
+        assert!(
+            pnpm_home_selected
+                .allow_write
+                .contains(&SandboxPath::dir(pnpm_home.join("store")))
         );
 
         let command_store = root.path().join("command-pnpm-store");

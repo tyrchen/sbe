@@ -244,13 +244,18 @@ user layer and receives an exact read grant.
 pnpm's `--store-dir`, configuration environment, project `.npmrc`, and user
 `.npmrc` select its store in the same manner. The effective cache/store replaces
 the corresponding default writable grant; relative paths are anchored to the
-command project. A repository-selected external path requires `--allow-write`.
+command project. Without an override, `PNPM_HOME/store` precedes the XDG and
+conventional defaults. A repository-selected external path requires
+`--allow-write`.
 
 For uv and pip commands, `--cache-dir` overrides the corresponding
-`UV_CACHE_DIR` or `PIP_CACHE_DIR`, followed by `XDG_CACHE_HOME` and the
-conventional cache. pip also resolves `cache-dir` from its legacy/current user
-configuration after environment overrides. The selected cache replaces only
-that tool's default grant. Conventional macOS caches live beneath
+`UV_CACHE_DIR` or `PIP_CACHE_DIR`. uv then resolves a simple `cache-dir` from
+project `uv.toml`, or `[tool.uv]` in `pyproject.toml` when no adjacent
+`uv.toml` exists. pip resolves `cache-dir` from its legacy/current user
+configuration after environment overrides. `XDG_CACHE_HOME` and the
+conventional cache are the final fallback. The selected cache replaces only
+that tool's default grant; a repository-selected uv cache outside the workspace
+requires `--allow-write`. Conventional macOS caches live beneath
 `~/Library/Caches`; Linux follows XDG conventions.
 
 For Gradle commands, the conventional cache grant follows Gradle's effective
@@ -285,8 +290,10 @@ command and host-environment sources continue to represent direct user intent.
 Explicit user/global settings files and the effective user `.m2` directory are
 granted read-only access; only the selected repository receives write access.
 A settings path selected by repository-controlled Maven config must stay inside
-the workspace or receive explicit `--allow-read` approval. Built-in secret
-denials remain sealed even against an explicit read grant.
+the workspace or receive explicit `--allow-read` approval. The same read gate
+applies when project `.mvn/jvm.config` changes `user.home` and therefore the
+effective `.m2` directory. Built-in secret denials remain sealed even against
+an explicit read grant.
 
 It denies writes everywhere else. In particular, home-directory persistence,
 credentials, shell startup, SSH authorization, user service configuration, and

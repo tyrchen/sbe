@@ -217,13 +217,17 @@ simple project `.npmrc` `cache=path`, user `~/.npmrc`, and the default `~/.npm`.
 layer and receives an exact read grant.
 For pnpm, `--store-dir`, its configuration environment, project `.npmrc`, and
 user `.npmrc` similarly select the store. Relative paths are anchored to the
-selected project. An external project-selected cache/store requires explicit
-`--allow-write` approval.
+selected project. Without a store override, `PNPM_HOME/store` precedes the XDG
+and conventional defaults. An external project-selected cache/store requires
+explicit `--allow-write` approval.
 For uv and pip, command `--cache-dir` overrides `UV_CACHE_DIR` or
-`PIP_CACHE_DIR`, then `XDG_CACHE_HOME` and the conventional cache. The effective
-cache replaces only that tool's default writable grant. pip also reads its
-legacy/current user configuration for `cache-dir`. Without overrides, macOS
-uses `~/Library/Caches/{pip,uv}` and Linux uses the XDG cache home.
+`PIP_CACHE_DIR`. uv then reads project `uv.toml`, or `[tool.uv]` in
+`pyproject.toml` when no `uv.toml` exists; an external project-selected cache
+requires explicit `--allow-write` approval. pip reads its legacy/current user
+configuration for `cache-dir`. The XDG or conventional platform cache is the
+final fallback, and the effective cache replaces only that tool's default
+writable grant. Without overrides, macOS uses `~/Library/Caches/{pip,uv}` and
+Linux uses the XDG cache home.
 An external Cargo target can be selected with an inherited `CARGO_TARGET_DIR`
 or a direct `--config build.target-dir='path'` override, or granted explicitly
 with matching `--allow-write` and `--allow-exec` paths. Cargo `--config` file
