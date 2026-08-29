@@ -239,7 +239,9 @@ Standard mode grants writes to:
 
 For Gradle commands, the conventional cache grant follows Gradle's effective
 user home: `--gradle-user-home`/`-g`, inherited `GRADLE_USER_HOME`, then
-`~/.gradle`. Relative selections are anchored to the command's project.
+`~/.gradle`. Relative selections are anchored to the command's project. Only
+runtime subdirectories such as caches, wrapper distributions, daemons, and
+toolchains are writable; the user-home root and `init.d` remain immutable.
 
 It denies writes everywhere else. In particular, home-directory persistence,
 credentials, shell startup, SSH authorization, user service configuration, and

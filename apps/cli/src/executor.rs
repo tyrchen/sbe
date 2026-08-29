@@ -32,6 +32,15 @@ use crate::cli::RunArgs;
 /// sbe exit codes for its own errors (matching docker run / env conventions).
 const EXIT_SBE_ERROR: u8 = 125;
 const EXIT_SANDBOX_FAILED: u8 = 126;
+const STANDARD_GRADLE_MUTABLE_SUBDIRECTORIES: &[&str] = &[
+    "caches",
+    "daemon",
+    "jdks",
+    "native",
+    "notifications",
+    "workers",
+    "wrapper",
+];
 #[cfg(target_os = "linux")]
 const MAX_SOURCE_SYMLINK_SCAN_ENTRIES: usize = 100_000;
 #[cfg(target_os = "linux")]
@@ -105,6 +114,10 @@ async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
         enable_existing_dependency_execution(&mut profile, &args.command);
     } else {
         apply_standard_profile(&mut profile, &args.command, &home, &pwd)?;
+        #[cfg(target_os = "macos")]
+        if !args.dry_run {
+            prepare_standard_gradle_directories(&profile, &args.command, &home, &pwd)?;
+        }
         resolve_standard_path_aliases(&mut profile, &home, &pwd)?;
     }
 
@@ -730,15 +743,18 @@ fn apply_standard_profile(
         );
 
         if let Some(gradle_home) = effective_gradle_user_home(profile, command, home, project_dir) {
-            // Wrapper distributions, dependency caches, and daemon state all
-            // live here. Gradle also executes wrapper/worker code from this
-            // tree, so standard mode needs both halves of its mutable output.
-            insert_builtin_path_grant(
-                profile,
-                GrantKind::AllowWrite,
-                SandboxPath::dir(gradle_home.clone()),
-            );
-            insert_builtin_path_grant(profile, GrantKind::AllowExec, SandboxPath::dir(gradle_home));
+            // Keep init.d and root-level initialization scripts immutable.
+            // Standard mode accepts cache poisoning, but should not provide a
+            // direct unsandboxed-startup persistence mechanism.
+            for name in STANDARD_GRADLE_MUTABLE_SUBDIRECTORIES {
+                let path = gradle_home.join(name);
+                insert_builtin_path_grant(
+                    profile,
+                    GrantKind::AllowWrite,
+                    SandboxPath::dir(path.clone()),
+                );
+                insert_builtin_path_grant(profile, GrantKind::AllowExec, SandboxPath::dir(path));
+            }
         }
     }
 
@@ -811,6 +827,32 @@ fn effective_gradle_user_home(
     } else {
         project_dir.join(selected)
     })
+}
+
+#[cfg(target_os = "macos")]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the trusted parent prepares exact Gradle runtime directories before sandboxing"
+)]
+fn prepare_standard_gradle_directories(
+    profile: &SandboxProfile,
+    command: &[String],
+    home: &Path,
+    project_dir: &Path,
+) -> anyhow::Result<()> {
+    let Some(gradle_home) = effective_gradle_user_home(profile, command, home, project_dir) else {
+        return Ok(());
+    };
+    for name in STANDARD_GRADLE_MUTABLE_SUBDIRECTORIES {
+        let path = gradle_home.join(name);
+        std::fs::create_dir_all(&path).with_context(|| {
+            format!(
+                "could not prepare Gradle runtime directory '{}'",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn remove_builtin_workspace_read_denials(profile: &mut SandboxProfile, project_dir: &Path) {
@@ -2927,16 +2969,41 @@ mod tests {
             &project,
         )
         .unwrap();
+        for name in STANDARD_GRADLE_MUTABLE_SUBDIRECTORIES {
+            let path = inherited_home.join(name);
+            assert!(
+                inherited
+                    .allow_write
+                    .contains(&SandboxPath::dir(path.clone()))
+            );
+            assert!(inherited.allow_exec.contains(&SandboxPath::dir(path)));
+        }
         assert!(
-            inherited
+            !inherited
                 .allow_write
                 .contains(&SandboxPath::dir(inherited_home.clone()))
         );
         assert!(
-            inherited
-                .allow_exec
-                .contains(&SandboxPath::dir(inherited_home))
+            !inherited
+                .allow_write
+                .iter()
+                .any(|grant| grant.path.starts_with(inherited_home.join("init.d")))
         );
+
+        #[cfg(target_os = "macos")]
+        {
+            prepare_standard_gradle_directories(
+                &inherited,
+                &["./gradlew".to_owned(), "build".to_owned()],
+                &home,
+                &project,
+            )
+            .unwrap();
+            for name in STANDARD_GRADLE_MUTABLE_SUBDIRECTORIES {
+                assert!(inherited_home.join(name).is_dir());
+            }
+            assert!(!inherited_home.join("init.d").exists());
+        }
 
         let cli_home = PathBuf::from(".cache/gradle-cli");
         let mut cli = SandboxProfile::for_ecosystem(Ecosystem::Java, &home, &project);
@@ -2960,11 +3027,12 @@ mod tests {
         )
         .unwrap();
         let cli_home = project.join(cli_home);
-        assert!(
-            cli.allow_write
-                .contains(&SandboxPath::dir(cli_home.clone()))
-        );
-        assert!(cli.allow_exec.contains(&SandboxPath::dir(cli_home)));
+        for name in STANDARD_GRADLE_MUTABLE_SUBDIRECTORIES {
+            let path = cli_home.join(name);
+            assert!(cli.allow_write.contains(&SandboxPath::dir(path.clone())));
+            assert!(cli.allow_exec.contains(&SandboxPath::dir(path)));
+        }
+        assert!(!cli.allow_write.contains(&SandboxPath::dir(cli_home)));
     }
 
     #[test]

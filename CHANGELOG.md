@@ -56,9 +56,10 @@ All notable changes to this project will be documented in this file. See [conven
 - Preserve explicit execute denials when standard mode infers output grants,
   filter custom AWS shared-credentials paths, and permit ordinary Unix-domain
   build-service IPC in macOS standard mode while keeping strict mode isolated.
-- Grant the effective Gradle user home for standard `gradle`/`gradlew` commands,
-  honoring the command-line option before inherited `GRADLE_USER_HOME` and the
-  conventional `~/.gradle` default.
+- Grant only mutable runtime subdirectories beneath the effective Gradle user
+  home for standard `gradle`/`gradlew` commands, honoring the command-line
+  option before inherited `GRADLE_USER_HOME` and the conventional `~/.gradle`
+  default while keeping initialization scripts immutable.
 - Keep macOS `DenyAll` authoritative by withholding standard-mode Unix-socket
   compatibility grants when the effective network policy denies all traffic.
 
