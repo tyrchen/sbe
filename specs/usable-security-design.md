@@ -244,6 +244,10 @@ to the command's project. Only runtime subdirectories such as `.tmp`, caches,
 wrapper distributions, daemons, and toolchains are writable; the user-home root
 and `init.d` remain immutable.
 
+For Maven commands, `-D`/`--define maven.repo.local=path` selects the writable
+local repository and replaces the default `~/.m2/repository` write grant.
+Relative selections are anchored to the command project.
+
 It denies writes everywhere else. In particular, home-directory persistence,
 credentials, shell startup, SSH authorization, user service configuration, and
 system locations remain outside the envelope.
@@ -266,9 +270,9 @@ Path grants derived from environment variables use the same final precedence
 as the child environment: trusted configuration and explicit CLI environment
 values override the parent environment. Policy compilation must not authorize
 one Cargo target or install root and then launch Cargo with another.
-Explicit tool arguments remain higher precedence still: Cargo `--target-dir`
-overrides direct `--config build.target-dir='path'` and target environment
-paths, while Gradle's user-home flags and
+Tool-native precedence must be preserved: Cargo `--target-dir` wins first,
+then Cargo target environment variables, then a direct
+`--config build.target-dir='path'`. Gradle's user-home flags and
 `gradle.user.home` system property override `GRADLE_OPTS` and
 `JAVA_OPTS`, then `GRADLE_USER_HOME`. Repeated JVM properties use the last
 value. An inherited JVM-option value requiring shell expansion is rejected with
@@ -408,7 +412,8 @@ feature switches, terminal settings, and tool paths. It removes:
   prefix-encoded forms such as Terraform's `TF_TOKEN_<host>` and concatenated
   platform names such as Azure Pipelines' `SYSTEM_ACCESSTOKEN`, plus OIDC bearer
   paths such as `AWS_WEB_IDENTITY_TOKEN_FILE` and custom credential stores such
-  as `AWS_SHARED_CREDENTIALS_FILE`, `CLOUDSDK_CONFIG`, and `AZURE_CONFIG_DIR`;
+  as `AWS_SHARED_CREDENTIALS_FILE`, `CLOUDSDK_CONFIG`, `AZURE_CONFIG_DIR`, and
+  Docker client TLS key directories selected by `DOCKER_CERT_PATH`;
 - agent and credential socket variables;
 - dynamic-loader injection variables; and
 - SBE-reserved proxy, runtime, and policy variables.

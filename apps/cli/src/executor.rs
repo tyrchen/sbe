@@ -489,6 +489,10 @@ async fn build_extra_env(
         && profile_name == "rust"
         && !env.contains_key("CARGO_TARGET_DIR")
         && !env.contains_key("CARGO_BUILD_TARGET_DIR")
+        && !profile.env.contains_key("CARGO_TARGET_DIR")
+        && !profile.env.contains_key("CARGO_BUILD_TARGET_DIR")
+        && command_option_value(command, "--target-dir").is_none()
+        && cargo_config_target_dir(command)?.is_none()
     {
         insert_runtime_environment(
             profile,
@@ -628,6 +632,7 @@ fn is_sensitive_environment_name(name: &str) -> bool {
         "CREDENTIALS",
         "DATABASE_URL",
         "DOCKER_AUTH_CONFIG",
+        "DOCKER_CERT_PATH",
         "DOCKER_CONFIG",
         "GPG_AGENT_INFO",
         "GOOGLE_APPLICATION_CREDENTIALS",
@@ -740,6 +745,13 @@ fn apply_standard_profile(
     }
 
     if profile.name == "java" {
+        if let Some(repository) = effective_maven_local_repository(command, home, project_dir)? {
+            replace_builtin_write_path(
+                profile,
+                &home.join(".m2/repository"),
+                SandboxPath::dir(repository),
+            );
+        }
         // Standard mode uses the package manager's ordinary persistent
         // caches. Strict mode redirects these into the private runtime root.
         for cache in [
@@ -775,12 +787,7 @@ fn apply_standard_profile(
 
     if command_is(command, "cargo") {
         let cargo_cli_target = command_option_value(command, "--target-dir").map(PathBuf::from);
-        let cargo_config_target = if cargo_cli_target.is_none() {
-            cargo_config_target_dir(command)?
-        } else {
-            None
-        };
-        if let Some(path) = cargo_cli_target.or(cargo_config_target) {
+        if let Some(path) = cargo_cli_target {
             let path = if path.is_absolute() {
                 path
             } else {
@@ -793,10 +800,25 @@ fn apply_standard_profile(
             );
             insert_builtin_path_grant(profile, GrantKind::AllowExec, SandboxPath::dir(path));
         } else {
+            let mut environment_target = false;
             for name in ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"] {
                 let Some(path) = effective_environment_path(profile, name) else {
                     continue;
                 };
+                environment_target = true;
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    project_dir.join(path)
+                };
+                insert_builtin_path_grant(
+                    profile,
+                    GrantKind::AllowWrite,
+                    SandboxPath::dir(path.clone()),
+                );
+                insert_builtin_path_grant(profile, GrantKind::AllowExec, SandboxPath::dir(path));
+            }
+            if !environment_target && let Some(path) = cargo_config_target_dir(command)? {
                 let path = if path.is_absolute() {
                     path
                 } else {
@@ -876,6 +898,32 @@ fn effective_gradle_user_home(
     } else {
         project_dir.join(selected)
     }))
+}
+
+fn effective_maven_local_repository(
+    command: &[String],
+    home: &Path,
+    project_dir: &Path,
+) -> anyhow::Result<Option<PathBuf>> {
+    if !command_is(command, "mvn") && !command_is(command, "mvnw") {
+        return Ok(None);
+    }
+    let Some(value) = command_maven_property(command, "maven.repo.local") else {
+        return Ok(None);
+    };
+    if value.is_empty() || value.chars().any(char::is_control) {
+        anyhow::bail!("maven.repo.local must be a non-empty path without control characters");
+    }
+    let path = PathBuf::from(value);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        project_dir.join(path)
+    };
+    if path == home.join(".m2/repository") {
+        return Ok(None);
+    }
+    Ok(Some(path))
 }
 
 fn jvm_options_gradle_user_home(
@@ -1072,6 +1120,40 @@ fn insert_builtin_path_grant(profile: &mut SandboxProfile, kind: GrantKind, gran
         value,
         origin: GrantOrigin::BuiltIn,
     });
+}
+
+fn replace_builtin_write_path(
+    profile: &mut SandboxProfile,
+    current: &Path,
+    replacement: SandboxPath,
+) {
+    if replacement.path == current {
+        return;
+    }
+    let built_in_boundary = profile
+        .first_user_allow_write
+        .min(profile.allow_write.len());
+    let mut removed = 0_usize;
+    profile.allow_write = profile
+        .allow_write
+        .drain(..)
+        .enumerate()
+        .filter_map(|(index, grant)| {
+            if index < built_in_boundary && grant.path == current {
+                removed += 1;
+                None
+            } else {
+                Some(grant)
+            }
+        })
+        .collect();
+    profile.first_user_allow_write = built_in_boundary.saturating_sub(removed);
+    profile.grant_origins.retain(|record| {
+        record.kind != GrantKind::AllowWrite
+            || record.origin != GrantOrigin::BuiltIn
+            || record.value != current.to_string_lossy()
+    });
+    insert_builtin_path_grant(profile, GrantKind::AllowWrite, replacement);
 }
 
 #[allow(
@@ -1624,6 +1706,9 @@ fn command_aliased_option_value<'a>(
 }
 
 fn cargo_config_target_dir(command: &[String]) -> anyhow::Result<Option<PathBuf>> {
+    if !command_is(command, "cargo") {
+        return Ok(None);
+    }
     let mut arguments = command
         .iter()
         .skip(1)
@@ -1698,6 +1783,31 @@ fn command_system_property<'a>(command: &'a [String], name: &str) -> Option<&'a 
             argument
                 .strip_prefix("-D")
                 .or_else(|| argument.strip_prefix("--system-prop="))
+        };
+        if let Some(value) = property.and_then(|property| {
+            property
+                .strip_prefix(name)
+                .and_then(|suffix| suffix.strip_prefix('='))
+        }) {
+            selected = Some(value);
+        }
+    }
+    selected
+}
+
+fn command_maven_property<'a>(command: &'a [String], name: &str) -> Option<&'a str> {
+    let mut arguments = command
+        .iter()
+        .skip(1)
+        .take_while(|argument| argument.as_str() != "--");
+    let mut selected = None;
+    while let Some(argument) = arguments.next() {
+        let property = if argument == "-D" || argument == "--define" {
+            arguments.next().map(String::as_str)
+        } else {
+            argument
+                .strip_prefix("-D")
+                .or_else(|| argument.strip_prefix("--define="))
         };
         if let Some(value) = property.and_then(|property| {
             property
@@ -2964,6 +3074,10 @@ mod tests {
                 ("CREDENTIAL".to_owned(), "sentinel".to_owned()),
                 ("CREDENTIALS".to_owned(), "sentinel".to_owned()),
                 ("DATABASE_URL".to_owned(), "sentinel".to_owned()),
+                (
+                    "DOCKER_CERT_PATH".to_owned(),
+                    "/tmp/docker-certs".to_owned(),
+                ),
                 ("DOCKER_CONFIG".to_owned(), "/tmp/docker-config".to_owned()),
                 ("TEST_DATABASE_URL".to_owned(), "sentinel".to_owned()),
                 ("PGPASSWORD".to_owned(), "sentinel".to_owned()),
@@ -3166,6 +3280,27 @@ mod tests {
         );
         assert!(!environment.contains_key("SCCACHE_CLIENT_SIDE"));
         assert!(!environment.contains_key("CARGO_BUILD_BUILD_DIR"));
+
+        let configured_environment = build_extra_env(
+            &mut profile,
+            None,
+            runtime.path(),
+            Path::new("/Users/test"),
+            project.path(),
+            &[
+                "cargo".to_owned(),
+                "build".to_owned(),
+                "--config".to_owned(),
+                "build.target-dir='configured-target'".to_owned(),
+            ],
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !configured_environment.contains_key("CARGO_TARGET_DIR"),
+            "the standard fallback must not override Cargo command-line configuration"
+        );
     }
 
     #[test]
@@ -3873,6 +4008,31 @@ mod tests {
         );
         let _ = shutdown_tx.send(true);
         await_proxy_shutdown(proxy).await.unwrap();
+
+        let custom_repository = tempfile::tempdir().unwrap();
+        let mut maven = SandboxProfile::for_ecosystem(Ecosystem::Java, home.path(), project.path());
+        apply_standard_profile(
+            &mut maven,
+            &[
+                "mvn".to_owned(),
+                format!("-Dmaven.repo.local={}", custom_repository.path().display()),
+                "package".to_owned(),
+            ],
+            home.path(),
+            project.path(),
+        )
+        .unwrap();
+        assert!(
+            maven
+                .allow_write
+                .contains(&SandboxPath::dir(custom_repository.path().to_path_buf()))
+        );
+        assert!(
+            !maven
+                .allow_write
+                .contains(&SandboxPath::dir(home.path().join(".m2/repository"))),
+            "the selected Maven repository must replace the default write grant"
+        );
     }
 
     #[test]
@@ -3982,10 +4142,6 @@ mod tests {
 
         let mut config_build_profile =
             SandboxProfile::for_ecosystem(Ecosystem::Rust, home.path(), project.path());
-        config_build_profile.env.insert(
-            "CARGO_TARGET_DIR".to_owned(),
-            target.path().to_string_lossy().into_owned(),
-        );
         apply_standard_profile(
             &mut config_build_profile,
             &[
@@ -4008,11 +4164,35 @@ mod tests {
                 .allow_exec
                 .contains(&SandboxPath::dir(config_target.path().to_path_buf()))
         );
+
+        let mut environment_over_config =
+            SandboxProfile::for_ecosystem(Ecosystem::Rust, home.path(), project.path());
+        environment_over_config.env.insert(
+            "CARGO_TARGET_DIR".to_owned(),
+            target.path().to_string_lossy().into_owned(),
+        );
+        apply_standard_profile(
+            &mut environment_over_config,
+            &[
+                "cargo".to_owned(),
+                "build".to_owned(),
+                "--config".to_owned(),
+                format!("build.target-dir='{}'", config_target.path().display()),
+            ],
+            home.path(),
+            project.path(),
+        )
+        .unwrap();
         assert!(
-            !config_build_profile
+            environment_over_config
                 .allow_write
-                .contains(&SandboxPath::dir(target.path().to_path_buf())),
-            "a direct Cargo config target must replace the environment path"
+                .contains(&SandboxPath::dir(target.path().to_path_buf()))
+        );
+        assert!(
+            !environment_over_config
+                .allow_write
+                .contains(&SandboxPath::dir(config_target.path().to_path_buf())),
+            "Cargo target environment variables take precedence over --config"
         );
 
         let mut config_file_profile =

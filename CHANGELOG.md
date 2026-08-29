@@ -87,9 +87,12 @@ All notable changes to this project will be documented in this file. See [conven
   execute authority into credential reads.
 - Include Gradle's required `.tmp` runtime directory and recognize its attached
   `-g/path` user-home form when deriving narrow persistent grants.
-- Honor direct Cargo `--config build.target-dir='path'` overrides ahead of the
-  target environment and reject opaque config-file overrides with actionable
-  `--target-dir` guidance.
+- Honor direct Cargo `--config build.target-dir='path'` overrides when no
+  higher-precedence target CLI/environment selection exists, avoid injecting a
+  fallback that masks the config, and reject opaque config-file overrides with
+  actionable `--target-dir` guidance.
+- Filter Docker client TLS-directory locators and derive Maven's writable local
+  repository from the last `-D`/`--define maven.repo.local` property.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23

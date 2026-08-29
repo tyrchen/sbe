@@ -314,6 +314,8 @@ caches before every launch.
 For sbt, standard keeps boot, Ivy, and Coursier dependency caches persistent,
 but places the mutable global base in the private per-run directory. This keeps
 `~/.sbt` settings and global-plugin locations from becoming a persistence path.
+Maven `-Dmaven.repo.local=path` and `--define` select a replacement for the
+default writable local repository; relative paths are resolved from the project.
 
 On macOS, secret read denials include both the configured pathname and its
 canonical target. A symlinked `~/.ssh`, `.aws`, or similar protected directory
