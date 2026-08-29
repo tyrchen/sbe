@@ -265,6 +265,9 @@ Path grants derived from environment variables use the same final precedence
 as the child environment: trusted configuration and explicit CLI environment
 values override the parent environment. Policy compilation must not authorize
 one Cargo target or install root and then launch Cargo with another.
+Explicit tool arguments remain higher precedence still: Cargo `--target-dir`
+overrides target environment/config paths, while Gradle's user-home flags and
+`gradle.user.home` system property override `GRADLE_USER_HOME`.
 
 Built-in profiles should remain small declarations of roots, domains, reserved
 environment names, and optional local IPC needs. They must not contain a second

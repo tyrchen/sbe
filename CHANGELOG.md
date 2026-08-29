@@ -64,6 +64,9 @@ All notable changes to this project will be documented in this file. See [conven
   compatibility grants when the effective network policy denies all traffic.
 - Reject Gradle and Maven project-relocation flags early, with the same
   actionable working-directory guidance used for other package managers.
+- Honor Cargo's explicit `--target-dir` ahead of its environment/config paths
+  and Gradle's `gradle.user.home` command-line system property ahead of its
+  environment/default home when deriving standard-mode grants.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23

@@ -758,8 +758,27 @@ fn apply_standard_profile(
         }
     }
 
-    for name in ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"] {
-        if let Some(path) = effective_environment_path(profile, name) {
+    let cargo_cli_target = command_is(command, "cargo")
+        .then(|| command_option_value(command, "--target-dir"))
+        .flatten()
+        .map(PathBuf::from);
+    if let Some(path) = cargo_cli_target {
+        let path = if path.is_absolute() {
+            path
+        } else {
+            project_dir.join(path)
+        };
+        insert_builtin_path_grant(
+            profile,
+            GrantKind::AllowWrite,
+            SandboxPath::dir(path.clone()),
+        );
+        insert_builtin_path_grant(profile, GrantKind::AllowExec, SandboxPath::dir(path));
+    } else {
+        for name in ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"] {
+            let Some(path) = effective_environment_path(profile, name) else {
+                continue;
+            };
             let path = if path.is_absolute() {
                 path
             } else {
@@ -773,7 +792,6 @@ fn apply_standard_profile(
             insert_builtin_path_grant(profile, GrantKind::AllowExec, SandboxPath::dir(path));
         }
     }
-
     if command_is(command, "cargo") && top_level_subcommand(command).is_command(&["install"]) {
         let cargo_root = command_option_value(command, "--root")
             .map(PathBuf::from)
@@ -819,6 +837,7 @@ fn effective_gradle_user_home(
     let selected = command_option_value(command, "--gradle-user-home")
         .or_else(|| command_option_value(command, "-g"))
         .map(PathBuf::from)
+        .or_else(|| command_system_property(command, "gradle.user.home").map(PathBuf::from))
         .or_else(|| effective_environment_path(profile, "GRADLE_USER_HOME"))
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| home.join(".gradle"));
@@ -1462,6 +1481,30 @@ fn command_option_value<'a>(command: &'a [String], option: &str) -> Option<&'a s
             .strip_prefix(option)
             .and_then(|suffix| suffix.strip_prefix('='))
         {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn command_system_property<'a>(command: &'a [String], name: &str) -> Option<&'a str> {
+    let mut arguments = command
+        .iter()
+        .skip(1)
+        .take_while(|argument| argument.as_str() != "--");
+    while let Some(argument) = arguments.next() {
+        let property = if argument == "-D" || argument == "--system-prop" {
+            arguments.next().map(String::as_str)
+        } else {
+            argument
+                .strip_prefix("-D")
+                .or_else(|| argument.strip_prefix("--system-prop="))
+        };
+        if let Some(value) = property.and_then(|property| {
+            property
+                .strip_prefix(name)
+                .and_then(|suffix| suffix.strip_prefix('='))
+        }) {
             return Some(value);
         }
     }
@@ -3035,6 +3078,36 @@ mod tests {
             assert!(cli.allow_exec.contains(&SandboxPath::dir(path)));
         }
         assert!(!cli.allow_write.contains(&SandboxPath::dir(cli_home)));
+
+        let property_home = root.path().join("property-gradle");
+        let mut property = SandboxProfile::for_ecosystem(Ecosystem::Java, &home, &project);
+        property.env.insert(
+            "GRADLE_USER_HOME".to_owned(),
+            root.path()
+                .join("ignored-environment-gradle")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        apply_standard_profile(
+            &mut property,
+            &[
+                "gradle".to_owned(),
+                format!("-Dgradle.user.home={}", property_home.display()),
+                "build".to_owned(),
+            ],
+            &home,
+            &project,
+        )
+        .unwrap();
+        for name in STANDARD_GRADLE_MUTABLE_SUBDIRECTORIES {
+            let path = property_home.join(name);
+            assert!(
+                property
+                    .allow_write
+                    .contains(&SandboxPath::dir(path.clone()))
+            );
+            assert!(property.allow_exec.contains(&SandboxPath::dir(path)));
+        }
     }
 
     #[test]
@@ -3400,6 +3473,41 @@ mod tests {
             build_profile
                 .allow_exec
                 .contains(&SandboxPath::dir(target.path().to_path_buf()))
+        );
+
+        let mut cli_build_profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Rust, home.path(), project.path());
+        cli_build_profile.env.insert(
+            "CARGO_TARGET_DIR".to_owned(),
+            target.path().to_string_lossy().into_owned(),
+        );
+        apply_standard_profile(
+            &mut cli_build_profile,
+            &[
+                "cargo".to_owned(),
+                "build".to_owned(),
+                "--target-dir=cli-target".to_owned(),
+            ],
+            home.path(),
+            project.path(),
+        )
+        .unwrap();
+        let cli_target = project.path().join("cli-target");
+        assert!(
+            cli_build_profile
+                .allow_write
+                .contains(&SandboxPath::dir(cli_target.clone()))
+        );
+        assert!(
+            cli_build_profile
+                .allow_exec
+                .contains(&SandboxPath::dir(cli_target))
+        );
+        assert!(
+            !cli_build_profile
+                .allow_write
+                .contains(&SandboxPath::dir(target.path().to_path_buf())),
+            "the CLI target directory must replace the lower-precedence environment path"
         );
 
         let mut install_profile =
