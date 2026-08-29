@@ -297,11 +297,13 @@ or another declared writable root; an external referent fails with a copyable
 `--allow-write` approval. If the final cache or output directory does not exist,
 SBE resolves its nearest existing ancestor and reconstructs the missing suffix
 beneath the approved referent, so symlinked cache roots work on a cold build.
-Before launch SBE discovers source-tree symlinks
-outside generated dependency/output directories, including nested links in an
-external source referent, so a link into an ordinary sibling checkout is
-readable without granting the sibling's parent. Canonical directory identities
-prevent traversal cycles, while entry and depth budgets bound discovery work.
+Before launch SBE discovers source-tree symlinks, including direct linked
+dependency entries beneath generated roots such as `node_modules` and nested
+links in an external source referent, so a link into an ordinary sibling
+checkout is readable without granting the sibling's parent. Generated roots
+receive only a shallow symlink-entry check; their ordinary contents are not
+recursively scanned. Canonical directory identities prevent traversal cycles,
+while entry and depth budgets bound discovery work.
 Magic links and protected referents remain rejected.
 This validation also applies to built-in readable and executable entries such
 as project-local `gradlew` and `mvnw`; a wrapper symlink cannot turn an execute

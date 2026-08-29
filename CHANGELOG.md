@@ -102,6 +102,9 @@ All notable changes to this project will be documented in this file. See [conven
   effective target environment path when both target variables are present.
 - Require explicit approval when repository-controlled Maven config selects a
   local repository outside the workspace or conventional Maven cache envelope.
+- Filter custom AWS configuration-file locators and inspect direct symlink
+  entries beneath generated dependency roots so warm linked dependencies remain
+  readable without recursively scanning ordinary generated contents.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23

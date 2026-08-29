@@ -379,13 +379,14 @@ envelope. The launcher receives only that snapshot. Thus a cold cache such as
 `~/.cache -> /mnt/cache` with missing `~/.cache/coursier` works after
 `/mnt/cache/` is approved, without reopening the mutable home-directory link.
 For the built-in workspace read grant, standard mode discovers symlinks in the
-source tree without descending into conventional generated dependency and
-output directories, then installs separate read rules for safe external
-referents. External directory referents are inspected for nested source links;
-canonical directory identities break cycles, and fixed entry/depth budgets
-bound startup time and memory. Exceeding either budget fails policy resolution
-instead of continuing with a partial authority view. Referents overlapping
-protected read denials are omitted.
+source tree and performs a shallow symlink-entry check inside conventional
+generated dependency and output roots, then installs separate read rules for
+safe external referents. It does not recurse through ordinary contents beneath
+those generated roots. External directory referents are inspected for nested
+source links; canonical directory identities break cycles, and fixed
+entry/depth budgets bound startup time and memory. Exceeding either budget
+fails policy resolution instead of continuing with a partial authority view.
+Referents overlapping protected read denials are omitted.
 
 On macOS it resolves and validates the target before rendering its canonical
 SBPL grant. Because the untrusted child has not started and cannot write
@@ -423,7 +424,8 @@ feature switches, terminal settings, and tool paths. It removes:
   prefix-encoded forms such as Terraform's `TF_TOKEN_<host>` and concatenated
   platform names such as Azure Pipelines' `SYSTEM_ACCESSTOKEN`, plus OIDC bearer
   paths such as `AWS_WEB_IDENTITY_TOKEN_FILE` and custom credential stores such
-  as `AWS_SHARED_CREDENTIALS_FILE`, `CLOUDSDK_CONFIG`, `AZURE_CONFIG_DIR`, Azure
+  as `AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE`, `CLOUDSDK_CONFIG`,
+  `AZURE_CONFIG_DIR`, Azure
   client certificates selected by `AZURE_CLIENT_CERTIFICATE_PATH`, and Docker
   client TLS key directories selected by `DOCKER_CERT_PATH`, plus custom GitHub
   CLI credential directories selected by `GH_CONFIG_DIR`;

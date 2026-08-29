@@ -621,6 +621,7 @@ fn is_sensitive_environment_name(name: &str) -> bool {
         "AWS_ACCESS_KEY_ID",
         "AWS_CONTAINER_CREDENTIALS_FULL_URI",
         "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONFIG_FILE",
         "AWS_SECRET_ACCESS_KEY",
         "AWS_SHARED_CREDENTIALS_FILE",
         "AWS_SESSION_TOKEN",
@@ -1666,11 +1667,11 @@ fn workspace_read_aliases_with_limits(
 
     let project_referent =
         std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
-    let mut pending = vec![(project_dir.to_path_buf(), 0_usize)];
+    let mut pending = vec![(project_dir.to_path_buf(), 0_usize, false)];
     let mut visited_directories = BTreeSet::new();
     let mut resolved_paths = BTreeSet::new();
     let mut inspected_entries = 0_usize;
-    while let Some((directory, depth)) = pending.pop() {
+    while let Some((directory, depth, symlinks_only)) = pending.pop() {
         if depth > max_depth {
             anyhow::bail!(
                 "source symlink discovery exceeds the maximum depth of {max_depth} below '{}'",
@@ -1684,7 +1685,7 @@ fn workspace_read_aliases_with_limits(
                 continue;
             }
         };
-        if !visited_directories.insert(directory.clone()) {
+        if !visited_directories.insert((directory.clone(), symlinks_only)) {
             continue;
         }
         let entries = match std::fs::read_dir(&directory) {
@@ -1711,13 +1712,10 @@ fn workspace_read_aliases_with_limits(
                 }
             };
             let path = entry.path();
-            if entry
+            let is_derived_directory = entry
                 .file_name()
                 .to_str()
-                .is_some_and(|name| DERIVED_DIRECTORIES.contains(&name))
-            {
-                continue;
-            }
+                .is_some_and(|name| DERIVED_DIRECTORIES.contains(&name));
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
                 Err(error) => {
@@ -1735,13 +1733,12 @@ fn workspace_read_aliases_with_limits(
                 {
                     continue;
                 }
-                if resolved_paths.insert(resolved.clone())
-                    && std::fs::metadata(&resolved).is_ok_and(|metadata| metadata.is_dir())
-                {
-                    pending.push((resolved, depth + 1));
+                resolved_paths.insert(resolved.clone());
+                if std::fs::metadata(&resolved).is_ok_and(|metadata| metadata.is_dir()) {
+                    pending.push((resolved, depth + 1, is_derived_directory));
                 }
-            } else if file_type.is_dir() {
-                pending.push((path, depth + 1));
+            } else if file_type.is_dir() && !symlinks_only {
+                pending.push((path, depth + 1, is_derived_directory));
             }
         }
     }
@@ -3235,6 +3232,7 @@ mod tests {
                     "http://127.0.0.1/credentials".to_owned(),
                 ),
                 ("AWS_SECRET_ACCESS_KEY".to_owned(), "sentinel".to_owned()),
+                ("AWS_CONFIG_FILE".to_owned(), "/tmp/aws-config".to_owned()),
                 (
                     "AWS_SHARED_CREDENTIALS_FILE".to_owned(),
                     "/tmp/aws-credentials".to_owned(),
@@ -4094,6 +4092,34 @@ mod tests {
         let depth_error =
             workspace_read_aliases_with_limits(&profile, &project, 100, 1).unwrap_err();
         assert!(depth_error.to_string().contains("maximum depth"));
+    }
+
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the unit test builds an isolated linked-dependency fixture"
+    )]
+    fn standard_source_symlink_discovery_reads_linked_generated_dependencies() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let dependencies = project.join("node_modules");
+        let ordinary_dependency = dependencies.join("ordinary");
+        let linked = root.path().join("linked");
+        let ignored = root.path().join("ignored");
+        std::fs::create_dir_all(&ordinary_dependency).unwrap();
+        std::fs::create_dir_all(&linked).unwrap();
+        std::fs::create_dir_all(&ignored).unwrap();
+        std::os::unix::fs::symlink("../../linked", dependencies.join("local")).unwrap();
+        std::os::unix::fs::symlink("../../../ignored", ordinary_dependency.join("nested")).unwrap();
+        let profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, root.path(), &project);
+
+        let aliases = workspace_read_aliases_with_limits(&profile, &project, 100, 128).unwrap();
+
+        assert!(aliases.contains(&SandboxPath::dir(std::fs::canonicalize(linked).unwrap())));
+        assert!(
+            !aliases.contains(&SandboxPath::dir(std::fs::canonicalize(ignored).unwrap())),
+            "ordinary generated dependency contents must not be recursively scanned"
+        );
     }
 
     #[test]
