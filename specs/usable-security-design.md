@@ -239,6 +239,8 @@ Standard mode grants writes to:
 
 For npm and npx commands, `--cache` overrides `NPM_CONFIG_CACHE`, then a simple
 project `.npmrc` `cache=path`, user `~/.npmrc`, then the default `~/.npm`.
+An npm `--userconfig` or explicitly restored user-config locator selects the
+user layer and receives an exact read grant.
 pnpm's `--store-dir`, configuration environment, project `.npmrc`, and user
 `.npmrc` select its store in the same manner. The effective cache/store replaces
 the corresponding default writable grant; relative paths are anchored to the
@@ -246,7 +248,10 @@ command project. A repository-selected external path requires `--allow-write`.
 
 For uv and pip commands, `--cache-dir` overrides the corresponding
 `UV_CACHE_DIR` or `PIP_CACHE_DIR`, followed by `XDG_CACHE_HOME` and the
-conventional cache. The selected cache replaces only that tool's default grant.
+conventional cache. pip also resolves `cache-dir` from its legacy/current user
+configuration after environment overrides. The selected cache replaces only
+that tool's default grant. Conventional macOS caches live beneath
+`~/Library/Caches`; Linux follows XDG conventions.
 
 For Gradle commands, the conventional cache grant follows Gradle's effective
 user home: `--gradle-user-home`, every accepted `-g` form including `-g/path`,

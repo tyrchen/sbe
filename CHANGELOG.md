@@ -135,6 +135,8 @@ All notable changes to this project will be documented in this file. See [conven
   paths, and follow pnpm store selection across command/configuration sources.
 - Filter pip/uv custom configuration locators and replace their conventional
   cache grants with command/environment-selected cache directories.
+- Honor command-selected npm user configuration, pip user-config cache paths,
+  and platform-native macOS pip/uv cache locations.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23

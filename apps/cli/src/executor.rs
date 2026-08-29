@@ -774,6 +774,18 @@ fn apply_standard_profile(
             SandboxPath::dir(npm_cache.path),
         );
     }
+    if profile.name == "node"
+        && (command_is(command, "npm") || command_is(command, "npx") || command_is(command, "pnpm"))
+    {
+        let user_config = effective_npm_user_config(profile, command, home, project_dir)?;
+        if user_config.explicit {
+            insert_builtin_path_grant(
+                profile,
+                GrantKind::AllowRead,
+                SandboxPath::file(user_config.path),
+            );
+        }
+    }
     if let Some(pnpm_store) = effective_pnpm_store(profile, command, home, project_dir)? {
         let conventional = home.join(".local/share/pnpm");
         if pnpm_store.project_controlled
@@ -1011,7 +1023,8 @@ fn effective_npm_cache(
     };
     let user_cache =
         if command_cache.is_none() && environment_cache.is_none() && project_cache.is_none() {
-            user_npm_config_path(home, "cache")?
+            let user_config = effective_npm_user_config(profile, command, home, project_dir)?;
+            user_npm_config_path(&user_config, home, "cache")?
         } else {
             None
         };
@@ -1042,12 +1055,59 @@ fn project_npm_cache(project_dir: &Path, home: &Path) -> anyhow::Result<Option<P
     npm_config_path_value(&contents, &path, home, "cache", "project .npmrc")
 }
 
-fn user_npm_config_path(home: &Path, key: &str) -> anyhow::Result<Option<PathBuf>> {
-    let path = home.join(".npmrc");
-    let Some(contents) = read_bounded_following_metadata_file(&path)? else {
+struct NpmUserConfigSelection {
+    path: PathBuf,
+    explicit: bool,
+}
+
+fn effective_npm_user_config(
+    profile: &SandboxProfile,
+    command: &[String],
+    home: &Path,
+    project_dir: &Path,
+) -> anyhow::Result<NpmUserConfigSelection> {
+    let command_config = command_long_path_option(command, "--userconfig")?;
+    let environment_config = if command_config.is_none() {
+        profile
+            .env
+            .get("NPM_CONFIG_USERCONFIG")
+            .or_else(|| profile.env.get("npm_config_userconfig"))
+            .map(PathBuf::from)
+    } else {
+        None
+    };
+    let explicit = command_config.is_some() || environment_config.is_some();
+    let selected = command_config
+        .or(environment_config)
+        .unwrap_or_else(|| home.join(".npmrc"));
+    if selected.as_os_str().is_empty() {
+        anyhow::bail!("npm userconfig must select a non-empty path");
+    }
+    Ok(NpmUserConfigSelection {
+        path: if selected.is_absolute() {
+            selected
+        } else {
+            project_dir.join(selected)
+        },
+        explicit,
+    })
+}
+
+fn user_npm_config_path(
+    selection: &NpmUserConfigSelection,
+    home: &Path,
+    key: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    let Some(contents) = read_bounded_following_metadata_file(&selection.path)? else {
+        if selection.explicit {
+            anyhow::bail!(
+                "could not inspect explicit npm user configuration: {}",
+                selection.path.display()
+            );
+        }
         return Ok(None);
     };
-    npm_config_path_value(&contents, &path, home, key, "user .npmrc")
+    npm_config_path_value(&contents, &selection.path, home, key, "user .npmrc")
 }
 
 fn npm_config_path_value(
@@ -1170,7 +1230,8 @@ fn effective_pnpm_store(
     };
     let user_store =
         if command_store.is_none() && environment_store.is_none() && project_store.is_none() {
-            user_npm_config_path(home, "store-dir")?
+            let user_config = effective_npm_user_config(profile, command, home, project_dir)?;
+            user_npm_config_path(&user_config, home, "store-dir")?
         } else {
             None
         };
@@ -1224,11 +1285,20 @@ fn effective_python_cache(
     } else {
         None
     };
+    let config_cache =
+        if command_cache.is_none() && environment_cache.is_none() && default_name == "pip" {
+            effective_pip_config_cache(profile, home)?
+        } else {
+            None
+        };
     let conventional = home.join(".cache").join(default_name);
     let default_cache = effective_environment_path(profile, "XDG_CACHE_HOME")
         .map(|directory| directory.join(default_name))
-        .unwrap_or_else(|| conventional.clone());
-    let selected = command_cache.or(environment_cache).unwrap_or(default_cache);
+        .unwrap_or_else(|| platform_python_cache(home, default_name));
+    let selected = command_cache
+        .or(environment_cache)
+        .or(config_cache)
+        .unwrap_or(default_cache);
     if selected.as_os_str().is_empty() {
         anyhow::bail!("{environment_name} must select a non-empty path");
     }
@@ -1240,6 +1310,67 @@ fn effective_python_cache(
             project_dir.join(selected)
         },
     }))
+}
+
+fn effective_pip_config_cache(
+    profile: &SandboxProfile,
+    home: &Path,
+) -> anyhow::Result<Option<PathBuf>> {
+    let legacy = home.join(".pip/pip.conf");
+    let mut selected = read_pip_config_cache(&legacy, home, false)?;
+
+    let user_config_root = effective_environment_path(profile, "XDG_CONFIG_HOME")
+        .unwrap_or_else(|| platform_config_home(home));
+    let user_config = user_config_root.join("pip/pip.conf");
+    if let Some(cache) = read_pip_config_cache(&user_config, home, false)? {
+        selected = Some(cache);
+    }
+
+    // Ambient PIP_CONFIG_FILE is filtered. If it is present in the resolved profile, the user
+    // explicitly restored it and its final config layer should be honored.
+    if let Some(explicit) = profile.env.get("PIP_CONFIG_FILE").map(PathBuf::from)
+        && let Some(cache) = read_pip_config_cache(&explicit, home, true)?
+    {
+        selected = Some(cache);
+    }
+    Ok(selected)
+}
+
+fn read_pip_config_cache(
+    path: &Path,
+    home: &Path,
+    required: bool,
+) -> anyhow::Result<Option<PathBuf>> {
+    let Some(contents) = read_bounded_following_metadata_file(path)? else {
+        if required {
+            anyhow::bail!(
+                "could not inspect explicit pip configuration: {}",
+                path.display()
+            );
+        }
+        return Ok(None);
+    };
+    npm_config_path_value(&contents, path, home, "cache-dir", "pip configuration")
+}
+
+#[cfg(target_os = "macos")]
+fn platform_python_cache(home: &Path, name: &str) -> PathBuf {
+    home.join("Library/Caches").join(name)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_python_cache(home: &Path, name: &str) -> PathBuf {
+    home.join(".cache").join(name)
+}
+
+#[cfg(target_os = "macos")]
+fn platform_config_home(home: &Path) -> PathBuf {
+    home.join("Library/Application Support")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_config_home(home: &Path) -> PathBuf {
+    home.join(".config")
 }
 
 fn command_long_path_option(command: &[String], option: &str) -> anyhow::Result<Option<PathBuf>> {
@@ -4692,6 +4823,34 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&project).unwrap();
 
+        let mut default_uv = SandboxProfile::for_ecosystem(Ecosystem::Python, &home, &project);
+        apply_standard_profile(
+            &mut default_uv,
+            &["uv".to_owned(), "sync".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap();
+        assert!(
+            default_uv
+                .allow_write
+                .contains(&SandboxPath::dir(platform_python_cache(&home, "uv")))
+        );
+
+        let mut default_pip = SandboxProfile::for_ecosystem(Ecosystem::Python, &home, &project);
+        apply_standard_profile(
+            &mut default_pip,
+            &["pip".to_owned(), "install".to_owned(), "build".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap();
+        assert!(
+            default_pip
+                .allow_write
+                .contains(&SandboxPath::dir(platform_python_cache(&home, "pip")))
+        );
+
         let uv_environment_cache = root.path().join("uv-environment-cache");
         let mut uv_environment = SandboxProfile::for_ecosystem(Ecosystem::Python, &home, &project);
         uv_environment.env.insert(
@@ -4764,6 +4923,32 @@ mod tests {
         assert!(
             !pip.allow_write
                 .contains(&SandboxPath::dir(home.join(".cache/pip")))
+        );
+
+        let pip_config_home = home.join("custom-config");
+        let pip_config_cache = root.path().join("pip-config-cache");
+        std::fs::create_dir_all(pip_config_home.join("pip")).unwrap();
+        std::fs::write(
+            pip_config_home.join("pip/pip.conf"),
+            format!("[global]\ncache-dir={}\n", pip_config_cache.display()),
+        )
+        .unwrap();
+        let mut pip_config = SandboxProfile::for_ecosystem(Ecosystem::Python, &home, &project);
+        pip_config.env.insert(
+            "XDG_CONFIG_HOME".to_owned(),
+            pip_config_home.to_string_lossy().into_owned(),
+        );
+        apply_standard_profile(
+            &mut pip_config,
+            &["pip".to_owned(), "install".to_owned(), "build".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap();
+        assert!(
+            pip_config
+                .allow_write
+                .contains(&SandboxPath::dir(pip_config_cache))
         );
     }
 
@@ -6950,6 +7135,39 @@ mod tests {
             user_selected
                 .allow_write
                 .contains(&SandboxPath::dir(user_cache))
+        );
+
+        let command_userconfig_root = tempfile::tempdir().unwrap();
+        let command_userconfig = command_userconfig_root.path().join("npmrc");
+        let command_userconfig_cache = root.path().join("command-userconfig-cache");
+        std::fs::write(
+            &command_userconfig,
+            format!("cache={}\n", command_userconfig_cache.display()),
+        )
+        .unwrap();
+        let mut command_userconfig_selected =
+            SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &project);
+        apply_standard_profile(
+            &mut command_userconfig_selected,
+            &[
+                "npm".to_owned(),
+                "--userconfig".to_owned(),
+                command_userconfig.display().to_string(),
+                "install".to_owned(),
+            ],
+            &home,
+            &project,
+        )
+        .unwrap();
+        assert!(
+            command_userconfig_selected
+                .allow_write
+                .contains(&SandboxPath::dir(command_userconfig_cache))
+        );
+        assert!(
+            command_userconfig_selected
+                .allow_read
+                .contains(&SandboxPath::file(command_userconfig))
         );
 
         let command_store = root.path().join("command-pnpm-store");
