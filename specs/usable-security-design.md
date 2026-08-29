@@ -401,7 +401,7 @@ feature switches, terminal settings, and tool paths. It removes:
   prefix-encoded forms such as Terraform's `TF_TOKEN_<host>` and concatenated
   platform names such as Azure Pipelines' `SYSTEM_ACCESSTOKEN`, plus OIDC bearer
   paths such as `AWS_WEB_IDENTITY_TOKEN_FILE` and custom credential stores such
-  as `AWS_SHARED_CREDENTIALS_FILE`;
+  as `AWS_SHARED_CREDENTIALS_FILE`, `CLOUDSDK_CONFIG`, and `AZURE_CONFIG_DIR`;
 - agent and credential socket variables;
 - dynamic-loader injection variables; and
 - SBE-reserved proxy, runtime, and policy variables.

@@ -621,6 +621,8 @@ fn is_sensitive_environment_name(name: &str) -> bool {
         "AWS_SESSION_TOKEN",
         "AWS_WEB_IDENTITY_TOKEN_FILE",
         "AZURE_CLIENT_SECRET",
+        "AZURE_CONFIG_DIR",
+        "CLOUDSDK_CONFIG",
         "CREDENTIAL",
         "CREDENTIALS",
         "DATABASE_URL",
@@ -2810,6 +2812,14 @@ mod tests {
                 (
                     "AZURE_FEDERATED_TOKEN_FILE".to_owned(),
                     "/tmp/azure-oidc-token".to_owned(),
+                ),
+                (
+                    "AZURE_CONFIG_DIR".to_owned(),
+                    "/tmp/azure-config".to_owned(),
+                ),
+                (
+                    "CLOUDSDK_CONFIG".to_owned(),
+                    "/tmp/gcloud-config".to_owned(),
                 ),
                 ("SSH_AUTH_SOCK".to_owned(), "/tmp/agent".to_owned()),
                 ("SYSTEM_ACCESSTOKEN".to_owned(), "sentinel".to_owned()),

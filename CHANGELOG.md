@@ -80,6 +80,8 @@ All notable changes to this project will be documented in this file. See [conven
 - Resolve missing writable descendants through their nearest existing symlink
   ancestor, validate the reconstructed target, and snapshot it so approved
   symlinked cache roots also work on cold builds.
+- Filter custom Google Cloud SDK and Azure CLI configuration directories so
+  their credential databases cannot bypass the default secret-path denials.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23
