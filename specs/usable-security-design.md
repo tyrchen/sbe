@@ -450,7 +450,8 @@ feature switches, terminal settings, and tool paths. It removes:
   by `GNUPGHOME`; Cargo credential files beneath the effective `CARGO_HOME` and
   GitHub CLI credentials beneath an inherited `XDG_CONFIG_HOME` receive
   matching path denials rather than withholding those ordinary configuration
-  locators;
+  locators; npm user-config files selected by `NPM_CONFIG_USERCONFIG` are
+  withheld because they commonly contain registry authentication tokens;
 - agent and credential socket variables;
 - dynamic-loader injection variables; and
 - SBE-reserved proxy, runtime, and policy variables.

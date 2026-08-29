@@ -120,6 +120,8 @@ All notable changes to this project will be documented in this file. See [conven
 - Pre-create missing Node workspace-root lockfiles on Linux, include that root
   in bounded linked-dependency discovery, and relocate Cargo registry/Git cache
   grants beneath the effective `CARGO_HOME` while retaining credential denials.
+- Filter npm's custom `NPM_CONFIG_USERCONFIG` credential-file locator while
+  preserving ordinary npm build configuration variables.
 
 ---
 ## [sbexec-v0.4.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.3.3..sbexec-v0.4.0) - 2026-08-23

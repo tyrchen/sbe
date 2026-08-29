@@ -649,6 +649,7 @@ fn is_sensitive_environment_name(name: &str) -> bool {
         "MONGODB_URI",
         "MONGO_URL",
         "MYSQL_PWD",
+        "NPM_CONFIG_USERCONFIG",
         "PASSWORD",
         "PASSWD",
         "PGPASSFILE",
@@ -3569,6 +3570,10 @@ mod tests {
                 ("SSH_AUTH_SOCK".to_owned(), "/tmp/agent".to_owned()),
                 ("SYSTEM_ACCESSTOKEN".to_owned(), "sentinel".to_owned()),
                 ("NPM_TOKEN".to_owned(), "sentinel".to_owned()),
+                (
+                    "NPM_CONFIG_USERCONFIG".to_owned(),
+                    "/tmp/custom-npmrc".to_owned(),
+                ),
                 ("OPENAI_API_KEY".to_owned(), "sentinel".to_owned()),
                 ("TOKEN".to_owned(), "sentinel".to_owned()),
                 ("API_KEY".to_owned(), "sentinel".to_owned()),
