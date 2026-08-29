@@ -332,10 +332,12 @@ Examples:
 ### 7.3 Resolution and race handling
 
 The trusted parent resolves each existing grant before the child starts and
-records both lexical and resolved paths. On Linux it opens the final object with
-descriptor-relative kernel resolution, rejects magic links, validates the
-opened object's type and boundary, and installs the Landlock rule from that
-file descriptor. It does not require `RESOLVE_NO_SYMLINKS` for ordinary grants.
+retains the lexical spelling for audit, but replaces writable/executable
+symlink grants with their canonical snapshot. The launcher therefore never
+reopens a mutable lexical link after its referent was approved. On Linux it
+opens the canonical final object with descriptor-relative kernel resolution,
+rejects magic links, validates the opened object's type and boundary, and
+installs the Landlock rule from that file descriptor.
 For the built-in workspace read grant, standard mode discovers symlinks in the
 source tree without descending into conventional generated dependency and
 output directories, then installs separate read rules for safe external
@@ -343,8 +345,8 @@ referents. External directory referents are inspected for nested source links;
 canonical directory identities break cycles. Referents overlapping protected
 read denials are omitted.
 
-On macOS it resolves and validates the target before rendering both necessary
-SBPL spellings. Because the untrusted child has not started and cannot write
+On macOS it resolves and validates the target before rendering its canonical
+SBPL grant. Because the untrusted child has not started and cannot write
 the protected ancestors after launch, a malicious same-user process racing
 that snapshot is part of the pre-compromised-host exclusion, not a reason to
 reject every user symlink.

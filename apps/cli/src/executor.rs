@@ -897,38 +897,9 @@ fn resolve_standard_path_aliases(
     home: &Path,
     project_dir: &Path,
 ) -> anyhow::Result<()> {
-    validate_standard_write_aliases(profile, home, project_dir)?;
-    let write_aliases = resolved_aliases(
-        &profile.allow_write,
-        profile.first_user_allow_write,
-        project_dir,
-    );
-    let exec_aliases = resolved_aliases(
-        &profile.allow_exec,
-        profile.first_user_allow_exec,
-        project_dir,
-    );
+    snapshot_standard_write_aliases(profile, home, project_dir)?;
+    snapshot_standard_exec_aliases(profile);
     let read_aliases = workspace_read_aliases(profile, project_dir);
-    for alias in write_aliases {
-        if !profile.allow_write.contains(&alias) {
-            profile.grant_origins.push(GrantRecord {
-                kind: GrantKind::AllowWrite,
-                value: alias.path.to_string_lossy().into_owned(),
-                origin: GrantOrigin::Runtime,
-            });
-            profile.allow_write.push(alias);
-        }
-    }
-    for alias in exec_aliases {
-        if !profile.allow_exec.contains(&alias) {
-            profile.grant_origins.push(GrantRecord {
-                kind: GrantKind::AllowExec,
-                value: alias.path.to_string_lossy().into_owned(),
-                origin: GrantOrigin::Runtime,
-            });
-            profile.allow_exec.push(alias);
-        }
-    }
     for alias in read_aliases {
         if !profile.allow_read.contains(&alias) {
             profile.grant_origins.push(GrantRecord {
@@ -944,11 +915,41 @@ fn resolve_standard_path_aliases(
 
 #[allow(
     clippy::disallowed_methods,
+    reason = "standard mode snapshots executable symlink referents before launching untrusted code"
+)]
+fn snapshot_standard_exec_aliases(profile: &mut SandboxProfile) {
+    let mut records = Vec::new();
+    profile.allow_exec = profile
+        .allow_exec
+        .drain(..)
+        .map(|grant| {
+            let Ok(resolved) = std::fs::canonicalize(&grant.path) else {
+                return grant;
+            };
+            if resolved == grant.path {
+                return grant;
+            }
+            records.push(GrantRecord {
+                kind: GrantKind::AllowExec,
+                value: resolved.to_string_lossy().into_owned(),
+                origin: GrantOrigin::Runtime,
+            });
+            SandboxPath {
+                path: resolved,
+                kind: grant.kind,
+            }
+        })
+        .collect();
+    profile.grant_origins.extend(records);
+}
+
+#[allow(
+    clippy::disallowed_methods,
     reason = "standard mode validates built-in write symlinks against the approved authority \
               envelope"
 )]
-fn validate_standard_write_aliases(
-    profile: &SandboxProfile,
+fn snapshot_standard_write_aliases(
+    profile: &mut SandboxProfile,
     home: &Path,
     project_dir: &Path,
 ) -> anyhow::Result<()> {
@@ -962,7 +963,8 @@ fn validate_standard_write_aliases(
         home_referent.join(".cache"),
         home_referent.join("Library/Caches"),
     ];
-    let built_in_envelopes: Vec<SandboxPath> = profile.allow_write[..built_in_boundary]
+    let original = profile.allow_write.clone();
+    let built_in_envelopes: Vec<SandboxPath> = original[..built_in_boundary]
         .iter()
         .map(|grant| SandboxPath {
             path: remap_to_referent(
@@ -975,9 +977,16 @@ fn validate_standard_write_aliases(
             kind: grant.kind,
         })
         .collect();
+    let explicit_envelopes: Vec<SandboxPath> = original[built_in_boundary..]
+        .iter()
+        .filter_map(resolve_explicit_grant)
+        .collect();
+    let mut snapped = Vec::with_capacity(original.len());
+    let mut records = Vec::new();
 
-    for grant in &profile.allow_write[..built_in_boundary] {
+    for (index, grant) in original.into_iter().enumerate() {
         let Ok(resolved) = std::fs::canonicalize(&grant.path) else {
+            snapped.push(grant);
             continue;
         };
         let expected = remap_to_referent(
@@ -987,7 +996,7 @@ fn validate_standard_write_aliases(
             project_dir,
             &project_referent,
         );
-        if resolved == expected
+        let approved = resolved == expected
             || resolved.starts_with(&project_referent)
             || cache_envelopes
                 .iter()
@@ -995,13 +1004,31 @@ fn validate_standard_write_aliases(
             || built_in_envelopes
                 .iter()
                 .any(|envelope| grant_covers(envelope, &resolved))
-            || explicit_write_covers(profile, &resolved)
-        {
-            continue;
+            || explicit_envelopes
+                .iter()
+                .any(|explicit| grant_covers(explicit, &resolved));
+        if index < built_in_boundary && !approved {
+            return Err(external_write_approval_error(&grant.path, &resolved));
         }
 
-        return Err(external_write_approval_error(&grant.path, &resolved));
+        if resolved != grant.path {
+            records.push(GrantRecord {
+                kind: GrantKind::AllowWrite,
+                value: resolved.to_string_lossy().into_owned(),
+                origin: GrantOrigin::Runtime,
+            });
+            snapped.push(SandboxPath {
+                path: resolved,
+                kind: grant.kind,
+            });
+        } else {
+            snapped.push(grant);
+        }
     }
+    // The launcher opens only these canonical snapshots, never the mutable
+    // lexical symlink that was validated above.
+    profile.allow_write = snapped;
+    profile.grant_origins.extend(records);
     Ok(())
 }
 
@@ -1193,37 +1220,6 @@ fn resolve_existing_ancestor(path: &Path) -> Option<PathBuf> {
             Err(_) => return None,
         }
     }
-}
-
-#[allow(
-    clippy::disallowed_methods,
-    reason = "standard mode snapshots pre-existing user tool and cache symlinks before launch"
-)]
-fn resolved_aliases(
-    paths: &[SandboxPath],
-    built_in_boundary: usize,
-    project_dir: &Path,
-) -> Vec<SandboxPath> {
-    paths
-        .iter()
-        .enumerate()
-        .filter_map(|(index, grant)| {
-            let resolved = std::fs::canonicalize(&grant.path).ok()?;
-            if resolved == grant.path {
-                return None;
-            }
-            let built_in_project_path = index < built_in_boundary
-                && grant.path.starts_with(project_dir)
-                && !resolved.starts_with(project_dir);
-            if built_in_project_path {
-                return None;
-            }
-            Some(SandboxPath {
-                path: resolved,
-                kind: grant.kind,
-            })
-        })
-        .collect()
 }
 
 fn command_is(command: &[String], expected: &str) -> bool {
@@ -2771,16 +2767,12 @@ mod tests {
         resolve_standard_path_aliases(&mut approved, Path::new("/Users/test"), project.path())
             .unwrap();
 
-        assert!(
-            approved
-                .allow_write
-                .contains(&SandboxPath::dir(project.path().to_path_buf()))
-        );
-        assert!(
-            approved
-                .allow_write
-                .contains(&SandboxPath::dir(external.path().to_path_buf()))
-        );
+        assert!(approved.allow_write.contains(&SandboxPath::dir(
+            std::fs::canonicalize(project.path()).unwrap()
+        )));
+        assert!(approved.allow_write.contains(&SandboxPath::dir(
+            std::fs::canonicalize(external.path()).unwrap()
+        )));
         assert!(approved.allow_exec.contains(&SandboxPath::dir(
             std::fs::canonicalize(external.path()).unwrap()
         )));
@@ -2828,11 +2820,9 @@ mod tests {
         )
         .unwrap();
         resolve_standard_path_aliases(&mut approved, &home, &project).unwrap();
-        assert!(
-            approved
-                .allow_write
-                .contains(&SandboxPath::dir(persistence))
-        );
+        assert!(approved.allow_write.contains(&SandboxPath::dir(
+            std::fs::canonicalize(persistence).unwrap()
+        )));
     }
 
     #[test]
@@ -2863,6 +2853,13 @@ mod tests {
             profile
                 .allow_write
                 .contains(&SandboxPath::dir(std::fs::canonicalize(cache).unwrap()))
+        );
+        assert!(
+            !profile
+                .allow_write
+                .iter()
+                .any(|grant| grant.path == home.join(".npm")),
+            "the launcher must not reopen the mutable lexical symlink"
         );
     }
 
