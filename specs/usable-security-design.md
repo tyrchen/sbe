@@ -434,6 +434,11 @@ still removed, but standard mode does not claim isolation from discoverable
 local services. Strict mode permits only SBE-owned proxy/private IPC endpoints
 explicitly present in the final policy.
 
+When the external proxy is active, standard mode injects localhost-only
+`NO_PROXY`/`no_proxy` and Java `http.nonProxyHosts` values so ordinary clients
+actually use the permitted loopback path. Strict mode keeps those bypasses
+empty.
+
 ### 9.2 Linux
 
 Landlock destination-port filtering is not domain filtering and cannot express

@@ -32,6 +32,8 @@ use crate::cli::RunArgs;
 /// sbe exit codes for its own errors (matching docker run / env conventions).
 const EXIT_SBE_ERROR: u8 = 125;
 const EXIT_SANDBOX_FAILED: u8 = 126;
+const STANDARD_NO_PROXY: &str = "localhost,.localhost,127.0.0.1,::1";
+const STANDARD_JAVA_NON_PROXY_HOSTS: &str = "localhost|*.localhost|127.*|[::1]";
 const STANDARD_GRADLE_MUTABLE_SUBDIRECTORIES: &[&str] = &[
     "caches",
     "daemon",
@@ -500,11 +502,17 @@ async fn build_extra_env(
         insert_runtime_environment(profile, &mut env, "HTTPS_PROXY", proxy_url.clone());
         insert_runtime_environment(profile, &mut env, "http_proxy", proxy_url.clone());
         insert_runtime_environment(profile, &mut env, "https_proxy", proxy_url);
-        insert_runtime_environment(profile, &mut env, "NO_PROXY", String::new());
-        insert_runtime_environment(profile, &mut env, "no_proxy", String::new());
+        let no_proxy = if strict { "" } else { STANDARD_NO_PROXY };
+        insert_runtime_environment(profile, &mut env, "NO_PROXY", no_proxy.to_owned());
+        insert_runtime_environment(profile, &mut env, "no_proxy", no_proxy.to_owned());
         if profile.name == "java" {
             let agent_path = install_java_proxy_agent(runtime_temp).await?;
-            for (name, value) in endpoint.java_environment(&agent_path, &temp) {
+            let non_proxy_hosts = if strict {
+                ""
+            } else {
+                STANDARD_JAVA_NON_PROXY_HOSTS
+            };
+            for (name, value) in endpoint.java_environment(&agent_path, &temp, non_proxy_hosts) {
                 insert_runtime_environment(profile, &mut env, name, value);
             }
         }
@@ -617,6 +625,7 @@ fn is_sensitive_environment_name(name: &str) -> bool {
         "CREDENTIALS",
         "DATABASE_URL",
         "DOCKER_AUTH_CONFIG",
+        "DOCKER_CONFIG",
         "GPG_AGENT_INFO",
         "GOOGLE_APPLICATION_CREDENTIALS",
         "KUBECONFIG",
@@ -2815,6 +2824,7 @@ mod tests {
                 ("CREDENTIAL".to_owned(), "sentinel".to_owned()),
                 ("CREDENTIALS".to_owned(), "sentinel".to_owned()),
                 ("DATABASE_URL".to_owned(), "sentinel".to_owned()),
+                ("DOCKER_CONFIG".to_owned(), "/tmp/docker-config".to_owned()),
                 ("TEST_DATABASE_URL".to_owned(), "sentinel".to_owned()),
                 ("PGPASSWORD".to_owned(), "sentinel".to_owned()),
                 ("PGPASSFILE".to_owned(), "sentinel".to_owned()),
@@ -3556,6 +3566,40 @@ mod tests {
             "-Dsbt.boot.directory={}",
             home.path().join(".sbt/boot").display()
         )));
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let proxy = start_proxy_if_needed(&profile, shutdown_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let proxied = build_extra_env(
+            &mut profile,
+            Some(&proxy.endpoint),
+            runtime.path(),
+            home.path(),
+            project.path(),
+            &["sbt".to_owned(), "compile".to_owned()],
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            proxied.get("NO_PROXY").map(String::as_str),
+            Some(STANDARD_NO_PROXY)
+        );
+        assert_eq!(
+            proxied.get("no_proxy").map(String::as_str),
+            Some(STANDARD_NO_PROXY)
+        );
+        assert!(
+            proxied
+                .get("JAVA_TOOL_OPTIONS")
+                .is_some_and(|options| options.contains(&format!(
+                    "-Dhttp.nonProxyHosts={STANDARD_JAVA_NON_PROXY_HOSTS}"
+                )))
+        );
+        let _ = shutdown_tx.send(true);
+        await_proxy_shutdown(proxy).await.unwrap();
     }
 
     #[test]
