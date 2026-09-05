@@ -2943,10 +2943,64 @@ fn resolve_standard_path_aliases(
     snapshot_standard_write_aliases(profile, home, project_dir)?;
     snapshot_standard_exec_aliases(profile)?;
     profile.enforce_deny_exec();
+    grant_standard_go_tool_directory(profile);
+    profile.enforce_deny_exec();
     snapshot_standard_read_aliases(profile)?;
     #[cfg(target_os = "linux")]
     append_standard_workspace_read_aliases(profile, project_dir)?;
     Ok(())
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "standard mode derives Go's immutable tool directory from its resolved built-in \
+              launcher"
+)]
+fn grant_standard_go_tool_directory(profile: &mut SandboxProfile) {
+    // `go build` launches compile, asm, link, cgo, and other implementation
+    // tools from `$GOROOT/pkg/tool/<platform>`. The directory is version- and
+    // package-manager-specific (notably Homebrew's Cellar layout), so derive
+    // it from the already-resolved standard launcher rather than granting a
+    // broad parent such as /usr/lib or /opt/homebrew/Cellar.
+    //
+    // Only standardAllowExec entries are candidates. Project config cannot
+    // populate that list, and a launcher removed by denyExec is not used to
+    // infer any extra execution authority.
+    let launchers: Vec<PathBuf> = profile
+        .standard_allow_exec
+        .iter()
+        .filter(|helper| helper.path.file_name().is_some_and(|name| name == "go"))
+        .map(|helper| helper.path.clone())
+        .collect();
+    for launcher in launchers {
+        let Ok(resolved_launcher) = std::fs::canonicalize(&launcher) else {
+            continue;
+        };
+        if !profile
+            .allow_exec
+            .iter()
+            .any(|grant| grant.path == resolved_launcher)
+        {
+            continue;
+        }
+        let Some(bin_dir) = resolved_launcher.parent() else {
+            continue;
+        };
+        if bin_dir.file_name().is_none_or(|name| name != "bin") {
+            continue;
+        }
+        let Some(goroot) = bin_dir.parent() else {
+            continue;
+        };
+        let tool_root = goroot.join("pkg/tool");
+        let Ok(tool_root) = std::fs::canonicalize(tool_root) else {
+            continue;
+        };
+        if !tool_root.is_dir() {
+            continue;
+        }
+        insert_builtin_path_grant(profile, GrantKind::AllowExec, SandboxPath::dir(tool_root));
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -5549,6 +5603,65 @@ mod tests {
                 && (record.value == alias.to_string_lossy()
                     || record.value == target.to_string_lossy())
         }));
+    }
+
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the unit test creates an isolated Go installation symlink fixture"
+    )]
+    fn standard_go_helper_grants_its_resolved_tool_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let project = root.path().join("project");
+        let go_root = root.path().join("go");
+        let go_binary = go_root.join("bin/go");
+        let tool_root = go_root.join("pkg/tool");
+        let compile = tool_root.join("test-platform/compile");
+        let launcher = root.path().join("bin/go");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(go_binary.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(compile.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+        std::fs::write(&go_binary, "#!/bin/sh\n").unwrap();
+        std::fs::write(&compile, "#!/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink(&go_binary, &launcher).unwrap();
+
+        let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, &home, &project);
+        profile.standard_allow_exec = vec![SandboxPath::file(launcher)];
+        apply_standard_profile(
+            &mut profile,
+            &["cargo".to_owned(), "build".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap();
+
+        resolve_standard_path_aliases(&mut profile, &home, &project).unwrap();
+
+        let resolved_tool_root = std::fs::canonicalize(&tool_root).unwrap();
+        assert!(
+            profile
+                .allow_exec
+                .contains(&SandboxPath::dir(resolved_tool_root)),
+            "a standard Go launcher must include its resolved GOROOT/pkg/tool subtree"
+        );
+
+        profile.merge_overrides(&ProfileOverrides {
+            deny_exec: vec![SandboxPath::file(compile.clone())],
+            ..ProfileOverrides::default()
+        });
+        resolve_standard_path_aliases(&mut profile, &home, &project).unwrap();
+
+        let resolved_compile = std::fs::canonicalize(&compile).unwrap();
+        assert!(
+            !profile
+                .allow_exec
+                .iter()
+                .any(|grant| paths_overlap(&grant.path, &resolved_compile)),
+            "a denyExec for a Go child tool must suppress the inferred tool-directory grant"
+        );
     }
 
     #[test]

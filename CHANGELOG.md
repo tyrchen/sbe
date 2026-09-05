@@ -17,6 +17,8 @@ All notable changes to this project will be documented in this file. See [conven
 - Preserve `denyExec` precedence after standard-mode helper symlinks are
   resolved, so a helper cannot reauthorize its denied canonical target on
   Linux.
+- Let standard-mode Go helpers execute the compiler tools in the resolved
+  `GOROOT/pkg/tool/` subtree without opening a broad package-manager directory.
 - Do not inherit language-runtime launcher and code-injection environment
   variables such as `JAVA_TOOL_OPTIONS`, `NODE_OPTIONS`, and `PYTHONPATH`;
   reviewed values can still be supplied explicitly.

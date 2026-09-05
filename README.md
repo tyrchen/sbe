@@ -107,7 +107,10 @@ The standard profiles also include common child build tools—downloaders,
 scripting runtimes, OpenSSL, `protoc`, native code generators, and platform
 toolchain launchers—using explicit per-platform paths. This covers helpers
 launched by npm scripts, uv or pip builds, Cargo build scripts, Maven/Gradle,
-and native extension builds. These compatibility grants are standard-only;
+and native extension builds. For Go, SBE derives the matching
+`GOROOT/pkg/tool/` directory from the resolved standard `go` launcher so its
+compiler subprocesses work without granting a broad package-manager directory.
+These compatibility grants are standard-only;
 strict mode keeps its smaller executable allowlist.
 
 Standard mode also removes language-runtime launcher variables such as
