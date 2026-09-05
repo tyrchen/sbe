@@ -7,7 +7,11 @@ All notable changes to this project will be documented in this file. See [conven
 
 ### Bug Fixes
 
-- allow sandboxed processes to signal their own child workers during teardown
+- **(macos)** allow sandboxed workers to terminate child processes (#17) - ([4239b42](https://github.com/tyrchen/sbe/commit/4239b428329c3ecf0d5aec4c2a51fd714482d9f9)) - Tyr Chen
+
+### Other
+
+- Update CHANGELOG.md - ([cb0f106](https://github.com/tyrchen/sbe/commit/cb0f106fe84ef6ce0edbb89cfe757e7a9ec90758)) - Tyr Chen
 
 ---
 ## [sbexec-v0.4.2](https://github.com/tyrchen/sbe/compare/sbexec-v0.4.1..sbexec-v0.4.2) - 2026-09-05
