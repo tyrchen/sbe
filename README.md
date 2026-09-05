@@ -17,14 +17,14 @@ install hooks, compiler plugins, and build scripts. It protects host
 credentials and limits filesystem, process, environment, and network access.
 The operating-system kernel and the installed SBE executable remain trusted.
 
-Current release: [`0.4.1`](https://github.com/tyrchen/sbe/releases/tag/sbexec-v0.4.1)
+Current release: [`0.4.2`](https://github.com/tyrchen/sbe/releases/tag/sbexec-v0.4.2)
 
 ## Install
 
 Install the `sbexec` crate, which provides the `sbe` command:
 
 ```bash
-cargo install sbexec --version 0.4.1 --locked
+cargo install sbexec --version 0.4.2 --locked
 sbe --version
 ```
 
@@ -85,7 +85,7 @@ failures use 126.
 
 ## Choose a security mode
 
-Version 0.4.1 uses `standard` mode by default and provides the original 0.4
+Version 0.4.2 uses `standard` mode by default and provides the original 0.4
 fail-closed boundary through `--strict`.
 
 | | Standard (default) | Strict (`--strict`) |
@@ -128,9 +128,10 @@ for later execution outside the sandbox.
 
 ## GitHub Actions
 
-The setup action installs the published `0.4.1` binary, verifies its SHA-256
+The setup action installs the published `0.4.2` binary, verifies its SHA-256
 checksum and GitHub build-provenance attestation, and adds it to `PATH`.
-Pinning both the action code and installed binary makes upgrades explicit:
+The action now defaults to the current release, so a normal workflow needs no
+extra version configuration:
 
 ```yaml
 name: build
@@ -146,21 +147,20 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install SBE
-        uses: tyrchen/sbe@5271cff35f898262b560492c4d2252adfb215053 # sbexec-v0.4.1
-        with:
-          version: '0.4.1'
+        uses: tyrchen/sbe@sbexec-v0.4.2
       - run: sbe --version
       - run: sbe run -- cargo build
 ```
 
-You may use `tyrchen/sbe@sbexec-v0.4.1` when a movable Git tag is acceptable.
-For high-assurance workflows, use the full commit SHA shown above.
+For high-assurance workflows, pin the action code to the immutable commit SHA
+for `sbexec-v0.4.2` from the release page. The installed archive is always
+checked against both its release checksum and GitHub build provenance.
 
-The `version` input accepts `0.4.1`, `v0.4.1`, or `sbexec-v0.4.1`. It defaults
-to `0.4.1`. Use `latest` only when you deliberately want automatic upgrades to
-the latest stable GitHub release. The optional `github-token` input defaults to
-`github.token`. The action exposes the resolved release tag as `version` and
-the installed executable as `bin-path`.
+The optional `version` input accepts `0.4.2`, `v0.4.2`, `sbexec-v0.4.2`, or
+`latest`; it defaults to `0.4.2`. Use it only to override the default or when
+you deliberately want automatic upgrades to the latest stable GitHub release.
+The optional `github-token` defaults to `github.token`. The action exposes the
+resolved release tag as `version` and the installed executable as `bin-path`.
 
 Release binaries are available for:
 
@@ -296,12 +296,21 @@ Policy sources are merged in this order:
 5. CLI options.
 
 An auto-discovered project file is untrusted by default. In standard mode it
-may add the project's ordinary network requirements with `allowDomains` and
-`allowFetch`, or tighten policy with `denyRead`, `denyExec`, and
-`denyDomains`. It cannot grant filesystem, execution, environment, proxy, or
-degraded-mode authority. Strict mode keeps the restrictive-only behavior.
-Inspect a repository-controlled expansion before trusting broader authority
-for one invocation:
+may add the project's ordinary registry or download domains with
+`allowDomains` and `allowFetch`, or tighten policy with `denyRead`, `denyExec`,
+and `denyDomains`. A private registry therefore works without a trust flag:
+
+```yaml
+# .sbe.yaml
+profiles:
+  rust:
+    allowDomains:
+      - "cargo-index.int.example.com"
+```
+
+It cannot grant filesystem, execution, environment, proxy, or degraded-mode
+authority. Strict mode keeps the restrictive-only behavior. Inspect before
+trusting a repository-controlled expansion that needs broader authority:
 
 ```bash
 sbe inspect --trust-project-config -- npm install
@@ -309,22 +318,7 @@ sbe run --trust-project-config -- npm install
 ```
 
 Global configuration, an explicitly selected file, and CLI options are treated
-as trusted user choices. Example project configuration for a private registry:
-
-```yaml
-profiles:
-  node:
-    allowWrite:
-      - "$PWD/dist/"
-    allowDomains:
-      - "api.example.com"
-    denyDomains:
-      - "github.com"
-    allowFetch:
-      - "downloads.example.com"
-    env:
-      NODE_ENV: production
-```
+as trusted user choices.
 
 Configuration rejects unknown fields, unsafe paths, malformed domains and
 environment names, oversized input, missing bases, and cyclic `extends`
@@ -395,7 +389,7 @@ Frequently used security options are:
 | `--deny-exec PATH` | Remove an executable path |
 | `--keep-env NAME` | Preserve one parent variable |
 | `--env NAME=VALUE` | Set one child variable |
-| `--trust-project-config` | Allow discovered project policy to add grants |
+| `--trust-project-config` | Allow broader filesystem, execution, or environment grants from project config |
 | `--no-proxy` | Use direct TCP 443 compatibility mode |
 | `--allow-all-network` | Remove network confinement |
 | `--allow-insecure-linux-network` | Acknowledge strict Linux port-only networking |
@@ -405,7 +399,7 @@ Frequently used security options are:
 
 - [Architecture](docs/arch.md)
 - [Security hardening design and threat model](specs/security-hardening-design.md)
-- [0.4.1 usable-security design](specs/usable-security-design.md)
+- [0.4.2 usable-security design](specs/usable-security-design.md)
 - [Changelog](CHANGELOG.md)
 
 ## Development

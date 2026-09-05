@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
-## Unreleased
+## [sbexec-v0.4.2](https://github.com/tyrchen/sbe/compare/sbexec-v0.4.1..sbexec-v0.4.2) - 2026-09-05
 
 ### Bug Fixes
 
