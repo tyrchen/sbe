@@ -263,7 +263,11 @@ fn section_misc(sb: &mut String) {
     .ok();
     writeln!(sb, "    (global-name-regex #\"^com\\.apple\\.lsd\\.\")").ok();
     writeln!(sb, ")").ok();
-    writeln!(sb, "(allow signal (target self))").ok();
+    // A sandboxed process must be able to tear down workers and other
+    // descendants it created. Target-scoping keeps the capability narrow:
+    // it does not authorize signals to the parent, siblings, or unrelated
+    // same-user processes.
+    writeln!(sb, "(allow signal (target self) (target children))").ok();
 }
 
 /// Write an SBPL path filter from a `SandboxPath`.
@@ -495,6 +499,18 @@ mod tests {
         assert!(!sbpl.contains("(allow mach-lookup)"));
         assert!(!sbpl.contains("com.apple.SecurityServer"));
         assert!(!sbpl.contains("ipc-posix-shm"));
+    }
+
+    #[test]
+    fn test_should_scope_signals_to_self_and_children() {
+        let home = PathBuf::from("/Users/test");
+        let pwd = PathBuf::from("/Users/test/project");
+        let profile = SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &pwd);
+        let sbpl = generate(&profile, Some(12345), strict_options()).unwrap();
+
+        assert!(sbpl.contains("(allow signal (target self) (target children))"));
+        assert!(!sbpl.contains("(allow signal*)"));
+        assert!(!sbpl.contains("(allow signal)"));
     }
 
     #[test]

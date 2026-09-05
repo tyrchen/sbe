@@ -1,7 +1,7 @@
 # SBE Usable Security Design
 
-- Status: Delivered in 0.4.2
-- Delivery: 0.4.2 implements the standard/strict split and immediate
+- Status: Delivered in 0.4.3
+- Delivery: 0.4.3 implements the standard/strict split and immediate
   compatibility changes; narrow persistent approvals remain follow-up work
 - Owner: SBE
 - Last updated: 2026-09-05
@@ -42,9 +42,9 @@ requested mode and the guarantees actually enforced. Standard mode degrades
 individual capabilities instead of failing the whole command; strict mode
 still fails before launch when one of its promised capabilities is missing.
 
-### 1.1 0.4.2 delivery boundary
+### 1.1 0.4.3 delivery boundary
 
-0.4.2 delivers the mode split, standard workspace/output behavior,
+0.4.3 delivers the mode split, standard workspace/output behavior,
 non-sensitive environment inheritance, referent-aware symlinks, ordinary
 sccache compatibility, top-level Cargo install intent, local developer
 services, and truthful Linux best-effort networking. It preserves the 0.4
@@ -556,7 +556,7 @@ Execution allowlisting is weak against malicious native code and creates
 continuous toolchain breakage. The target standard design therefore blocks
 small, reviewed sets of true capability brokers where the OS can enforce that
 distinction, and relies on filesystem, secret, network, and `no_new_privs`
-boundaries for the primary protection. 0.4.2 keeps the existing curated list
+boundaries for the primary protection. 0.4.3 keeps the existing curated list
 but resolves normal tool-manager aliases and adds black-box compatibility tests;
 removing that list safely is follow-up work. Strict mode retains a positive
 execute allowlist.

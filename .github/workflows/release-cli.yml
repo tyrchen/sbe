@@ -85,10 +85,10 @@ jobs:
       # setup action verifies both checksum and build provenance. On native
       # targets the sandboxed build warms the upload action's cache;
       # cross-musl targets use a host-native sandboxed check.
-      - name: Install sbe 0.4.1 (dogfood)
-        uses: tyrchen/sbe@5271cff35f898262b560492c4d2252adfb215053 # sbexec-v0.4.1
+      - name: Install sbe 0.4.2 (dogfood)
+        uses: tyrchen/sbe@dba413595698f878a07c2106b45bf7b115ad1bea # sbexec-v0.4.2
         with:
-          version: '0.4.1'
+          version: '0.4.2'
       - name: Pre-build under sbe (dogfood)
         shell: bash
         env:

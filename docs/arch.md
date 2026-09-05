@@ -1,6 +1,6 @@
 # sbe Architecture
 
-> **Status:** Current for SBE 0.4.2. Standard mode is the default; `--strict`
+> **Status:** Current for SBE 0.4.3. Standard mode is the default; `--strict`
 > retains the 0.4 fail-closed boundary. Security requirements and finding IDs are
 > defined in the [security hardening design](../specs/security-hardening-design.md).
 
