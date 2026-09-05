@@ -52,10 +52,10 @@ jobs:
       # archive checksum and GitHub build-provenance attestation before install.
       # nextest stays outside because its proxy tests bind random localhost TCP
       # ports.
-      - name: Install sbe 0.4.1 (dogfood)
-        uses: tyrchen/sbe@5271cff35f898262b560492c4d2252adfb215053 # sbexec-v0.4.1
+      - name: Install sbe 0.4.2 (dogfood)
+        uses: tyrchen/sbe@dba413595698f878a07c2106b45bf7b115ad1bea # sbexec-v0.4.2
         with:
-          version: '0.4.1'
+          version: '0.4.2'
       - name: sbe smoke
         run: |
           sbe --version

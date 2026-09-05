@@ -5,4 +5,4 @@
 - [sbe Implementation Plan](sbe-impl-plan.md) — 3-phase roadmap: core sandbox → network proxy → audit & polish
 - [Cross-Platform Backend Design](cross-platform-backend-design.md) — `SandboxBackend` trait, macOS/Linux parity matrix, Landlock+seccomp port, per-OS profile defaults, phased migration
 - [Security Hardening Design](security-hardening-design.md) — Threat model, prioritized security findings, process/network/filesystem hardening, supply-chain controls, and adversarial acceptance tests
-- [Usable Security Design](usable-security-design.md) — SBE 0.4.2 product contract: usable standard mode, opt-in strict mode, referent-based symlink policy, no vendored tool adapters, and a control-by-control simplification audit
+- [Usable Security Design](usable-security-design.md) — SBE 0.4.3 product contract: usable standard mode, opt-in strict mode, referent-based symlink policy, no vendored tool adapters, and a control-by-control simplification audit

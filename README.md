@@ -17,14 +17,14 @@ install hooks, compiler plugins, and build scripts. It protects host
 credentials and limits filesystem, process, environment, and network access.
 The operating-system kernel and the installed SBE executable remain trusted.
 
-Current release: [`0.4.2`](https://github.com/tyrchen/sbe/releases/tag/sbexec-v0.4.2)
+Current release: [`0.4.3`](https://github.com/tyrchen/sbe/releases/tag/sbexec-v0.4.3)
 
 ## Install
 
 Install the `sbexec` crate, which provides the `sbe` command:
 
 ```bash
-cargo install sbexec --version 0.4.2 --locked
+cargo install sbexec --version 0.4.3 --locked
 sbe --version
 ```
 
@@ -85,7 +85,7 @@ failures use 126.
 
 ## Choose a security mode
 
-Version 0.4.2 uses `standard` mode by default and provides the original 0.4
+Version 0.4.3 uses `standard` mode by default and provides the original 0.4
 fail-closed boundary through `--strict`.
 
 | | Standard (default) | Strict (`--strict`) |
@@ -131,7 +131,7 @@ for later execution outside the sandbox.
 
 ## GitHub Actions
 
-The setup action installs the published `0.4.2` binary, verifies its SHA-256
+The setup action installs the published `0.4.3` binary, verifies its SHA-256
 checksum and GitHub build-provenance attestation, and adds it to `PATH`.
 The action now defaults to the current release, so a normal workflow needs no
 extra version configuration:
@@ -150,17 +150,17 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install SBE
-        uses: tyrchen/sbe@sbexec-v0.4.2
+        uses: tyrchen/sbe@sbexec-v0.4.3
       - run: sbe --version
       - run: sbe run -- cargo build
 ```
 
 For high-assurance workflows, pin the action code to the immutable commit SHA
-for `sbexec-v0.4.2` from the release page. The installed archive is always
+for `sbexec-v0.4.3` from the release page. The installed archive is always
 checked against both its release checksum and GitHub build provenance.
 
-The optional `version` input accepts `0.4.2`, `v0.4.2`, `sbexec-v0.4.2`, or
-`latest`; it defaults to `0.4.2`. Use it only to override the default or when
+The optional `version` input accepts `0.4.3`, `v0.4.3`, `sbexec-v0.4.3`, or
+`latest`; it defaults to `0.4.3`. Use it only to override the default or when
 you deliberately want automatic upgrades to the latest stable GitHub release.
 The optional `github-token` defaults to `github.token`. The action exposes the
 resolved release tag as `version` and the installed executable as `bin-path`.
@@ -402,7 +402,7 @@ Frequently used security options are:
 
 - [Architecture](docs/arch.md)
 - [Security hardening design and threat model](specs/security-hardening-design.md)
-- [0.4.2 usable-security design](specs/usable-security-design.md)
+- [0.4.3 usable-security design](specs/usable-security-design.md)
 - [Changelog](CHANGELOG.md)
 
 ## Development
