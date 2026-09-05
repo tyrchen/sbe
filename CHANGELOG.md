@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
+## Unreleased
+
+### Bug Fixes
+
+- Allow standard-mode project configs to declare ordinary registry and
+  build-time download domains without requiring `--trust-project-config`.
+- Include common build helpers such as downloaders, scripting runtimes,
+  `perl`, `protoc`, OpenSSL, native code generators, and Xcode tools in the
+  standard-mode executable policy so normal build scripts can run on Linux
+  and macOS. Strict mode remains unchanged.
+- Detect standalone `uvx` and `corepack` invocations and cover common
+  Homebrew/user-managed Node and uv tool locations in standard mode.
+- Do not inherit language-runtime launcher and code-injection environment
+  variables such as `JAVA_TOOL_OPTIONS`, `NODE_OPTIONS`, and `PYTHONPATH`;
+  reviewed values can still be supplied explicitly.
+
 ---
 ## [sbexec-v0.4.1](https://github.com/tyrchen/sbe/compare/sbexec-v0.4.0..sbexec-v0.4.1) - 2026-08-29
 

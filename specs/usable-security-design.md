@@ -78,6 +78,11 @@ The default promise is:
 > ambient credentials and its ability to persist outside the project and
 > expected tool data, while preserving normal build-tool behavior.
 
+Normal build-tool behavior includes common child helpers such as downloaders,
+Perl/Python/Node/Ruby scripting runtimes, OpenSSL, `protoc`, native code
+generators, and platform compiler launchers. These are declared in the
+embedded per-OS standard defaults and are not inherited by strict mode.
+
 The strict promise is:
 
 > If SBE reports that a strict command started, every requested strict
@@ -215,6 +220,15 @@ Security features are reported independently rather than collapsed into one
 | macOS external egress | Exact proxy policy | Exact proxy policy |
 | Linux external egress | Best available, explicitly not strict | Refuse domain mode if unavailable |
 | Missing secondary capability | Continue with one concise warning | Refuse before spawn |
+
+Standard mode treats an automatically discovered project configuration as
+untrusted, but accepts `allowDomains`, `denyDomains`, and `allowFetch` because
+these are ordinary descriptions of where a build obtains dependencies. The
+proxy (or Linux's explicitly best-effort network mode) still governs the
+resulting traffic. Filesystem, executable, environment, proxy, and
+degraded-mode changes remain blocked unless the user explicitly passes
+`--trust-project-config`. Strict mode keeps the restrictive-only project
+policy.
 
 `inspect` emits, for each capability, one of `enforced`, `bestEffort`,
 `unavailable`, `notRequested`, or `explicitlyAllowed`, plus the origin of the

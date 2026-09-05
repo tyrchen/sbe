@@ -103,6 +103,18 @@ outputs, and package caches. Because the whole workspace is readable in this
 mode, do not keep real credentials in repository files such as `.env`. Put
 them outside the workspace or use strict mode.
 
+The standard profiles also include common child build tools—downloaders,
+scripting runtimes, OpenSSL, `protoc`, native code generators, and platform
+toolchain launchers—using explicit per-platform paths. This covers helpers
+launched by npm scripts, uv or pip builds, Cargo build scripts, Maven/Gradle,
+and native extension builds. These compatibility grants are standard-only;
+strict mode keeps its smaller executable allowlist.
+
+Standard mode also removes language-runtime launcher variables such as
+`JAVA_TOOL_OPTIONS`, `NODE_OPTIONS`, and `PYTHONPATH` from the inherited
+environment. Pass a reviewed value with `--keep-env` when a build genuinely
+needs one; SBE-controlled variables remain reserved.
+
 Strict mode is intentionally less convenient. It is most useful with a warm,
 reviewed dependency cache and a command that does not need the network:
 
@@ -165,9 +177,9 @@ SBE detects these built-in profiles:
 
 | Ecosystem | Commands | Project files |
 |---|---|---|
-| Node.js | `node`, `npm`, `npx`, `yarn`, `pnpm`, `bun` | `package.json` |
+| Node.js | `node`, `npm`, `npx`, `corepack`, `yarn`, `pnpm`, `bun` | `package.json` |
 | Rust | `cargo`, `rustc`, `rustup` | `Cargo.toml` |
-| Python | `python`, `pip`, `uv`, `poetry`, `pdm`, `rye` | `pyproject.toml`, requirements files |
+| Python | `python`, `pip`, `uv`, `uvx`, `poetry`, `pdm`, `rye` | `pyproject.toml`, requirements files |
 | Elixir | `mix`, `elixir`, `iex` | `mix.exs` |
 | Java/Scala | `java`, `javac`, `mvn`, `gradle`, `sbt`, `scala` | Maven, Gradle, and sbt descriptors |
 
@@ -283,10 +295,13 @@ Policy sources are merged in this order:
 4. a file selected with `--config`; and
 5. CLI options.
 
-An auto-discovered project file is untrusted by default. It may tighten policy
-with `denyRead`, `denyExec`, or `denyDomains`, but it cannot grant filesystem,
-execution, environment, fetch, network, or degraded-mode authority. Inspect a
-repository-controlled expansion before trusting it for one invocation:
+An auto-discovered project file is untrusted by default. In standard mode it
+may add the project's ordinary network requirements with `allowDomains` and
+`allowFetch`, or tighten policy with `denyRead`, `denyExec`, and
+`denyDomains`. It cannot grant filesystem, execution, environment, proxy, or
+degraded-mode authority. Strict mode keeps the restrictive-only behavior.
+Inspect a repository-controlled expansion before trusting broader authority
+for one invocation:
 
 ```bash
 sbe inspect --trust-project-config -- npm install
@@ -294,7 +309,7 @@ sbe run --trust-project-config -- npm install
 ```
 
 Global configuration, an explicitly selected file, and CLI options are treated
-as trusted user choices. Example:
+as trusted user choices. Example project configuration for a private registry:
 
 ```yaml
 profiles:

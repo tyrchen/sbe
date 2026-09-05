@@ -162,6 +162,53 @@ common:
     - "/usr/bin/git"
     - "/usr/local/bin/git"
 
+  # Compatibility helpers used by ordinary standard-mode build scripts.
+  # Strict mode deliberately does not inherit this list.
+  standardAllowExec:
+    - "/usr/bin/curl"
+    - "/usr/local/bin/curl"
+    - "/usr/bin/wget"
+    - "/usr/local/bin/wget"
+    - "/usr/bin/perl"
+    - "/usr/local/bin/perl"
+    - "/usr/bin/protoc"
+    - "/usr/local/bin/protoc"
+    - "/usr/bin/openssl"
+    - "/usr/local/bin/openssl"
+    # Cross-language build helpers commonly launched by package scripts,
+    # build.rs files, and native extension builds.
+    - "/usr/bin/python"
+    - "/usr/bin/python3"
+    - "/usr/local/bin/python"
+    - "/usr/local/bin/python3"
+    - "/usr/bin/node"
+    - "/usr/local/bin/node"
+    - "/usr/bin/ruby"
+    - "/usr/local/bin/ruby"
+    - "/usr/bin/go"
+    - "/usr/local/bin/go"
+    - "/usr/local/go/bin/go"
+    - "/usr/bin/dotnet"
+    - "/usr/local/bin/dotnet"
+    - "/usr/bin/javac"
+    - "/usr/bin/jar"
+    - "/usr/bin/xcodebuild"
+    - "/usr/bin/xcrun"
+    # Native and generated-code build tools that are not part of every
+    # ecosystem profile.
+    - "/usr/bin/ninja"
+    - "/usr/local/bin/ninja"
+    - "/usr/bin/meson"
+    - "/usr/local/bin/meson"
+    - "/usr/bin/m4"
+    - "/usr/bin/autoconf"
+    - "/usr/bin/automake"
+    - "/usr/bin/libtool"
+    - "/usr/bin/libtoolize"
+    - "/usr/bin/bison"
+    - "/usr/bin/flex"
+    - "/usr/bin/swig"
+
 profiles:
   node:
     allowWrite:
@@ -193,6 +240,8 @@ profiles:
       - "/usr/bin/npx"
       - "/usr/local/bin/npm"
       - "/usr/local/bin/npx"
+      - "/usr/bin/corepack"
+      - "/usr/local/bin/corepack"
       - "/usr/local/bin/yarn"
       - "/usr/local/bin/pnpm"
       - "/usr/local/bin/bun"
@@ -207,6 +256,9 @@ profiles:
       - "~/.local/share/mise/"
       # asdf shim layout
       - "~/.asdf/"
+    standardAllowExec:
+      - "~/.bun/"
+      - "~/.local/share/pnpm/"
 
   rust:
     allowRead:
@@ -266,6 +318,8 @@ profiles:
       - "/usr/local/bin/pip3"
       - "/usr/local/bin/uv"
       - "/usr/bin/uv"
+      - "/usr/local/bin/uvx"
+      - "/usr/bin/uvx"
       # GitHub Actions setup-python installs versioned interpreters here.
       - "/opt/hostedtoolcache/Python/"
       # GitHub Actions setup-uv installs versioned binaries here.

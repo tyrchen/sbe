@@ -15,7 +15,10 @@ use anyhow::Context;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use sbe_core::{
     BackendOptions, Sandbox, SandboxBackend, SecurityMode,
-    config::{PathKind, SandboxPath, expand_path, load_configs, resolve_profile},
+    config::{
+        PathKind, ProjectConfigMode, SandboxPath, expand_path, load_configs,
+        resolve_profile_with_mode,
+    },
     detect::{self, Ecosystem},
     error::CoreError,
     profile::{
@@ -99,7 +102,14 @@ async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
         configure_node_workspace(&mut profile, &args.command, &pwd, !args.strict)?;
     }
     let configs = load_configs(&pwd, args.config.as_deref(), args.trust_project_config).await?;
-    resolve_profile(&mut profile, &configs, &home, &pwd)?;
+    let project_config_mode = if args.trust_project_config {
+        ProjectConfigMode::Trusted
+    } else if args.strict {
+        ProjectConfigMode::Restricted
+    } else {
+        ProjectConfigMode::Standard
+    };
+    resolve_profile_with_mode(&mut profile, &configs, &home, &pwd, project_config_mode)?;
 
     let overrides = build_overrides(args, &home, &pwd)?;
     let cli_allow_degraded = overrides.allow_degraded;
@@ -679,6 +689,26 @@ fn is_sensitive_environment_name(name: &str) -> bool {
         "UV_EXTRA_INDEX_URL",
         "UV_INDEX",
         "UV_INDEX_URL",
+        // Tool-specific launcher and code-injection options are intentionally
+        // not inherited. SBE supplies its own JVM/proxy options at runtime;
+        // users can still pass a reviewed value explicitly with --keep-env
+        // (except for SBE-reserved JAVA_TOOL_OPTIONS).
+        "BASH_ENV",
+        "ENV",
+        "GRADLE_OPTS",
+        "JAVA_TOOL_OPTIONS",
+        "JDK_JAVA_OPTIONS",
+        "MAVEN_OPTS",
+        "NODE_OPTIONS",
+        "PERL5LIB",
+        "PERL5OPT",
+        "PYTHONHOME",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+        "RUBYLIB",
+        "RUBYOPT",
+        "_JAVA_OPTIONS",
+        "GOPROXY",
     ];
     const RESERVED: &[&str] = &[
         "HTTP_PROXY",
@@ -739,6 +769,12 @@ fn apply_standard_profile(
         GrantKind::AllowWrite,
         SandboxPath::dir(project_dir.to_path_buf()),
     );
+    // Standard mode favors compatibility for ordinary build scripts. These
+    // are common local code-generation/download helpers, and their use still
+    // remains subject to the resolved network policy and protected reads.
+    for helper in &profile.standard_allow_exec.clone() {
+        insert_builtin_path_grant(profile, GrantKind::AllowExec, helper.clone());
+    }
     for output in project_outputs {
         if resolves_within(&output, project_dir) {
             // The Linux backend must open an executable directory before it
@@ -1620,8 +1656,8 @@ fn simple_uv_cache_path(value: &str, source: &Path) -> anyhow::Result<PathBuf> {
         let unquoted = &value[1..value.len() - 1];
         if unquoted.contains('\\') || unquoted.contains('"') {
             anyhow::bail!(
-                "uv configuration '{}' uses an escaped or multiline cache-dir; use an explicit \
-                 uv --cache-dir path",
+                "uv configuration '{}' uses an escaped or multiline cache-dir; use an explicit uv \
+                 --cache-dir path",
                 source.display()
             );
         }
@@ -4640,7 +4676,7 @@ fn workspace_component_matches(pattern: &str, value: &str) -> bool {
 }
 
 /// Determine which Yarn linker outputs are required without executing Yarn or
-/// following project-controlled symlinks. Yarn Berry uses PnP by default when
+/// following project-controlled symlinks. Yarn Berry uses Plug'n'Play by default when
 /// a `.yarnrc.yml` is present; `packageManager: yarn@2+` is the other explicit
 /// modern-Yarn signal. Classic/unspecified Yarn remains lockfile-only so SBE
 /// does not create an unrelated empty `.pnp.cjs`.
@@ -4980,6 +5016,10 @@ pub fn print_profiles() -> anyhow::Result<()> {
         for p in &profile.allow_exec {
             println!("    - {p}");
         }
+        println!("  Standard-only compatibility executables:");
+        for p in &profile.standard_allow_exec {
+            println!("    - {p}");
+        }
         println!();
     }
     Ok(())
@@ -5067,6 +5107,19 @@ mod tests {
                 ("SSH_AUTH_SOCK".to_owned(), "/tmp/agent".to_owned()),
                 ("SYSTEM_ACCESSTOKEN".to_owned(), "sentinel".to_owned()),
                 ("NPM_TOKEN".to_owned(), "sentinel".to_owned()),
+                (
+                    "JAVA_TOOL_OPTIONS".to_owned(),
+                    "-javaagent:/tmp/a.jar".to_owned(),
+                ),
+                (
+                    "NODE_OPTIONS".to_owned(),
+                    "--require=/tmp/hook.js".to_owned(),
+                ),
+                ("PYTHONPATH".to_owned(), "/tmp/hooks".to_owned()),
+                (
+                    "GOPROXY".to_owned(),
+                    "https://user:sentinel@example.com".to_owned(),
+                ),
                 (
                     "NPM_CONFIG_GLOBALCONFIG".to_owned(),
                     "/tmp/global-npmrc".to_owned(),
@@ -5345,6 +5398,12 @@ mod tests {
                 .allow_write
                 .contains(&SandboxPath::dir(project.path().join("target")))
         );
+        for helper in &profile.standard_allow_exec {
+            assert!(
+                profile.allow_exec.contains(helper),
+                "standard mode should allow configured helper {helper}"
+            );
+        }
         assert!(!profile.deny_read.iter().any(|grant| {
             grant.path.parent() == Some(project.path())
                 && grant.path.file_name().is_some_and(|name| name == ".env")
@@ -6402,7 +6461,8 @@ mod tests {
                 .allow_write
                 .iter()
                 .any(|grant| grant.path == home.join(".cache/coursier")),
-            "the launcher must receive the reconstructed canonical target, not its symlinked spelling"
+            "the launcher must receive the reconstructed canonical target, not its symlinked \
+             spelling"
         );
     }
 

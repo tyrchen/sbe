@@ -119,6 +119,23 @@ pub enum ConfigOrigin {
     Explicit,
 }
 
+/// How an automatically discovered project configuration may affect policy.
+///
+/// Standard mode accepts the small set of project settings that describe the
+/// project's network dependencies. Filesystem, execution, environment, and
+/// broad-network grants still require an explicit trust decision. Strict mode
+/// uses [`Self::Restricted`] so repository-controlled configuration cannot
+/// expand any authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectConfigMode {
+    /// Only settings that tighten the resolved policy are accepted.
+    Restricted,
+    /// Accept ordinary project network requirements, but not authority grants.
+    Standard,
+    /// The caller explicitly authorized the project file to add grants.
+    Trusted,
+}
+
 /// A configuration plus the provenance needed to enforce monotonic project
 /// policy and explain the final profile.
 #[derive(Debug, Clone)]
@@ -426,6 +443,34 @@ impl ProfileConfig {
         }
         Ok(())
     }
+
+    /// Validate the compatibility subset accepted from an untrusted project
+    /// file in standard mode.
+    ///
+    /// A project must be able to name its registries and build-time download
+    /// hosts without making every invocation carry `--trust-project-config`.
+    /// Those settings remain constrained by the proxy (or are reported as
+    /// best-effort on Linux). They do not grant filesystem, process, or
+    /// environment authority. Everything else remains opt-in.
+    fn validate_standard_project(&self, path: &Path) -> Result<(), CoreError> {
+        let expands_authority = self.extends.is_some()
+            || !self.allow_write.is_empty()
+            || !self.allow_read.is_empty()
+            || !self.allow_exec.is_empty()
+            || !self.env.is_empty()
+            || self.allow_all_network == Some(true)
+            || self.enable_proxy == Some(false)
+            || self.allow_degraded == Some(true);
+        if expands_authority {
+            return Err(config_policy(
+                path,
+                "standard project configuration may add allowDomains/denyDomains or allowFetch, \
+                 but filesystem, execution, environment, proxy, and degraded-mode changes require \
+                 --trust-project-config",
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn record_path(
@@ -642,6 +687,17 @@ pub fn resolve_profile(
     home: &Path,
     pwd: &Path,
 ) -> Result<(), CoreError> {
+    resolve_profile_with_mode(base, configs, home, pwd, ProjectConfigMode::Restricted)
+}
+
+/// Resolve the final profile with the requested project-configuration policy.
+pub fn resolve_profile_with_mode(
+    base: &mut SandboxProfile,
+    configs: &[LoadedConfig],
+    home: &Path,
+    pwd: &Path,
+    project_mode: ProjectConfigMode,
+) -> Result<(), CoreError> {
     let profile_name = base.name.clone();
 
     for loaded in configs {
@@ -649,7 +705,11 @@ pub fn resolve_profile(
         // Apply matching profile config
         if let Some(pc) = config.profiles.get(&profile_name) {
             if loaded.origin == ConfigOrigin::Project && !loaded.trusted {
-                pc.validate_untrusted_project(&loaded.path)?;
+                match project_mode {
+                    ProjectConfigMode::Restricted => pc.validate_untrusted_project(&loaded.path)?,
+                    ProjectConfigMode::Standard => pc.validate_standard_project(&loaded.path)?,
+                    ProjectConfigMode::Trusted => {}
+                }
             }
             let grant_origin = match &loaded.origin {
                 ConfigOrigin::Global => GrantOrigin::Global(loaded.path.clone()),
@@ -836,7 +896,7 @@ profiles:
 
     #[test]
     fn test_should_reject_unknown_config_fields() {
-        let yaml = "profiles:\n  node:\n    allowNetwrok: true\n";
+        let yaml = "profiles:\n  node:\n    allowUnknownField: true\n";
         assert!(serde_yaml::from_str::<SbeConfig>(yaml).is_err());
     }
 
@@ -983,6 +1043,84 @@ profiles:
                 .iter()
                 .any(|domain| domain.0 == "registry.npmjs.org")
         );
+    }
+
+    #[test]
+    fn test_should_allow_standard_project_network_requirements() {
+        let home = PathBuf::from("/home/test");
+        let pwd = PathBuf::from("/work/project");
+        let mut config = SbeConfig::default();
+        config.profiles.insert(
+            "rust".to_owned(),
+            ProfileConfig {
+                allow_domains: vec!["cargo-index.example.com".to_owned()],
+                allow_fetch: vec!["downloads.example.com".to_owned()],
+                ..ProfileConfig::default()
+            },
+        );
+        let loaded = LoadedConfig {
+            config,
+            origin: ConfigOrigin::Project,
+            path: pwd.join(".sbe.yaml"),
+            trusted: false,
+        };
+        let mut profile =
+            SandboxProfile::for_ecosystem(crate::detect::Ecosystem::Rust, &home, &pwd);
+
+        resolve_profile_with_mode(
+            &mut profile,
+            &[loaded],
+            &home,
+            &pwd,
+            ProjectConfigMode::Standard,
+        )
+        .unwrap();
+
+        assert!(
+            profile
+                .allow_domains
+                .iter()
+                .any(|domain| domain.0 == "cargo-index.example.com")
+        );
+        assert!(
+            profile
+                .allow_fetch
+                .iter()
+                .any(|domain| domain.0 == "downloads.example.com")
+        );
+    }
+
+    #[test]
+    fn test_should_keep_standard_project_authority_expansion_opt_in() {
+        let home = PathBuf::from("/home/test");
+        let pwd = PathBuf::from("/work/project");
+        let mut config = SbeConfig::default();
+        config.profiles.insert(
+            "rust".to_owned(),
+            ProfileConfig {
+                allow_write: vec!["$PWD/generated/".to_owned()],
+                ..ProfileConfig::default()
+            },
+        );
+        let loaded = LoadedConfig {
+            config,
+            origin: ConfigOrigin::Project,
+            path: pwd.join(".sbe.yaml"),
+            trusted: false,
+        };
+        let mut profile =
+            SandboxProfile::for_ecosystem(crate::detect::Ecosystem::Rust, &home, &pwd);
+
+        let error = resolve_profile_with_mode(
+            &mut profile,
+            &[loaded],
+            &home,
+            &pwd,
+            ProjectConfigMode::Standard,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("--trust-project-config"));
     }
 
     #[test]

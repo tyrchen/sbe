@@ -242,6 +242,13 @@ pub struct SandboxProfile {
     #[serde(default)]
     pub allow_exec: Vec<SandboxPath>,
 
+    /// Additional compatibility executables enabled only by standard mode.
+    ///
+    /// These remain separate from `allow_exec` so strict mode does not
+    /// inherit compatibility grants outside its smaller contract.
+    #[serde(skip)]
+    pub standard_allow_exec: Vec<SandboxPath>,
+
     /// Requested proxy setting retained while configuration is merged.
     #[serde(skip)]
     pub enable_proxy: bool,
@@ -315,6 +322,13 @@ impl SandboxProfile {
             .allow_exec
             .iter()
             .chain(eco_cfg.allow_exec.iter())
+            .map(|p| expand_path(p, home, pwd))
+            .collect();
+
+        let standard_allow_exec: Vec<SandboxPath> = common
+            .standard_allow_exec
+            .iter()
+            .chain(eco_cfg.standard_allow_exec.iter())
             .map(|p| expand_path(p, home, pwd))
             .collect();
 
@@ -436,6 +450,7 @@ impl SandboxProfile {
             allow_domains,
             deny_exec,
             allow_exec,
+            standard_allow_exec,
             enable_proxy,
             allow_all_network: false,
             network_mode,
@@ -974,6 +989,8 @@ struct CommonDefaults {
     deny_exec: Vec<String>,
     #[serde(default)]
     allow_exec: Vec<String>,
+    #[serde(default)]
+    standard_allow_exec: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -987,6 +1004,8 @@ struct EcosystemDefaults {
     allow_domains: Vec<String>,
     #[serde(default)]
     allow_exec: Vec<String>,
+    #[serde(default)]
+    standard_allow_exec: Vec<String>,
     /// Whether to start the domain-filtering proxy. Some ecosystems whose
     /// HTTP stack does not respect `HTTP_PROXY` env (notably JVM tools like
     /// Maven and Gradle) cannot benefit from the proxy and need the kernel
@@ -1268,6 +1287,20 @@ mod tests {
                 "missing osascript deny for {eco}"
             );
         }
+    }
+
+    #[test]
+    fn test_should_keep_standard_compatibility_exec_separate() {
+        let home = PathBuf::from("/Users/test");
+        let pwd = PathBuf::from("/Users/test/project");
+        let profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, &home, &pwd);
+
+        assert!(has(&profile.standard_allow_exec, "/usr/bin/curl"));
+        assert!(has(&profile.standard_allow_exec, "/usr/bin/perl"));
+        assert!(has(&profile.standard_allow_exec, "/usr/bin/protoc"));
+        assert!(!has(&profile.allow_exec, "/usr/bin/curl"));
+        assert!(!has(&profile.allow_exec, "/usr/bin/perl"));
+        assert!(!has(&profile.allow_exec, "/usr/bin/protoc"));
     }
 
     #[test]
