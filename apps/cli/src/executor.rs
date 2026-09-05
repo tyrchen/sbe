@@ -169,6 +169,11 @@ async fn execute_inner(args: &RunArgs) -> anyhow::Result<ExitCode> {
         origin: GrantOrigin::Runtime,
     });
     profile.ephemeral_write_exec.push(runtime_temp_path.clone());
+    // Standard helper and runtime grants can become aliases of a denied
+    // executable only after their final path is resolved. Reconcile after all
+    // grants so Linux's allowlist preserves denyExec precedence just as
+    // macOS's explicit deny rule does.
+    profile.enforce_deny_exec();
     // Normal execution performs the filesystem identity scan exactly once in
     // the platform backend immediately before spawn. Inspection has no spawn,
     // so its branch below runs the complete validation explicitly.
@@ -2937,6 +2942,7 @@ fn resolve_standard_path_aliases(
 ) -> anyhow::Result<()> {
     snapshot_standard_write_aliases(profile, home, project_dir)?;
     snapshot_standard_exec_aliases(profile)?;
+    profile.enforce_deny_exec();
     snapshot_standard_read_aliases(profile)?;
     #[cfg(target_os = "linux")]
     append_standard_workspace_read_aliases(profile, project_dir)?;
@@ -5488,6 +5494,61 @@ mod tests {
                 .any(|allowed| paths_overlap(&allowed.path, &output)),
             "an inferred output grant must not override an explicit execute denial"
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the unit test creates an isolated standard-helper symlink fixture"
+    )]
+    fn standard_profile_reapplies_execute_denials_after_helper_alias_resolution() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let project = root.path().join("project");
+        let tools = root.path().join("tools");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&tools).unwrap();
+
+        let target = tools.join("protoc-real");
+        let alias = tools.join("protoc");
+        std::fs::write(&target, "#!/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+
+        let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, &home, &project);
+        profile.standard_allow_exec = vec![SandboxPath::file(alias.clone())];
+        profile.merge_overrides(&ProfileOverrides {
+            deny_exec: vec![SandboxPath::file(target.clone())],
+            ..ProfileOverrides::default()
+        });
+
+        apply_standard_profile(
+            &mut profile,
+            &["cargo".to_owned(), "build".to_owned()],
+            &home,
+            &project,
+        )
+        .unwrap();
+        assert!(
+            profile
+                .allow_exec
+                .contains(&SandboxPath::file(alias.clone())),
+            "the lexical helper grant demonstrates the pre-snapshot state"
+        );
+
+        resolve_standard_path_aliases(&mut profile, &home, &project).unwrap();
+
+        assert!(
+            !profile
+                .allow_exec
+                .iter()
+                .any(|allowed| paths_overlap(&allowed.path, &target))
+        );
+        assert!(!profile.grant_origins.iter().any(|record| {
+            record.kind == GrantKind::AllowExec
+                && (record.value == alias.to_string_lossy()
+                    || record.value == target.to_string_lossy())
+        }));
     }
 
     #[test]

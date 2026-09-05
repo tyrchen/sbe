@@ -14,6 +14,9 @@ All notable changes to this project will be documented in this file. See [conven
   and macOS. Strict mode remains unchanged.
 - Detect standalone `uvx` and `corepack` invocations and cover common
   Homebrew/user-managed Node and uv tool locations in standard mode.
+- Preserve `denyExec` precedence after standard-mode helper symlinks are
+  resolved, so a helper cannot reauthorize its denied canonical target on
+  Linux.
 - Do not inherit language-runtime launcher and code-injection environment
   variables such as `JAVA_TOOL_OPTIONS`, `NODE_OPTIONS`, and `PYTHONPATH`;
   reviewed values can still be supplied explicitly.
