@@ -5598,10 +5598,12 @@ mod tests {
                 .iter()
                 .any(|allowed| paths_overlap(&allowed.path, &target))
         );
+        let resolved_target = std::fs::canonicalize(&target).unwrap();
         assert!(!profile.grant_origins.iter().any(|record| {
             record.kind == GrantKind::AllowExec
                 && (record.value == alias.to_string_lossy()
-                    || record.value == target.to_string_lossy())
+                    || record.value == target.to_string_lossy()
+                    || record.value == resolved_target.to_string_lossy())
         }));
     }
 
