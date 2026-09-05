@@ -242,6 +242,13 @@ pub struct SandboxProfile {
     #[serde(default)]
     pub allow_exec: Vec<SandboxPath>,
 
+    /// Additional compatibility executables enabled only by standard mode.
+    ///
+    /// These remain separate from `allow_exec` so strict mode does not
+    /// inherit compatibility grants outside its smaller contract.
+    #[serde(skip)]
+    pub standard_allow_exec: Vec<SandboxPath>,
+
     /// Requested proxy setting retained while configuration is merged.
     #[serde(skip)]
     pub enable_proxy: bool,
@@ -315,6 +322,13 @@ impl SandboxProfile {
             .allow_exec
             .iter()
             .chain(eco_cfg.allow_exec.iter())
+            .map(|p| expand_path(p, home, pwd))
+            .collect();
+
+        let standard_allow_exec: Vec<SandboxPath> = common
+            .standard_allow_exec
+            .iter()
+            .chain(eco_cfg.standard_allow_exec.iter())
             .map(|p| expand_path(p, home, pwd))
             .collect();
 
@@ -436,6 +450,7 @@ impl SandboxProfile {
             allow_domains,
             deny_exec,
             allow_exec,
+            standard_allow_exec,
             enable_proxy,
             allow_all_network: false,
             network_mode,
@@ -602,6 +617,7 @@ impl SandboxProfile {
             }
         }
 
+        self.enforce_deny_exec();
         self.recompute_network_mode();
     }
 
@@ -710,16 +726,39 @@ impl SandboxProfile {
     /// no subtractive rule, so an overlapping allow entry is removed in full;
     /// this can be stricter than the requested path but never weaker.
     pub(crate) fn add_deny_exec(&mut self, path: SandboxPath, origin: GrantOrigin) {
-        let old_boundary = self.first_user_allow_exec;
+        self.deny_exec.push(path.clone());
+        self.enforce_deny_exec();
+        self.grant_origins.push(GrantRecord {
+            kind: GrantKind::DenyExec,
+            value: path.path.to_string_lossy().into_owned(),
+            origin,
+        });
+    }
+
+    /// Ensure that every remaining execution denial wins over current
+    /// allowlist entries.
+    ///
+    /// Standard mode snapshots executable symlink referents immediately
+    /// before launch. A denial that was lexical when it was added can then
+    /// overlap an allow entry only after that resolution, so this reconciliation
+    /// is required after any allow-exec rewrite or runtime grant.
+    pub fn enforce_deny_exec(&mut self) {
+        if self.deny_exec.is_empty() {
+            return;
+        }
+
+        let deny_exec = self.deny_exec.clone();
+        let old_boundary = self.first_user_allow_exec.min(self.allow_exec.len());
         let mut built_in_remaining = 0_usize;
-        let mut removed = Vec::new();
         self.allow_exec = self
             .allow_exec
             .drain(..)
             .enumerate()
             .filter_map(|(index, allowed)| {
-                if paths_overlap(&allowed.path, &path.path) {
-                    removed.push(allowed.path.to_string_lossy().into_owned());
+                if deny_exec
+                    .iter()
+                    .any(|denied| paths_overlap(&allowed.path, &denied.path))
+                {
                     None
                 } else {
                     if index < old_boundary {
@@ -731,14 +770,11 @@ impl SandboxProfile {
             .collect();
         self.first_user_allow_exec = built_in_remaining;
         self.grant_origins.retain(|record| {
-            record.kind != GrantKind::AllowExec || !removed.contains(&record.value)
+            record.kind != GrantKind::AllowExec
+                || !deny_exec
+                    .iter()
+                    .any(|denied| paths_overlap(Path::new(&record.value), &denied.path))
         });
-        self.grant_origins.push(GrantRecord {
-            kind: GrantKind::DenyExec,
-            value: path.path.to_string_lossy().into_owned(),
-            origin,
-        });
-        self.deny_exec.push(path);
     }
 
     /// Apply an execute grant at the current precedence level, removing an
@@ -974,6 +1010,8 @@ struct CommonDefaults {
     deny_exec: Vec<String>,
     #[serde(default)]
     allow_exec: Vec<String>,
+    #[serde(default)]
+    standard_allow_exec: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -987,6 +1025,8 @@ struct EcosystemDefaults {
     allow_domains: Vec<String>,
     #[serde(default)]
     allow_exec: Vec<String>,
+    #[serde(default)]
+    standard_allow_exec: Vec<String>,
     /// Whether to start the domain-filtering proxy. Some ecosystems whose
     /// HTTP stack does not respect `HTTP_PROXY` env (notably JVM tools like
     /// Maven and Gradle) cannot benefit from the proxy and need the kernel
@@ -1180,6 +1220,54 @@ mod tests {
         }));
     }
 
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the unit test creates an isolated executable symlink fixture"
+    )]
+    fn execution_denials_win_after_an_alias_is_added_later() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let project = root.path().join("project");
+        let tools = root.path().join("tools");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&tools).unwrap();
+
+        let target = tools.join("protoc-real");
+        let alias = tools.join("protoc");
+        std::fs::write(&target, "#!/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+
+        let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, &home, &project);
+        profile.add_deny_exec(SandboxPath::file(target.clone()), GrantOrigin::Cli);
+
+        // This mirrors a standard-mode helper that is inserted after the
+        // denial was merged but before executable aliases are snapshotted.
+        let index = profile.first_user_allow_exec;
+        profile
+            .allow_exec
+            .insert(index, SandboxPath::file(alias.clone()));
+        profile.first_user_allow_exec += 1;
+        profile.grant_origins.push(GrantRecord {
+            kind: GrantKind::AllowExec,
+            value: alias.to_string_lossy().into_owned(),
+            origin: GrantOrigin::BuiltIn,
+        });
+
+        profile.enforce_deny_exec();
+
+        assert!(
+            !profile
+                .allow_exec
+                .iter()
+                .any(|allowed| paths_overlap(&allowed.path, &target))
+        );
+        assert!(!profile.grant_origins.iter().any(|record| {
+            record.kind == GrantKind::AllowExec && record.value == alias.to_string_lossy()
+        }));
+    }
+
     /// Both YAML defaults files must deserialize through [`DefaultsFile`]
     /// (regression guard for the macOS/Linux schema split).
     #[test]
@@ -1271,6 +1359,20 @@ mod tests {
     }
 
     #[test]
+    fn test_should_keep_standard_compatibility_exec_separate() {
+        let home = PathBuf::from("/Users/test");
+        let pwd = PathBuf::from("/Users/test/project");
+        let profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, &home, &pwd);
+
+        assert!(has(&profile.standard_allow_exec, "/usr/bin/curl"));
+        assert!(has(&profile.standard_allow_exec, "/usr/bin/perl"));
+        assert!(has(&profile.standard_allow_exec, "/usr/bin/protoc"));
+        assert!(!has(&profile.allow_exec, "/usr/bin/curl"));
+        assert!(!has(&profile.allow_exec, "/usr/bin/perl"));
+        assert!(!has(&profile.allow_exec, "/usr/bin/protoc"));
+    }
+
+    #[test]
     fn test_should_merge_overrides() {
         let home = PathBuf::from("/Users/test");
         let pwd = PathBuf::from("/Users/test/project");
@@ -1311,6 +1413,23 @@ mod tests {
         assert!(has(&profile.allow_exec, "/usr/bin/curl"));
         assert!(has(&profile.allow_exec, "/usr/bin/wget"));
         assert!(profile.allow_domains.iter().any(|d| d.0 == "example.com"));
+    }
+
+    #[test]
+    fn finalize_does_not_resurrect_a_denied_fetch_helper() {
+        let home = PathBuf::from("/Users/test");
+        let pwd = PathBuf::from("/Users/test/project");
+        let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Rust, &home, &pwd);
+
+        profile.merge_overrides(&ProfileOverrides {
+            allow_fetch: vec![DomainPattern::from("example.com")],
+            deny_exec: vec![SandboxPath::file(PathBuf::from("/usr/bin/curl"))],
+            ..ProfileOverrides::default()
+        });
+        profile.finalize();
+
+        assert!(!has(&profile.allow_exec, "/usr/bin/curl"));
+        assert!(has(&profile.allow_exec, "/usr/bin/wget"));
     }
 
     #[test]

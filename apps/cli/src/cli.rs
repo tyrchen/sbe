@@ -89,8 +89,9 @@ pub struct RunArgs {
     #[arg(long)]
     pub allow_insecure_linux_network: bool,
 
-    /// Trust an automatically discovered project `.sbe.yaml` to expand the
-    /// sandbox. Without this flag project config may only restrict policy.
+    /// Trust an automatically discovered project `.sbe.yaml` to add
+    /// filesystem, execution, environment, or broad-network grants.
+    /// Standard mode already accepts project network requirements.
     #[arg(long)]
     pub trust_project_config: bool,
 
@@ -185,7 +186,8 @@ pub struct InspectArgs {
     #[arg(long)]
     pub allow_insecure_linux_network: bool,
 
-    /// Trust an automatically discovered project `.sbe.yaml` to expand policy.
+    /// Trust an automatically discovered project `.sbe.yaml` to add
+    /// filesystem, execution, environment, or broad-network grants.
     #[arg(long)]
     pub trust_project_config: bool,
 

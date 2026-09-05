@@ -132,6 +132,63 @@ common:
     - "/usr/local/bin/cmake"
     - "/opt/homebrew/bin/pkg-config"
     - "/usr/local/bin/pkg-config"
+
+  # Compatibility helpers used by ordinary standard-mode build scripts.
+  # Strict mode deliberately does not inherit this list.
+  standardAllowExec:
+    - "/usr/bin/curl"
+    - "/opt/homebrew/bin/curl"
+    - "/usr/local/bin/curl"
+    - "/opt/homebrew/bin/wget"
+    - "/usr/local/bin/wget"
+    - "/usr/bin/perl"
+    - "/opt/homebrew/bin/perl"
+    - "/usr/local/bin/perl"
+    - "/usr/bin/openssl"
+    - "/opt/homebrew/bin/openssl"
+    - "/usr/local/bin/openssl"
+    - "/usr/bin/protoc"
+    - "/opt/homebrew/bin/protoc"
+    - "/usr/local/bin/protoc"
+    # Cross-language build helpers commonly launched by package scripts,
+    # build.rs files, and native extension builds.
+    - "/usr/bin/python"
+    - "/usr/bin/python3"
+    - "/opt/homebrew/bin/python3"
+    - "/usr/local/bin/python3"
+    - "/opt/homebrew/bin/node"
+    - "/usr/local/bin/node"
+    - "/usr/bin/ruby"
+    - "/opt/homebrew/bin/ruby"
+    - "/usr/local/bin/ruby"
+    - "/opt/homebrew/bin/go"
+    - "/usr/local/bin/go"
+    - "/usr/local/go/bin/go"
+    - "/usr/bin/dotnet"
+    - "/opt/homebrew/share/dotnet/dotnet"
+    - "/usr/local/share/dotnet/dotnet"
+    - "/usr/bin/javac"
+    - "/usr/bin/jar"
+    - "/usr/bin/xcodebuild"
+    - "/usr/bin/xcrun"
+    - "/usr/bin/swift"
+    - "/usr/bin/swiftc"
+    # Native and generated-code build tools that are not part of every
+    # ecosystem profile.
+    - "/opt/homebrew/bin/ninja"
+    - "/usr/local/bin/ninja"
+    - "/opt/homebrew/bin/meson"
+    - "/usr/local/bin/meson"
+    - "/usr/bin/m4"
+    - "/usr/bin/autoconf"
+    - "/usr/bin/automake"
+    - "/opt/homebrew/bin/libtool"
+    - "/usr/local/bin/libtool"
+    - "/usr/bin/bison"
+    - "/usr/bin/flex"
+    - "/opt/homebrew/bin/swig"
+    - "/usr/local/bin/swig"
+
 profiles:
   node:
     allowWrite:
@@ -160,6 +217,12 @@ profiles:
     allowExec:
       - "/usr/local/bin/node"
       - "/opt/homebrew/bin/node"
+      - "/opt/homebrew/bin/corepack"
+      - "/usr/local/bin/corepack"
+      - "/opt/homebrew/bin/yarn"
+      - "/opt/homebrew/bin/pnpm"
+      - "/opt/homebrew/bin/bun"
+      - "/usr/local/bin/bun"
       # actions/setup-node installs into this non-system toolcache on hosted runners.
       - "/Users/runner/hostedtoolcache/node/"
       - "~/.nvm/"
@@ -171,6 +234,9 @@ profiles:
       - "~/.local/share/mise/"
       - "/usr/bin/xcodebuild"
       - "/usr/bin/xcrun"
+    standardAllowExec:
+      - "~/.bun/"
+      - "~/.local/share/pnpm/"
 
   rust:
     allowWrite:
@@ -249,6 +315,8 @@ profiles:
       - "/usr/local/bin/python3"
       - "/usr/local/bin/pip3"
       - "/usr/local/bin/uv"
+      - "/opt/homebrew/bin/uvx"
+      - "/usr/local/bin/uvx"
       # actions/setup-python uses a fixed, non-relocatable macOS toolcache.
       - "/Users/runner/hostedtoolcache/Python/"
       # Toolcache launchers resolve into this fixed framework installation.

@@ -61,11 +61,11 @@ fn detect_from_command(command: &str) -> Option<Ecosystem> {
 
     match basename {
         // Node.js
-        "node" | "npm" | "npx" | "yarn" | "pnpm" | "bun" => Some(Ecosystem::Node),
+        "node" | "npm" | "npx" | "yarn" | "pnpm" | "bun" | "corepack" => Some(Ecosystem::Node),
         // Rust
         "cargo" | "rustc" | "rustup" => Some(Ecosystem::Rust),
         // Python
-        "python" | "python3" | "pip" | "pip3" | "uv" | "poetry" | "pdm" | "rye" => {
+        "python" | "python3" | "pip" | "pip3" | "uv" | "uvx" | "poetry" | "pdm" | "rye" => {
             Some(Ecosystem::Python)
         }
         // Elixir
@@ -119,6 +119,7 @@ mod tests {
         assert_eq!(detect_from_command("yarn"), Some(Ecosystem::Node));
         assert_eq!(detect_from_command("pnpm"), Some(Ecosystem::Node));
         assert_eq!(detect_from_command("bun"), Some(Ecosystem::Node));
+        assert_eq!(detect_from_command("corepack"), Some(Ecosystem::Node));
     }
 
     #[test]
@@ -130,6 +131,7 @@ mod tests {
     fn test_should_detect_python_from_pip() {
         assert_eq!(detect_from_command("pip"), Some(Ecosystem::Python));
         assert_eq!(detect_from_command("uv"), Some(Ecosystem::Python));
+        assert_eq!(detect_from_command("uvx"), Some(Ecosystem::Python));
         assert_eq!(detect_from_command("poetry"), Some(Ecosystem::Python));
     }
 

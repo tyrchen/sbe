@@ -1,10 +1,10 @@
 # SBE Usable Security Design
 
-- Status: Accepted for 0.4.1
-- Delivery: 0.4.1 implements the standard/strict split and immediate
+- Status: Delivered in 0.4.2
+- Delivery: 0.4.2 implements the standard/strict split and immediate
   compatibility changes; narrow persistent approvals remain follow-up work
 - Owner: SBE
-- Last updated: 2026-08-28
+- Last updated: 2026-09-05
 - Supersedes the 0.4 hardening design as the default product contract while
   retaining it as the strict-mode contract:
   [Security Hardening Design](security-hardening-design.md)
@@ -42,9 +42,9 @@ requested mode and the guarantees actually enforced. Standard mode degrades
 individual capabilities instead of failing the whole command; strict mode
 still fails before launch when one of its promised capabilities is missing.
 
-### 1.1 0.4.1 delivery boundary
+### 1.1 0.4.2 delivery boundary
 
-0.4.1 delivers the mode split, standard workspace/output behavior,
+0.4.2 delivers the mode split, standard workspace/output behavior,
 non-sensitive environment inheritance, referent-aware symlinks, ordinary
 sccache compatibility, top-level Cargo install intent, local developer
 services, and truthful Linux best-effort networking. It preserves the 0.4
@@ -77,6 +77,11 @@ The default promise is:
 > If dependency code becomes malicious, SBE substantially limits its access to
 > ambient credentials and its ability to persist outside the project and
 > expected tool data, while preserving normal build-tool behavior.
+
+Normal build-tool behavior includes common child helpers such as downloaders,
+Perl/Python/Node/Ruby scripting runtimes, OpenSSL, `protoc`, native code
+generators, and platform compiler launchers. These are declared in the
+embedded per-OS standard defaults and are not inherited by strict mode.
 
 The strict promise is:
 
@@ -215,6 +220,15 @@ Security features are reported independently rather than collapsed into one
 | macOS external egress | Exact proxy policy | Exact proxy policy |
 | Linux external egress | Best available, explicitly not strict | Refuse domain mode if unavailable |
 | Missing secondary capability | Continue with one concise warning | Refuse before spawn |
+
+Standard mode treats an automatically discovered project configuration as
+untrusted, but accepts `allowDomains`, `denyDomains`, and `allowFetch` because
+these are ordinary descriptions of where a build obtains dependencies. The
+proxy (or Linux's explicitly best-effort network mode) still governs the
+resulting traffic. Filesystem, executable, environment, proxy, and
+degraded-mode changes remain blocked unless the user explicitly passes
+`--trust-project-config`. Strict mode keeps the restrictive-only project
+policy.
 
 `inspect` emits, for each capability, one of `enforced`, `bestEffort`,
 `unavailable`, `notRequested`, or `explicitlyAllowed`, plus the origin of the
@@ -542,7 +556,7 @@ Execution allowlisting is weak against malicious native code and creates
 continuous toolchain breakage. The target standard design therefore blocks
 small, reviewed sets of true capability brokers where the OS can enforce that
 distinction, and relies on filesystem, secret, network, and `no_new_privs`
-boundaries for the primary protection. 0.4.1 keeps the existing curated list
+boundaries for the primary protection. 0.4.2 keeps the existing curated list
 but resolves normal tool-manager aliases and adds black-box compatibility tests;
 removing that list safely is follow-up work. Strict mode retains a positive
 execute allowlist.

@@ -1,6 +1,6 @@
 # sbe Architecture
 
-> **Status:** Current for SBE 0.4.1. Standard mode is the default; `--strict`
+> **Status:** Current for SBE 0.4.2. Standard mode is the default; `--strict`
 > retains the 0.4 fail-closed boundary. Security requirements and finding IDs are
 > defined in the [security hardening design](../specs/security-hardening-design.md).
 
@@ -16,8 +16,10 @@ Both modes retain these cross-platform invariants:
 
 1. the child receives no ambient file descriptors or high-confidence
    credential/capability environment variables;
-2. an auto-discovered project configuration cannot expand authority without
-   `--trust-project-config`;
+2. an auto-discovered project configuration cannot add filesystem, execution,
+   environment, proxy, or degraded-mode authority without
+   `--trust-project-config`; standard mode may add ordinary project network
+   requirements;
 3. an empty allowlist never becomes broader network access;
 4. the local proxy is authenticated, destination-restricted, and bounded; and
 5. capability output does not claim a guarantee the running backend lacks.
@@ -61,11 +63,12 @@ Policy sources are applied in this order:
 4. an explicit `--config` file; and
 5. CLI options.
 
-Project configuration is restrictive-only by default. It may add read/execute
-denials, remove destinations, or disable previously granted broad modes. It may
-not add filesystem, execution, environment, fetch, network, or degradation
-authority. Configuration schemas reject unknown fields and enforce file, list,
-string, environment, domain, and inheritance limits.
+Project configuration is restrictive-only in strict mode. Standard mode also
+accepts `allowDomains` and `allowFetch`, which describe ordinary project
+network requirements without granting filesystem, execution, environment,
+proxy, or degraded-mode authority. Broader project grants still require
+`--trust-project-config`. Configuration schemas reject unknown fields and
+enforce file, list, string, environment, domain, and inheritance limits.
 
 The network booleans used while merging are converted into one exhaustive
 effective mode:
