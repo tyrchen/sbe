@@ -6,3 +6,4 @@
 - [Cross-Platform Backend Design](cross-platform-backend-design.md) — `SandboxBackend` trait, macOS/Linux parity matrix, Landlock+seccomp port, per-OS profile defaults, phased migration
 - [Security Hardening Design](security-hardening-design.md) — Threat model, prioritized security findings, process/network/filesystem hardening, supply-chain controls, and adversarial acceptance tests
 - [Usable Security Design](usable-security-design.md) — SBE 0.4.3 product contract: usable standard mode, opt-in strict mode, referent-based symlink policy, no vendored tool adapters, and a control-by-control simplification audit
+- [Private procfs Design](private-procfs-design.md) — Safe Linux PID/mount namespace design for exposing runtime-compatible private `/proc` without exposing host processes or credentials
