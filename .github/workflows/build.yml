@@ -53,7 +53,7 @@ jobs:
       # nextest stays outside because its proxy tests bind random localhost TCP
       # ports.
       - name: Install sbe 0.4.2 (dogfood)
-        uses: tyrchen/sbe@dba413595698f878a07c2106b45bf7b115ad1bea # sbexec-v0.4.2
+        uses: tyrchen/sbe@f8eccf81ccccf4dac227781f98f65c7477017a39 # sbexec-v0.4.2
         with:
           version: '0.4.2'
       - name: sbe smoke
