@@ -37,7 +37,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Generate changelog
-        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5 # v4
+        uses: orhun/git-cliff-action@a9a95522b26fe6403f7bb24031f21fb573d0f5ff # v4
         id: git-cliff
         with:
           config: cliff.toml
@@ -77,7 +77,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: ${{ matrix.target }}
 
@@ -86,7 +86,7 @@ jobs:
       # targets the sandboxed build warms the upload action's cache;
       # cross-musl targets use a host-native sandboxed check.
       - name: Install sbe 0.4.2 (dogfood)
-        uses: tyrchen/sbe@dba413595698f878a07c2106b45bf7b115ad1bea # sbexec-v0.4.2
+        uses: tyrchen/sbe@f8eccf81ccccf4dac227781f98f65c7477017a39 # sbexec-v0.4.2
         with:
           version: '0.4.2'
       - name: Pre-build under sbe (dogfood)
@@ -113,7 +113,7 @@ jobs:
           esac
 
       - name: Generate SPDX SBOM
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           path: .
           format: spdx-json
