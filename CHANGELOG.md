@@ -3,6 +3,22 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [sbexec-v0.4.4](https://github.com/tyrchen/sbe/compare/sbexec-v0.4.3..sbexec-v0.4.4) - 2026-11-08
+
+### Bug Fixes
+
+- **(rust)** grant an exported CARGO_TARGET_DIR to indirect Cargo commands (#33) - ([1fcbac7](https://github.com/tyrchen/sbe/commit/1fcbac7307ce93ace3578f809dd3f888aab4ccc7)) - Tyr Chen
+
+### Miscellaneous Chores
+
+- add potential design - ([f8eccf8](https://github.com/tyrchen/sbe/commit/f8eccf81ccccf4dac227781f98f65c7477017a39)) - Tyr Chen
+- bump to 0.4.4 - ([2dd5269](https://github.com/tyrchen/sbe/commit/2dd526956bd564233e620103d9ccffa8c18211d2)) - Tyr Chen
+
+### Other
+
+- Update CHANGELOG.md - ([74ed2ae](https://github.com/tyrchen/sbe/commit/74ed2ae8b7de3b1f80be9a068490d4b048d10742)) - Tyr Chen
+
+---
 ## [sbexec-v0.4.3](https://github.com/tyrchen/sbe/compare/sbexec-v0.4.2..sbexec-v0.4.3) - 2026-09-05
 
 ### Bug Fixes
