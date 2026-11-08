@@ -188,6 +188,12 @@ SBE detects these built-in profiles:
 
 Standard mode makes the workspace, conventional package caches, and expected
 dependency/build directories usable for normal install-then-run workflows.
+Under the Rust profile, an exported `CARGO_TARGET_DIR` (for example a target
+directory shared across worktrees) is writable and executable even when Cargo
+runs behind `make`, `sh -c`, or another wrapper. SBE refuses a target directory
+that resolves to `/`, the home directory or one of its ancestors, a read-denied
+credential path, or the Cargo, rustup, or user configuration roots.
+
 Strict mode separates writable dependency installation from dependency
 execution:
 

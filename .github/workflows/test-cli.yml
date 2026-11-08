@@ -121,6 +121,22 @@ jobs:
           echo "got: $out"
           test "$out" = "hello from sbe"
 
+      - name: rust profile grants an exported CARGO_TARGET_DIR to indirect Cargo
+        run: |
+          set -euo pipefail
+          target="$HOME/.sbe-ci-shared-target"
+          rm -rf "$target"
+          mkdir -p "$target/release"
+          CARGO_TARGET_DIR="$target" sbe run --profile rust -- \
+            /bin/sh -c 'touch "$CARGO_TARGET_DIR/release/.probe"'
+          test -f "$target/release/.probe"
+          if CARGO_TARGET_DIR="$HOME" sbe run --profile rust -- /bin/echo should-not-run \
+              >home-target.out 2>&1; then
+            echo "::error::standard mode granted the home directory as a Cargo target"
+            exit 1
+          fi
+          grep -q "refusing to grant it write" home-target.out
+
       - name: project relocation fails early in standard mode
         run: |
           set -euo pipefail
