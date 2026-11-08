@@ -989,50 +989,25 @@ fn apply_standard_profile(
             &home.join(".cargo/git"),
             SandboxPath::dir(cargo_home.join("git")),
         );
-        let cargo_cli_target = command_option_value(command, "--target-dir").map(PathBuf::from);
-        if let Some(path) = cargo_cli_target {
-            let path = if path.is_absolute() {
-                path
-            } else {
-                project_dir.join(path)
-            };
-            insert_builtin_path_grant(
-                profile,
-                GrantKind::AllowWrite,
-                SandboxPath::dir(path.clone()),
-            );
-            insert_builtin_path_grant(profile, GrantKind::AllowExec, SandboxPath::dir(path));
-        } else {
-            let environment_target = effective_environment_path(profile, "CARGO_TARGET_DIR")
-                .or_else(|| effective_environment_path(profile, "CARGO_BUILD_TARGET_DIR"));
-            let has_environment_target = environment_target.is_some();
-            if let Some(path) = environment_target {
-                let path = if path.is_absolute() {
-                    path
-                } else {
-                    project_dir.join(path)
-                };
-                insert_builtin_path_grant(
-                    profile,
-                    GrantKind::AllowWrite,
-                    SandboxPath::dir(path.clone()),
-                );
-                insert_builtin_path_grant(profile, GrantKind::AllowExec, SandboxPath::dir(path));
-            }
-            if !has_environment_target && let Some(path) = cargo_config_target_dir(command)? {
-                let path = if path.is_absolute() {
-                    path
-                } else {
-                    project_dir.join(path)
-                };
-                insert_builtin_path_grant(
-                    profile,
-                    GrantKind::AllowWrite,
-                    SandboxPath::dir(path.clone()),
-                );
-                insert_builtin_path_grant(profile, GrantKind::AllowExec, SandboxPath::dir(path));
-            }
+        // Cargo's own precedence: --target-dir, then the target environment
+        // variables, then a direct --config build.target-dir override.
+        let target = match command_option_value(command, "--target-dir") {
+            Some(path) => Some(PathBuf::from(path)),
+            None => match cargo_environment_target_dir(profile) {
+                Some(path) => Some(path),
+                None => cargo_config_target_dir(command)?,
+            },
+        };
+        if let Some(path) = target {
+            grant_cargo_target_dir(profile, path, home, project_dir)?;
         }
+    } else if profile.name == "rust"
+        && let Some(path) = cargo_environment_target_dir(profile)
+    {
+        // Rust-profile commands such as make, sh -c, or build tools that shell
+        // out to Cargo inherit the same target directory that SBE otherwise
+        // pins to `$PWD/target`.
+        grant_cargo_target_dir(profile, path, home, project_dir)?;
     }
     if command_is(command, "cargo") && top_level_subcommand(command).is_command(&["install"]) {
         let explicit_root = command_option_value(command, "--root").map(PathBuf::from);
@@ -1075,6 +1050,71 @@ fn effective_environment_path(profile: &SandboxProfile, name: &str) -> Option<Pa
         .get(name)
         .map(PathBuf::from)
         .or_else(|| std::env::var_os(name).map(PathBuf::from))
+}
+
+fn cargo_environment_target_dir(profile: &SandboxProfile) -> Option<PathBuf> {
+    effective_environment_path(profile, "CARGO_TARGET_DIR")
+        .or_else(|| effective_environment_path(profile, "CARGO_BUILD_TARGET_DIR"))
+}
+
+fn grant_cargo_target_dir(
+    profile: &mut SandboxProfile,
+    path: PathBuf,
+    home: &Path,
+    project_dir: &Path,
+) -> anyhow::Result<()> {
+    let path = anchor_project_path(path, project_dir);
+    reject_unsafe_cargo_target_dir(profile, &path, home, project_dir)?;
+    insert_builtin_path_grant(
+        profile,
+        GrantKind::AllowWrite,
+        SandboxPath::dir(path.clone()),
+    );
+    insert_builtin_path_grant(profile, GrantKind::AllowExec, SandboxPath::dir(path));
+    Ok(())
+}
+
+/// Refuse a Cargo target directory whose write+execute grant would cover the
+/// home directory, credentials, configuration, or toolchain binaries.
+fn reject_unsafe_cargo_target_dir(
+    profile: &SandboxProfile,
+    path: &Path,
+    home: &Path,
+    project_dir: &Path,
+) -> anyhow::Result<()> {
+    let resolve =
+        |path: &Path| resolve_existing_ancestor(path).unwrap_or_else(|| path.to_path_buf());
+    let resolved = resolve(path);
+    let rustup_home =
+        effective_environment_path(profile, "RUSTUP_HOME").unwrap_or_else(|| home.join(".rustup"));
+    let protected_roots = [
+        home.join(".cargo"),
+        home.join(".rustup"),
+        effective_cargo_home(profile, home, project_dir),
+        anchor_project_path(rustup_home, project_dir),
+        home.join(".config"),
+        platform_config_home(home),
+    ];
+    let reason = if resolved.parent().is_none() {
+        "is the filesystem root"
+    } else if resolve(home).starts_with(&resolved) {
+        "is the home directory or one of its ancestors"
+    } else if overlaps_denied_read(profile, &resolved) {
+        "overlaps a path SBE denies for reads"
+    } else if protected_roots
+        .iter()
+        .any(|root| paths_overlap(&resolved, &resolve(root)))
+    {
+        "overlaps a Cargo, rustup, or user configuration root"
+    } else {
+        return Ok(());
+    };
+    anyhow::bail!(
+        "Cargo target directory '{}' resolves to '{}', which {reason}; refusing to grant it write \
+         and execute access. Choose a dedicated build directory instead",
+        path.display(),
+        resolved.display(),
+    )
 }
 
 struct NpmCacheSelection {
@@ -7623,6 +7663,104 @@ mod tests {
                     .contains(&SandboxPath::dir(home.path().join(".cargo").join(cache)))
             );
         }
+    }
+
+    #[test]
+    fn standard_rust_profile_grants_environment_target_to_indirect_cargo() {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let shared_target = home.path().join(".target");
+        let command = ["sh".to_owned(), "-c".to_owned(), "cargo build".to_owned()];
+
+        let mut profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Rust, home.path(), project.path());
+        profile.env.insert(
+            "CARGO_TARGET_DIR".to_owned(),
+            shared_target.to_string_lossy().into_owned(),
+        );
+        apply_standard_profile(&mut profile, &command, home.path(), project.path()).unwrap();
+        assert!(
+            profile
+                .allow_write
+                .contains(&SandboxPath::dir(shared_target.clone())),
+            "an exported target must be writable for commands that launch Cargo indirectly"
+        );
+        assert!(
+            profile
+                .allow_exec
+                .contains(&SandboxPath::dir(shared_target.clone())),
+            "an exported target must be executable for build scripts and tests"
+        );
+
+        let mut relative =
+            SandboxProfile::for_ecosystem(Ecosystem::Rust, home.path(), project.path());
+        relative
+            .env
+            .insert("CARGO_TARGET_DIR".to_owned(), "out/target".to_owned());
+        apply_standard_profile(&mut relative, &command, home.path(), project.path()).unwrap();
+        assert!(
+            relative
+                .allow_write
+                .contains(&SandboxPath::dir(project.path().join("out/target")))
+        );
+    }
+
+    #[test]
+    fn standard_cargo_target_dir_rejects_home_credentials_and_tool_roots() {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let home_path = home.path();
+        let unsafe_targets = [
+            PathBuf::from("/"),
+            home_path.to_path_buf(),
+            home_path.parent().unwrap().to_path_buf(),
+            home_path.join(".ssh"),
+            home_path.join(".aws/target"),
+            home_path.join(".cargo"),
+            home_path.join(".cargo/bin"),
+            home_path.join(".rustup/toolchains"),
+            home_path.join(".config/target"),
+        ];
+        let commands: [Vec<String>; 2] = [
+            vec!["cargo".to_owned(), "build".to_owned()],
+            vec!["make".to_owned(), "build".to_owned()],
+        ];
+
+        for target in &unsafe_targets {
+            for command in &commands {
+                let mut profile =
+                    SandboxProfile::for_ecosystem(Ecosystem::Rust, home_path, project.path());
+                profile.env.insert(
+                    "CARGO_TARGET_DIR".to_owned(),
+                    target.to_string_lossy().into_owned(),
+                );
+                let Err(error) =
+                    apply_standard_profile(&mut profile, command, home_path, project.path())
+                else {
+                    panic!("'{}' was granted for {command:?}", target.display());
+                };
+                assert!(
+                    error.to_string().contains("refusing to grant it write"),
+                    "unexpected error for '{}': {error}",
+                    target.display()
+                );
+            }
+        }
+
+        let mut cli_profile =
+            SandboxProfile::for_ecosystem(Ecosystem::Rust, home_path, project.path());
+        let error = apply_standard_profile(
+            &mut cli_profile,
+            &[
+                "cargo".to_owned(),
+                "build".to_owned(),
+                format!("--target-dir={}", home_path.display()),
+            ],
+            home_path,
+            project.path(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("home directory"));
     }
 
     #[test]

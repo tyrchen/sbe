@@ -103,8 +103,16 @@ In standard mode the workspace is writable and conventional output roots are
 writable+executable. Persistent workspace, cache, and install results are
 tainted. SBE recognizes only top-level install intent; it does not reproduce a
 package manager's lockfile and output grammar. An inherited
-`CARGO_TARGET_DIR` receives matching write and execute authority; otherwise
+`CARGO_TARGET_DIR` (or `CARGO_BUILD_TARGET_DIR`) receives matching write and
+execute authority for every command run under the Rust profile, including
+wrappers such as `make` or `sh -c` that launch Cargo indirectly; otherwise
 standard Rust mode selects `$PWD/target` without parsing layered Cargo config.
+SBE refuses a Cargo target directory, whether it comes from the environment,
+`--target-dir`, or `--config build.target-dir`, when its resolved path is `/`,
+the home directory or one of its ancestors, overlaps a read-denied path such as
+`~/.ssh`, `~/.aws`, or Cargo credentials, or overlaps the Cargo home, rustup
+home, `~/.config`, or the platform configuration directory. A missing target
+directory is handled like any other directory grant.
 Workspace contents, including `.env*`, are readable in standard mode so Linux
 can grant general create/read/write semantics without package-manager-specific
 precreation. Strict mode retains project secret-file denials.
