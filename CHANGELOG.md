@@ -3,7 +3,7 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
-## [unreleased]
+## [sbexec-v0.5.0](https://github.com/tyrchen/sbe/compare/sbexec-v0.4.4..sbexec-v0.5.0) - 2026-11-10
 
 ### Bug Fixes
 
@@ -12,6 +12,7 @@ All notable changes to this project will be documented in this file. See [conven
 ### Other
 
 - Update CHANGELOG.md - ([85395ca](https://github.com/tyrchen/sbe/commit/85395ca24d6c2157b430749b05d06caa80c3295d)) - Tyr Chen
+- Update CHANGELOG.md - ([ea20ccb](https://github.com/tyrchen/sbe/commit/ea20ccb54c2c53f34a2f20e2f0d0caeff1fcbd30)) - Tyr Chen
 
 ---
 ## [sbexec-v0.4.4](https://github.com/tyrchen/sbe/compare/sbexec-v0.4.3..sbexec-v0.4.4) - 2026-11-08
