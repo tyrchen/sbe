@@ -392,11 +392,25 @@ Create a mode-0700 per-run directory, set `TMPDIR`, `TMP`, and `TEMP`, and grant
 only that directory. Do not grant write access to global `/tmp`, `/var/tmp`,
 `/private/tmp`, `/private/var/folders`, or `/dev/shm` by default.
 
-On macOS the shared temporary roots deny `file-read-data` (contents and
-directory listings), not `file-read-metadata`. Runtimes such as Node `fstat`
-their inherited stdio at startup and abort on any error other than `EBADF`, so a
-redirect into a file under `/private/tmp` must stay `stat`-able. Metadata
-reveals no contents; the private per-run root remains the only readable subtree.
+On macOS the shared temporary roots are treated as follows:
+
+| Root | Read | Write | Exec |
+| --- | --- | --- | --- |
+| `/private/tmp`, `/private/var/tmp` | allowed, except contents (data and listings) under `/private/tmp/claude-*` | denied | denied |
+| `/private/var/folders` | metadata only; contents denied | denied | denied |
+| run private root (`TMPDIR`) | allowed | allowed | allowed |
+
+Rationale. Reads of general temp files are low risk, but `/private/tmp/claude-*`
+holds agent scratchpads, tool outputs and transcripts, so contents stay denied
+there; an explicit `--allow-read` still wins. Metadata stays readable because
+runtimes such as Node `fstat` their inherited stdio at startup and abort on any
+error other than `EBADF`, so a redirect into a temp file must keep working.
+Writes stay closed because unsandboxed processes later read and execute files
+in shared temp. Exec is denied (the rule follows the broad exec allow, since
+later SBPL rules win) so a download-then-run chain inside the sandbox fails. The
+per-run private root remains writable and executable because build tools run
+artifacts from it (Cargo build scripts and test binaries in `CARGO_TARGET_DIR`);
+`TMPDIR`, `TMP`, `TEMP` and `XDG_RUNTIME_DIR` already point there.
 
 Built-in profiles grant the smallest expected project outputs and lockfiles,
 not all of `$PWD`. `.git`, `.github/workflows`, SBE config, source files, and

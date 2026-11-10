@@ -47,6 +47,46 @@ pub fn generate(
     Ok(sb)
 }
 
+/// Shared temporary roots on macOS. Writes are never granted here by default;
+/// the run's private root (`TMPDIR`) is the only writable temp location.
+const SHARED_TEMP_ROOTS: [&str; 3] = ["/private/tmp", "/private/var/tmp", "/private/var/folders"];
+
+/// SBPL filter matching `/private/tmp/claude-*` and everything below it.
+const CLAUDE_TEMP_FILTER: &str = "(regex #\"^/private/tmp/claude-[^/]*(/|$)\")";
+
+/// Paths under `root` that the caller or the runtime explicitly granted for
+/// reading, writing or executing; they win over the shared-temp read deny.
+fn shared_temp_read_exceptions<'a>(profile: &'a SandboxProfile, root: &str) -> BTreeSet<&'a Path> {
+    profile
+        .allow_read
+        .iter()
+        .chain(&profile.allow_write)
+        .chain(&profile.allow_exec)
+        .map(|sandbox_path| sandbox_path.path.as_path())
+        .chain(profile.ephemeral_write_exec.iter().map(PathBuf::as_path))
+        .filter(|path| path.starts_with(root))
+        .collect()
+}
+
+/// Emit `(deny <operation> (require-all <filter> (require-not (subpath ..))...))`.
+fn write_shared_temp_deny(
+    sb: &mut String,
+    operation: &str,
+    filter: &str,
+    exceptions: &BTreeSet<&Path>,
+) -> Result<(), CoreError> {
+    writeln!(sb, "(deny {operation}").ok();
+    writeln!(sb, "    (require-all").ok();
+    writeln!(sb, "        {filter}").ok();
+    for exception in exceptions {
+        let exception = validated_sbpl_path(exception)?;
+        writeln!(sb, "        (require-not (subpath \"{exception}\"))").ok();
+    }
+    writeln!(sb, "    )").ok();
+    writeln!(sb, ")").ok();
+    Ok(())
+}
+
 fn section_process(sb: &mut String, profile: &SandboxProfile) -> Result<(), CoreError> {
     writeln!(sb, ";; Process control").ok();
     writeln!(sb, "(allow process-fork)").ok();
@@ -57,6 +97,27 @@ fn section_process(sb: &mut String, profile: &SandboxProfile) -> Result<(), Core
     }
 
     writeln!(sb, ")").ok();
+
+    // Shared temporary roots never host executables: a download-then-run
+    // chain inside the sandbox must fail. This rule comes after the allow
+    // above (later rules win). Only the run's own private root and explicit
+    // exec grants are carved back, because build tools legitimately execute
+    // artifacts from there (e.g. Cargo build scripts in CARGO_TARGET_DIR).
+    for shared in SHARED_TEMP_ROOTS {
+        let exceptions: BTreeSet<&Path> = profile
+            .allow_exec
+            .iter()
+            .map(|sandbox_path| sandbox_path.path.as_path())
+            .chain(profile.ephemeral_write_exec.iter().map(PathBuf::as_path))
+            .filter(|path| path.starts_with(shared))
+            .collect();
+        write_shared_temp_deny(
+            sb,
+            "process-exec",
+            &format!("(subpath \"{shared}\")"),
+            &exceptions,
+        )?;
+    }
 
     if !profile.deny_exec.is_empty() {
         writeln!(sb, "(deny process-exec").ok();
@@ -74,34 +135,25 @@ fn section_file_read(sb: &mut String, profile: &SandboxProfile) -> Result<(), Co
     writeln!(sb, ";; File reads: allow most, deny secrets").ok();
     writeln!(sb, "(allow file-read*)").ok();
 
-    // Shared temporary roots belong to every same-user process. Deny reading
-    // their contents (file data and directory listings) while carving back only
-    // this invocation's private root. `require-not` keeps the broad allow-read
-    // model compatible without allowing one SBE invocation to inspect another
-    // invocation's temporary files. Metadata (`stat`, `fstat`) stays allowed:
-    // runtimes such as Node `fstat` their inherited stdio at startup and abort
-    // on any error other than EBADF, so a redirect into a temp file must not
-    // fail with EPERM. Metadata exposes no file contents.
-    for shared in ["/private/tmp", "/private/var/tmp", "/private/var/folders"] {
-        let exceptions: BTreeSet<&Path> = profile
-            .allow_read
-            .iter()
-            .chain(&profile.allow_write)
-            .chain(&profile.allow_exec)
-            .map(|sandbox_path| sandbox_path.path.as_path())
-            .chain(profile.ephemeral_write_exec.iter().map(PathBuf::as_path))
-            .filter(|path| path.starts_with(shared))
-            .collect();
-        writeln!(sb, "(deny file-read-data").ok();
-        writeln!(sb, "    (require-all").ok();
-        writeln!(sb, "        (subpath \"{shared}\")").ok();
-        for exception in exceptions {
-            let exception = validated_sbpl_path(exception)?;
-            writeln!(sb, "        (require-not (subpath \"{exception}\"))").ok();
-        }
-        writeln!(sb, "    )").ok();
-        writeln!(sb, ")").ok();
-    }
+    // `/private/tmp` and `/private/var/tmp` are readable, except the Claude
+    // Code state under `/private/tmp/claude-*` (scratchpads, tool outputs and
+    // agent transcripts). Metadata stays readable there so that `fstat` of a
+    // redirected stdout still works: runtimes such as Node abort on any
+    // inherited-stdio error other than EBADF.
+    let claude_exceptions = shared_temp_read_exceptions(profile, "/private/tmp");
+    write_shared_temp_deny(sb, "file-read-data", CLAUDE_TEMP_FILTER, &claude_exceptions)?;
+
+    // `/private/var/folders` holds every same-user process's per-user temp and
+    // cache data. Deny contents (data and listings) while carving back this
+    // invocation's private root and explicit read grants. Metadata stays
+    // readable for the same reason as above.
+    let folders_exceptions = shared_temp_read_exceptions(profile, "/private/var/folders");
+    write_shared_temp_deny(
+        sb,
+        "file-read-data",
+        "(subpath \"/private/var/folders\")",
+        &folders_exceptions,
+    )?;
 
     if !profile.deny_read.is_empty() {
         writeln!(sb, "(deny file-read*").ok();
@@ -398,13 +450,65 @@ mod tests {
         let sbpl = generate(&profile, Some(12345), strict_options()).unwrap();
 
         assert!(sbpl.contains("/private/tmp/sbe-private"));
-        assert_eq!(sbpl.matches("(subpath \"/private/tmp\")").count(), 1);
-        assert_eq!(sbpl.matches("(subpath \"/private/var/tmp\")").count(), 1);
+        // The private root is carved out of the exec deny for /private/tmp only.
         assert!(sbpl.contains(
+            "(deny process-exec\n    (require-all\n        (subpath \"/private/tmp\")\n        \
+             (require-not (subpath \"/private/tmp/sbe-private\"))"
+        ));
+        assert!(sbpl.contains(
+            "(deny process-exec\n    (require-all\n        (subpath \"/private/var/tmp\")\n    )"
+        ));
+        assert!(
+            sbpl.contains(
+                "(deny process-exec\n    (require-all\n        (subpath \
+                 \"/private/var/folders\")\n    )"
+            )
+        );
+    }
+
+    #[test]
+    fn test_should_deny_exec_in_shared_temp_after_exec_allow() {
+        let home = PathBuf::from("/Users/test");
+        let pwd = PathBuf::from("/Users/test/project");
+        let profile = SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &pwd);
+        let sbpl = generate(&profile, Some(12345), strict_options()).unwrap();
+
+        let allow = sbpl.find("(allow process-exec").unwrap();
+        let deny = sbpl.find("(deny process-exec").unwrap();
+        assert!(
+            allow < deny,
+            "later deny must override the broad exec allow"
+        );
+        assert_eq!(
+            sbpl.matches("(deny process-exec\n    (require-all").count(),
+            3
+        );
+    }
+
+    #[test]
+    fn test_should_allow_tmp_reads_but_deny_claude_state_and_var_folders_contents() {
+        let home = PathBuf::from("/Users/test");
+        let pwd = PathBuf::from("/Users/test/project");
+        let mut profile = SandboxProfile::for_ecosystem(Ecosystem::Node, &home, &pwd);
+        profile
+            .allow_read
+            .push(SandboxPath::dir(PathBuf::from("/private/tmp/claude-501")));
+        let sbpl = generate(&profile, Some(12345), strict_options()).unwrap();
+
+        // No blanket read deny: /private/tmp and /private/var/tmp stay readable.
+        assert!(!sbpl.contains("(deny file-read*\n    (require-all"));
+        assert!(!sbpl.contains(
             "(deny file-read-data\n    (require-all\n        (subpath \"/private/tmp\")"
         ));
-        assert!(!sbpl.contains("(require-not (literal \"/private/tmp\"))"));
-        assert!(sbpl.contains("(require-not (subpath \"/private/tmp/sbe-private\"))"));
+        // Claude state is content-denied (metadata allowed), with explicit grants winning.
+        assert!(sbpl.contains(
+            "(deny file-read-data\n    (require-all\n        (regex \
+             #\"^/private/tmp/claude-[^/]*(/|$)\")\n        (require-not (subpath \
+             \"/private/tmp/claude-501\"))"
+        ));
+        assert!(sbpl.contains(
+            "(deny file-read-data\n    (require-all\n        (subpath \"/private/var/folders\")"
+        ));
     }
 
     #[test]
