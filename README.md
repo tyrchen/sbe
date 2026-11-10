@@ -367,9 +367,16 @@ boundary; older kernels report that enforcement as unavailable.
   is best-effort, and strict domain mode fails closed unless its insecure
   compatibility option is acknowledged.
 - macOS uses an allow-most/read-deny model for compatibility. Curated secret
-  paths, Keychain service access, shared temporary roots, environment, and
-  inherited descriptors are protected, but this is not a complete home-folder
-  read allowlist.
+  paths, Keychain service access, environment, and inherited descriptors are
+  protected, but this is not a complete home-folder read allowlist. Shared
+  temporary roots: `/private/tmp` and `/private/var/tmp` are readable except
+  contents under `/private/tmp/claude-*` (Claude Code scratchpads and
+  transcripts; grant one explicitly with `--allow-read`);
+  `/private/var/folders` contents are denied except the run's private
+  directory. Metadata (`stat`) stays readable so redirected stdio works. Writes
+  to shared temp roots are not granted (only the per-run `TMPDIR`), and
+  executing anything from them is denied except from the per-run private
+  directory.
 - Correlated kernel violation streaming is currently unavailable. Ordinary
   denials still appear as `EACCES`, `EPERM`, or target failure.
 - SBE does not defend against kernel vulnerabilities, a compromised SBE
