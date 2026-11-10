@@ -367,8 +367,10 @@ boundary; older kernels report that enforcement as unavailable.
   is best-effort, and strict domain mode fails closed unless its insecure
   compatibility option is acknowledged.
 - macOS uses an allow-most/read-deny model for compatibility. Curated secret
-  paths, Keychain service access, shared temporary roots, environment, and
-  inherited descriptors are protected, but this is not a complete home-folder
+  paths, Keychain service access, the contents of shared temporary roots
+  (`/private/tmp`, `/private/var/tmp`, `/private/var/folders`; metadata such as
+  `stat` stays readable so redirected stdio works), environment, and inherited
+  descriptors are protected, but this is not a complete home-folder
   read allowlist.
 - Correlated kernel violation streaming is currently unavailable. Ordinary
   denials still appear as `EACCES`, `EPERM`, or target failure.

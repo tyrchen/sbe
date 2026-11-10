@@ -74,10 +74,14 @@ fn section_file_read(sb: &mut String, profile: &SandboxProfile) -> Result<(), Co
     writeln!(sb, ";; File reads: allow most, deny secrets").ok();
     writeln!(sb, "(allow file-read*)").ok();
 
-    // Shared temporary roots belong to every same-user process. Deny them
-    // while carving back only this invocation's private root. `require-not`
-    // keeps the broad allow-read model compatible without allowing one SBE
-    // invocation to inspect another invocation's temporary files.
+    // Shared temporary roots belong to every same-user process. Deny reading
+    // their contents (file data and directory listings) while carving back only
+    // this invocation's private root. `require-not` keeps the broad allow-read
+    // model compatible without allowing one SBE invocation to inspect another
+    // invocation's temporary files. Metadata (`stat`, `fstat`) stays allowed:
+    // runtimes such as Node `fstat` their inherited stdio at startup and abort
+    // on any error other than EBADF, so a redirect into a temp file must not
+    // fail with EPERM. Metadata exposes no file contents.
     for shared in ["/private/tmp", "/private/var/tmp", "/private/var/folders"] {
         let exceptions: BTreeSet<&Path> = profile
             .allow_read
@@ -88,30 +92,9 @@ fn section_file_read(sb: &mut String, profile: &SandboxProfile) -> Result<(), Co
             .chain(profile.ephemeral_write_exec.iter().map(PathBuf::as_path))
             .filter(|path| path.starts_with(shared))
             .collect();
-        let mut ancestor_literals = BTreeSet::new();
-        for exception in &exceptions {
-            let mut ancestor = exception.parent();
-            while let Some(path) = ancestor {
-                if !path.starts_with(shared) {
-                    break;
-                }
-                ancestor_literals.insert(path.to_path_buf());
-                if path == Path::new(shared) {
-                    break;
-                }
-                ancestor = path.parent();
-            }
-        }
-        writeln!(sb, "(deny file-read*").ok();
+        writeln!(sb, "(deny file-read-data").ok();
         writeln!(sb, "    (require-all").ok();
         writeln!(sb, "        (subpath \"{shared}\")").ok();
-        // Path canonicalization needs metadata access to each ancestor. A
-        // literal exception permits traversal of that inode without opening
-        // any sibling child as data.
-        for ancestor in ancestor_literals {
-            let ancestor = validated_sbpl_path(&ancestor)?;
-            writeln!(sb, "        (require-not (literal \"{ancestor}\"))").ok();
-        }
         for exception in exceptions {
             let exception = validated_sbpl_path(exception)?;
             writeln!(sb, "        (require-not (subpath \"{exception}\"))").ok();
@@ -417,7 +400,10 @@ mod tests {
         assert!(sbpl.contains("/private/tmp/sbe-private"));
         assert_eq!(sbpl.matches("(subpath \"/private/tmp\")").count(), 1);
         assert_eq!(sbpl.matches("(subpath \"/private/var/tmp\")").count(), 1);
-        assert!(sbpl.contains("(require-not (literal \"/private/tmp\"))"));
+        assert!(sbpl.contains(
+            "(deny file-read-data\n    (require-all\n        (subpath \"/private/tmp\")"
+        ));
+        assert!(!sbpl.contains("(require-not (literal \"/private/tmp\"))"));
         assert!(sbpl.contains("(require-not (subpath \"/private/tmp/sbe-private\"))"));
     }
 

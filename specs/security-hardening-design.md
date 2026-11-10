@@ -392,6 +392,12 @@ Create a mode-0700 per-run directory, set `TMPDIR`, `TMP`, and `TEMP`, and grant
 only that directory. Do not grant write access to global `/tmp`, `/var/tmp`,
 `/private/tmp`, `/private/var/folders`, or `/dev/shm` by default.
 
+On macOS the shared temporary roots deny `file-read-data` (contents and
+directory listings), not `file-read-metadata`. Runtimes such as Node `fstat`
+their inherited stdio at startup and abort on any error other than `EBADF`, so a
+redirect into a file under `/private/tmp` must stay `stat`-able. Metadata
+reveals no contents; the private per-run root remains the only readable subtree.
+
 Built-in profiles grant the smallest expected project outputs and lockfiles,
 not all of `$PWD`. `.git`, `.github/workflows`, SBE config, source files, and
 package manifests remain non-writable during install/build by default. A
