@@ -3,6 +3,17 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [unreleased]
+
+### Bug Fixes
+
+- **(macos)** allow tmp reads except claude state; deny exec from shared temp (0.5.0) (#35) - ([c371c1e](https://github.com/tyrchen/sbe/commit/c371c1ecffa8ea6207a81010d9f0e7b6e79265bc)) - Tyr Chen
+
+### Other
+
+- Update CHANGELOG.md - ([85395ca](https://github.com/tyrchen/sbe/commit/85395ca24d6c2157b430749b05d06caa80c3295d)) - Tyr Chen
+
+---
 ## [sbexec-v0.4.4](https://github.com/tyrchen/sbe/compare/sbexec-v0.4.3..sbexec-v0.4.4) - 2026-11-08
 
 ### Bug Fixes
